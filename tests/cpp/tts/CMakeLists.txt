@@ -77,6 +77,14 @@ if(NEMO_SPEECH_TTS_WITH_ZH)
     endif()
 endif()
 
+add_executable(test_sentence_splitting test_sentence_splitting.cpp)
+target_link_libraries(test_sentence_splitting PRIVATE nemo_speech_tts_tokenizer)
+if(DEFINED ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR_V2602})
+    add_test(
+        NAME sentence_splitting
+        COMMAND test_sentence_splitting $ENV{NEMO_SPEECH_TEST_TOKENIZER_DIR_V2602})
+endif()
+
 add_executable(test_tts_terminal_punctuation test_tts_terminal_punctuation.cpp)
 target_link_libraries(test_tts_terminal_punctuation PRIVATE nemo_speech_tts_tokenizer)
 

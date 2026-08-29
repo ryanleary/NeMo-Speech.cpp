@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -763,6 +764,51 @@ cjk_terminal_size_at(const std::string& text, size_t position) {
     return 0;
 }
 
+// A period after one of these is an abbreviation, not the end of a sentence.
+// Splitting there puts a chunk boundary -- with its own BOS, attention prior and
+// boundary silence -- inside a sentence, which is audible.
+static bool
+abbreviation_before(const std::string& text, size_t period) {
+    static const std::array<const char*, 26> known = {
+        "mr",  "mrs", "ms",  "dr",  "prof", "sr",     "jr",   "st",  "mt",
+        "rev", "hon", "gen", "col", "capt", "lt",     "sgt",  "gov", "sen",
+        "rep", "vs",  "etc", "eg",  "ie",   "approx", "dept", "est"};
+
+    size_t end = period;  // scan the word ending at the period
+    size_t begin = end;
+    while (begin > 0) {
+        const unsigned char c = (unsigned char)text[begin - 1];
+        if (!std::isalpha(c) && c != '.') {
+            break;
+        }
+        --begin;
+    }
+    if (begin == end) {
+        return false;
+    }
+    std::string word;
+    for (size_t i = begin; i < end; ++i) {
+        const unsigned char c = (unsigned char)text[i];
+        if (c != '.') {
+            word.push_back((char)std::tolower(c));
+        }
+    }
+    if (word.empty()) {
+        return false;
+    }
+    // A single letter ("J. R. R.") or an internally dotted form ("U.S.",
+    // "e.g.") is an initialism, never a terminator.
+    if (word.size() == 1) {
+        return true;
+    }
+    if (text.compare(begin, end - begin, word) != 0 &&
+        std::count(text.begin() + (long)begin, text.begin() + (long)end, '.') > 0) {
+        return true;
+    }
+    return std::find_if(known.begin(), known.end(), [&](const char* k) { return word == k; }) !=
+           known.end();
+}
+
 static std::vector<std::string>
 split_sentences(std::string paragraph) {
     paragraph = replace_all(paragraph, "-", " ");
@@ -776,7 +822,10 @@ split_sentences(std::string paragraph) {
     for (size_t i = 0; i < paragraph.size(); ++i) {
         const char c = paragraph[i];
         const char next = i + 1 < paragraph.size() ? paragraph[i + 1] : '\0';
-        const bool ascii_boundary = (c == '.' || c == '?' || c == '!') && next == ' ';
+        bool ascii_boundary = (c == '.' || c == '?' || c == '!') && next == ' ';
+        if (ascii_boundary && c == '.' && abbreviation_before(paragraph, i)) {
+            ascii_boundary = false;
+        }
         const size_t cjk_terminal_size = cjk_terminal_size_at(paragraph, i);
         if (ascii_boundary || cjk_terminal_size != 0) {
             size_t end = i + (ascii_boundary ? 1 : cjk_terminal_size);
