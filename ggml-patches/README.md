@@ -58,8 +58,13 @@ stock comparison therefore requires both a pristine ggml checkout and
   CUDA, including stride-aware inputs, F16 K/V/P storage, head-merged output,
   and the `NEMO_SPEECH_FUSED_RELPOS_ATTN` encoder path.
 
-- **0002-nvfp4-warp-quantizer.patch** - adds warp-cooperative NVFP4 activation
-  quantization with configurable scale search and an optional self-check.
+- **0002-nvfp4-residual-activations.patch** - keeps the native NVFP4 weight
+  path while reducing activation-quantization error. Each activation
+  sub-block is quantized once to FP4, its reconstruction residual is quantized
+  to a second FP4 block, and both contributions are accumulated by the same
+  MMQ tile. The correction is restricted to NVFP4; MXFP4 and non-native paths
+  retain their upstream behavior. Backend correctness tests use the standard
+  quantized-matmul tolerance rather than the previous relaxed NVFP4 threshold.
 
 - **0003-norm-mul-add-fusion.patch** - fuses affine LayerNorm with row-vector
   scale and optional bias.
@@ -116,6 +121,15 @@ stock comparison therefore requires both a pristine ggml checkout and
 
 - **0017-cuda-stream-interop.patch** - exposes borrowed access to the active
   CUDA stream and stable graph templates for external graph composition.
+
+- **0018-cuda-graph-dynamic-update.patch** - refreshes CUDA graph node
+  parameters when a cached graph is replayed so dynamic pointers and launch
+  geometry do not retain values from an earlier execution.
+
+- **0019-bf16-convolution.patch** - adds BF16 im2col and direct depthwise
+  convolution support, then fuses bias, BF16 output rounding, and optional
+  ReLU epilogues. This preserves the VoiceChat perception stem's native BF16
+  behavior without adding standalone conversion kernels.
 
 ## Regenerating after editing ggml
 
