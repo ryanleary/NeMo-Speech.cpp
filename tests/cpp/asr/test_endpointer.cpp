@@ -14,6 +14,7 @@
 // Usage: ./test_endpointer [<model.gguf> <audio.wav> [--gpu N] [--vad-model F]
 //                           [--chunk-ms N] [--gap-ms N] [--eou-ms N]]
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -48,6 +49,20 @@ starts_with_attach_punctuation(const std::string& text) {
     return tail.rfind("\xE0\xA5\xA4", 0) == 0 || tail.rfind("\xE0\xA5\xA5", 0) == 0 ||
            tail.rfind("\xE3\x80\x82", 0) == 0 || tail.rfind("\xEF\xBC\x81", 0) == 0 ||
            tail.rfind("\xEF\xBC\x9F", 0) == 0;
+}
+
+// A continuation is only legitimately capitalized if whatever came right
+// before it actually ended a sentence. Audio-content-agnostic on purpose (no
+// assumption about what words are in the clip) -- this is exactly the
+// correctness property a hard per-utterance reset at a false-positive
+// mid-sentence EOU breaks: the next segment gets capitalized as if it were a
+// brand new, unrelated utterance.
+static bool
+starts_with_uppercase_letter(const std::string& text) {
+    const size_t first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return false;
+    return std::isupper(static_cast<unsigned char>(text[first])) != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +179,12 @@ test_integration(int argc, char** argv) {
     cfg.vad.model_path = vad_model;
     cfg.vad.masker.mask_enable = !no_masking;
     cfg.endpointing = ep;
-    cfg.streaming.rnnt_right_context = 1;  // R=1 for RNNT; the CTC runner ignores it
+    // -1 = the model's own trained cache-aware right-context (see
+    // StreamingConfig::rnnt_right_context's doc comment) -- NOT hardcoded to
+    // 1, which isn't even a supported context size for every RNNT model
+    // (e.g. nemotron-3.5-asr-streaming trains at R=3, and only exposes
+    // {0,3,6,13}); the CTC runner ignores this either way.
+    cfg.streaming.rnnt_right_context = -1;
 
     std::unique_ptr<AsrRunner> runner;
     if (model->head_kind() == HeadKind::Rnnt) {
@@ -172,6 +192,12 @@ test_integration(int argc, char** argv) {
     } else {
         runner = std::make_unique<BufferedStreamRunner>(static_cast<CtcModel*>(model.get()), cfg);
     }
+    // Prompt-conditioned multilingual RNNT models (nemotron-3.5) need a
+    // prompt slot set before they'll decode at all -- Recognizer::
+    // streaming_recognize always does this (see recognizer.cpp); this
+    // harness constructs runners directly, bypassing Recognizer, so it has
+    // to do the same. No-op (returns -1) for non-prompt models.
+    runner->set_prompt_index(model->prompt_index_for_lang("auto"));
     AsrRequestOptions request_options;
     request_options.enable_word_time_offsets = true;
     runner->set_request_options(request_options);
@@ -187,7 +213,7 @@ test_integration(int argc, char** argv) {
         ep_off.enable = false;
         RecognizerConfig pcfg;
         pcfg.endpointing = ep_off;
-        pcfg.streaming.rnnt_right_context = 1;  // R=1 for RNNT; the CTC runner ignores it
+        pcfg.streaming.rnnt_right_context = -1;  // model default -- see cfg above
         std::unique_ptr<AsrRunner> probe;
         if (model->head_kind() == HeadKind::Rnnt) {
             probe = std::make_unique<CacheStreamRunner>(static_cast<RnntModel*>(model.get()), pcfg);
@@ -195,6 +221,7 @@ test_integration(int argc, char** argv) {
             probe =
                 std::make_unique<BufferedStreamRunner>(static_cast<CtcModel*>(model.get()), pcfg);
         }
+        probe->set_prompt_index(model->prompt_index_for_lang("auto"));
         const size_t head = std::min(audio.size(), static_cast<size_t>(4) * sr);
         for (size_t off = 0; off < head; off += chunk_samples) {
             const size_t n = std::min(chunk_samples, head - off);
@@ -211,9 +238,11 @@ test_integration(int argc, char** argv) {
     }
 
     std::vector<std::string> finals;
+    std::vector<float> final_audio_processed_sec;
     std::vector<int64_t> first_word_frames;
     const auto record_final = [&](const StreamingUpdate& update) {
         finals.push_back(update.transcript_so_far);
+        final_audio_processed_sec.push_back(update.audio_processed_sec);
         if (!update.words.empty())
             first_word_frames.push_back(update.words.front().start_frame);
     };
@@ -252,6 +281,37 @@ test_integration(int argc, char** argv) {
     check(
         leading_punctuation == 0,
         "integration: terminal punctuation does not leak into the next final");
+    // Catches what leading_punctuation above doesn't: a continuation
+    // capitalized as if it started a fresh, unrelated utterance. Can't use
+    // the previous segment's own trailing punctuation to decide whether
+    // capitalization is justified here -- a leaked/spurious terminal '.'/'?'
+    // is itself a symptom of the exact same bug (the finalizing_ EOU
+    // punctuation floor firing on a false mid-sentence EOU), so trusting it
+    // would validate the bug using its own artifact. Instead, use ground
+    // truth this harness itself controls: `audio` is built as
+    // [one utterance | gap silence | one utterance], so no real utterance-2
+    // content has even been fed to the runner until audio_processed_sec
+    // reaches the end of the gap -- any final reported before then, however
+    // delayed by decode lag, can only be describing utterance 1, by
+    // construction never a real utterance boundary, and must never be
+    // capitalized (this is the primary symptom of a false-positive
+    // mid-sentence EOU hard-resetting decoder state; see
+    // CacheStreamRunner::finish_endpoint's doc comment).
+    const float first_utterance_and_gap_sec =
+        static_cast<float>(one.size()) / static_cast<float>(sr) +
+        static_cast<float>(gap_ms) / 1000.0f;
+    int spurious_capitalization = 0;
+    for (size_t i = 1; i < finals.size(); i++) {
+        if (finals[i].empty())
+            continue;
+        if (final_audio_processed_sec[i] >= first_utterance_and_gap_sec)
+            continue;  // at/after this point a real utterance boundary is possible
+        if (starts_with_uppercase_letter(finals[i]))
+            spurious_capitalization++;
+    }
+    check(
+        spurious_capitalization == 0,
+        "integration: no internal split of the first utterance is capitalized as a new sentence");
     check(
         first_word_frames.size() >= 2 &&
             std::is_sorted(first_word_frames.begin(), first_word_frames.end()),
