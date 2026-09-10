@@ -1041,37 +1041,12 @@ CacheStreamRunner::step() {
 
 void
 CacheStreamRunner::finish_endpoint(StreamingUpdate& update) {
-    // A mid-stream EOU is a *reporting* boundary, not an audio-stream
-    // boundary -- see this method's declaration doc comment. It used to also
-    // hard-reset encoder cache and predictor state (Decoder::reset(),
-    // zero_caches(), cache_filled_frames_, attn_mask_) and flush a
-    // zero-padded synthetic tail through the finalizing_ (is_last) path to
-    // resolve trailing subwords early. Both are deliberately gone now:
-    //
-    // - The hard reset destroyed the model's acoustic/linguistic context
-    //   right at the boundary, so the next segment decoded as if it were a
-    //   brand new, context-free utterance -- wrong capitalization and (per
-    //   the finalizing_ EOU punctuation floor below) a spurious terminal
-    //   '.'/'?' that has nothing to do with the actual grammar.
-    // - The synthetic zero-pad tail flush exists to give the encoder extra
-    //   right-context lookahead for words it hasn't fully resolved yet (see
-    //   finalize()'s identical technique for genuine end-of-stream). That's
-    //   only needed because the old code was about to reset state and lose
-    //   the chance to keep decoding; without a reset, real subsequent audio
-    //   keeps arriving and resolves any still-open word exactly the way it
-    //   already does everywhere else in this runner (see
-    //   process_one_chunk/step) -- no synthetic frames required.
-    // - `finalizing_`/set_finalizing(true) specifically biases the RNNT head
-    //   to float a marginal terminal '.'/'?' logit above blank (see
-    //   RnntGreedyDecoder's punct-bias comment) -- appropriate at a genuine
-    //   end of stream, wrong here: an ordinary mid-utterance pause is not
-    //   grammatically "the end of a sentence," and forcing punctuation there
-    //   is exactly the class of bug this fix removes.
-    //
-    // fire_eou's own Decoder::reset_utterance() (not reset()) already is the
-    // right-sized reset for a checkpoint like this: see reset_utterance()'s
-    // doc comment -- "soft utterance reset for callers that intentionally
-    // preserve predictor context."
+    // Used to also hard-reset encoder cache/predictor state and flush a
+    // synthetic zero-padded tail (which biases the RNNT head toward a
+    // terminal '.'/'?'). Both removed: an ordinary mid-sentence pause isn't
+    // a real utterance end, so it shouldn't wipe context or force
+    // punctuation. fire_eou's Decoder::reset_utterance() is already the
+    // right-sized reset for a checkpoint like this.
     fire_eou(head_.get(), opts_, all_tokens_, transcript_, update);
 }
 

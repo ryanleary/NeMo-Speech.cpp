@@ -51,12 +51,7 @@ starts_with_attach_punctuation(const std::string& text) {
            tail.rfind("\xEF\xBC\x9F", 0) == 0;
 }
 
-// A continuation is only legitimately capitalized if whatever came right
-// before it actually ended a sentence. Audio-content-agnostic on purpose (no
-// assumption about what words are in the clip) -- this is exactly the
-// correctness property a hard per-utterance reset at a false-positive
-// mid-sentence EOU breaks: the next segment gets capitalized as if it were a
-// brand new, unrelated utterance.
+// Detects a continuation capitalized as if it started a new sentence.
 static bool
 starts_with_uppercase_letter(const std::string& text) {
     const size_t first = text.find_first_not_of(" \t\r\n");
@@ -179,11 +174,9 @@ test_integration(int argc, char** argv) {
     cfg.vad.model_path = vad_model;
     cfg.vad.masker.mask_enable = !no_masking;
     cfg.endpointing = ep;
-    // -1 = the model's own trained cache-aware right-context (see
-    // StreamingConfig::rnnt_right_context's doc comment) -- NOT hardcoded to
-    // 1, which isn't even a supported context size for every RNNT model
-    // (e.g. nemotron-3.5-asr-streaming trains at R=3, and only exposes
-    // {0,3,6,13}); the CTC runner ignores this either way.
+    // -1 = model's trained right-context; 1 isn't a supported value for
+    // every RNNT model (e.g. nemotron-3.5-asr-streaming only supports
+    // {0,3,6,13}).
     cfg.streaming.rnnt_right_context = -1;
 
     std::unique_ptr<AsrRunner> runner;
@@ -192,11 +185,8 @@ test_integration(int argc, char** argv) {
     } else {
         runner = std::make_unique<BufferedStreamRunner>(static_cast<CtcModel*>(model.get()), cfg);
     }
-    // Prompt-conditioned multilingual RNNT models (nemotron-3.5) need a
-    // prompt slot set before they'll decode at all -- Recognizer::
-    // streaming_recognize always does this (see recognizer.cpp); this
-    // harness constructs runners directly, bypassing Recognizer, so it has
-    // to do the same. No-op (returns -1) for non-prompt models.
+    // Required for prompt-conditioned models (nemotron-3.5); Recognizer
+    // normally does this, but this harness bypasses Recognizer.
     runner->set_prompt_index(model->prompt_index_for_lang("auto"));
     AsrRequestOptions request_options;
     request_options.enable_word_time_offsets = true;
@@ -281,22 +271,12 @@ test_integration(int argc, char** argv) {
     check(
         leading_punctuation == 0,
         "integration: terminal punctuation does not leak into the next final");
-    // Catches what leading_punctuation above doesn't: a continuation
-    // capitalized as if it started a fresh, unrelated utterance. Can't use
-    // the previous segment's own trailing punctuation to decide whether
-    // capitalization is justified here -- a leaked/spurious terminal '.'/'?'
-    // is itself a symptom of the exact same bug (the finalizing_ EOU
-    // punctuation floor firing on a false mid-sentence EOU), so trusting it
-    // would validate the bug using its own artifact. Instead, use ground
-    // truth this harness itself controls: `audio` is built as
-    // [one utterance | gap silence | one utterance], so no real utterance-2
-    // content has even been fed to the runner until audio_processed_sec
-    // reaches the end of the gap -- any final reported before then, however
-    // delayed by decode lag, can only be describing utterance 1, by
-    // construction never a real utterance boundary, and must never be
-    // capitalized (this is the primary symptom of a false-positive
-    // mid-sentence EOU hard-resetting decoder state; see
-    // CacheStreamRunner::finish_endpoint's doc comment).
+    // Catches what leading_punctuation doesn't: spurious capitalization.
+    // Can't trust the previous segment's own trailing punctuation as
+    // justification -- a leaked '.'/'?' is itself a symptom of the same bug.
+    // Instead use ground truth this harness controls: no utterance-2 audio
+    // is fed until the gap ends, so any final before that point can only be
+    // an internal (never legitimate) split of utterance 1.
     const float first_utterance_and_gap_sec =
         static_cast<float>(one.size()) / static_cast<float>(sr) +
         static_cast<float>(gap_ms) / 1000.0f;
