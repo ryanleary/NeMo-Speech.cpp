@@ -844,10 +844,8 @@ CacheStreamRunner::set_request_options(const AsrRequestOptions& opts) {
 
 void
 CacheStreamRunner::force_eou() {
-    if (endpointer_) {
-        force_eou_pending_ = true;
+    if (endpointer_)
         endpointer_->force();
-    }
 }
 
 void
@@ -1022,7 +1020,7 @@ CacheStreamRunner::step() {
             stream_zero_padded_ = true;
         }
         process_one_chunk(/*is_last=*/false);
-        if (poll_endpoint(update, /*after_chunk=*/true))
+        if (poll_endpoint(update))
             break;
     }
     update.new_token_ids = last_step_new_tokens_;
@@ -1034,7 +1032,7 @@ CacheStreamRunner::step() {
         static_cast<float>(audio_end) / static_cast<float>(model_->fe_config().sample_rate);
     // A pending force_eou() must fire even on a chunk-less step.
     if (!update.is_final)
-        poll_endpoint(update, /*after_chunk=*/false);
+        poll_endpoint(update);
     if (!update.is_final && opts_.needs_word_timings() && head_)
         update.words = head_->word_timings();
     trim_buffers();
@@ -1042,67 +1040,43 @@ CacheStreamRunner::step() {
 }
 
 void
-CacheStreamRunner::finish_endpoint(StreamingUpdate& update, bool preserve_buffered_future) {
-    compact_mel_buffer();
-    const int n_mels = model_->fe_config().n_mels;
-    const int sub = enc_cfg_.subsampling_factor;
-    const int R = enc_cfg_.cache_right_ctx;
-    const int chunk_size_mel = pre_encode_cache_size_ + sub * (1 + R);
-    const int shift_size_mel = sub * (1 + R - cache_drop_size_);
-
-    // After a decoded chunk, mel_buf_ starts with the encoder overlap. Frames
-    // beyond it have not been decoded and belong to the next utterance when
-    // endpointing fired automatically. A forced EOU instead commits all audio
-    // already supplied by the caller.
-    std::vector<float> next_mel;
-    if (preserve_buffered_future) {
-        const int overlap_frames = chunk_size_mel - shift_size_mel;
-        const size_t split = std::min(
-            mel_buf_.size(), static_cast<size_t>(overlap_frames) * static_cast<size_t>(n_mels));
-        next_mel.assign(mel_buf_.begin() + split, mel_buf_.end());
-        mel_buf_.resize(split);
-    }
-
-    // Flush the acoustic tail through the same EOS path as finalize(). The
-    // synthetic frames may commit terminal punctuation, but they must not
-    // advance the stream clock used by the next utterance.
-    const int64_t real_frames_emitted = total_frames_emitted_;
-    const int real_chunks_processed = chunks_processed_;
-    finalizing_ = true;
-    if (!mel_buf_.empty()) {
-        if (!stream_zero_padded_) {
-            mel_buf_.insert(
-                mel_buf_.begin(), static_cast<size_t>(pre_encode_cache_size_) * n_mels, 0.0f);
-            stream_zero_padded_ = true;
-        }
-        const size_t flush_frames = static_cast<size_t>(chunk_size_mel + shift_size_mel);
-        mel_buf_.resize(mel_buf_.size() + flush_frames * static_cast<size_t>(n_mels), 0.0f);
-        while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >= chunk_size_mel)
-            process_one_chunk(/*is_last=*/true);
-    }
-
+CacheStreamRunner::finish_endpoint(StreamingUpdate& update) {
+    // A mid-stream EOU is a *reporting* boundary, not an audio-stream
+    // boundary -- see this method's declaration doc comment. It used to also
+    // hard-reset encoder cache and predictor state (Decoder::reset(),
+    // zero_caches(), cache_filled_frames_, attn_mask_) and flush a
+    // zero-padded synthetic tail through the finalizing_ (is_last) path to
+    // resolve trailing subwords early. Both are deliberately gone now:
+    //
+    // - The hard reset destroyed the model's acoustic/linguistic context
+    //   right at the boundary, so the next segment decoded as if it were a
+    //   brand new, context-free utterance -- wrong capitalization and (per
+    //   the finalizing_ EOU punctuation floor below) a spurious terminal
+    //   '.'/'?' that has nothing to do with the actual grammar.
+    // - The synthetic zero-pad tail flush exists to give the encoder extra
+    //   right-context lookahead for words it hasn't fully resolved yet (see
+    //   finalize()'s identical technique for genuine end-of-stream). That's
+    //   only needed because the old code was about to reset state and lose
+    //   the chance to keep decoding; without a reset, real subsequent audio
+    //   keeps arriving and resolves any still-open word exactly the way it
+    //   already does everywhere else in this runner (see
+    //   process_one_chunk/step) -- no synthetic frames required.
+    // - `finalizing_`/set_finalizing(true) specifically biases the RNNT head
+    //   to float a marginal terminal '.'/'?' logit above blank (see
+    //   RnntGreedyDecoder's punct-bias comment) -- appropriate at a genuine
+    //   end of stream, wrong here: an ordinary mid-utterance pause is not
+    //   grammatically "the end of a sentence," and forcing punctuation there
+    //   is exactly the class of bug this fix removes.
+    //
+    // fire_eou's own Decoder::reset_utterance() (not reset()) already is the
+    // right-sized reset for a checkpoint like this: see reset_utterance()'s
+    // doc comment -- "soft utterance reset for callers that intentionally
+    // preserve predictor context."
     fire_eou(head_.get(), opts_, all_tokens_, transcript_, update);
-
-    // An EOU is a decoder boundary, not a new audio stream. Reset model state
-    // and segment-local buffers while retaining global FE/VAD cursors and the
-    // absolute encoder-frame clock.
-    if (head_)
-        head_->reset();
-    zero_caches();
-    cache_filled_frames_ = 0;
-    std::fill(attn_mask_.begin(), attn_mask_.end(), 0.0f);
-    mel_buf_ = std::move(next_mel);
-    mel_offset_ = 0;
-    stream_zero_padded_ = false;
-    total_frames_emitted_ = real_frames_emitted;
-    chunks_processed_ = real_chunks_processed;
-    last_enc_out_.clear();
-    last_enc_T_ = 0;
-    finalizing_ = false;
 }
 
 bool
-CacheStreamRunner::poll_endpoint(StreamingUpdate& update, bool after_chunk) {
+CacheStreamRunner::poll_endpoint(StreamingUpdate& update) {
     if (!endpointer_ || finalizing_)
         return false;
     const int sample_rate = model_->fe_config().sample_rate;
@@ -1131,9 +1105,7 @@ CacheStreamRunner::poll_endpoint(StreamingUpdate& update, bool after_chunk) {
     }
     if (!endpointer_->poll(now_ms, last_speech_ms))
         return false;
-    const bool preserve_buffered_future = after_chunk && !force_eou_pending_;
-    force_eou_pending_ = false;
-    finish_endpoint(update, preserve_buffered_future);
+    finish_endpoint(update);
     return true;
 }
 
@@ -1264,7 +1236,6 @@ CacheStreamRunner::reset() {
     audio_fed_to_vad_ = 0;
     if (endpointer_)
         endpointer_->reset();
-    force_eou_pending_ = false;
     vad_scan_frame_ = 0;
     vad_speech_seen_frame_ = -1;
     cache_filled_frames_ = 0;

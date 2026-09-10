@@ -277,15 +277,24 @@ class CacheStreamRunner final : public AsrRunner {
 
    private:
     void process_one_chunk(bool /*is_last*/);
-    void finish_endpoint(StreamingUpdate& update, bool preserve_buffered_future);
+    // A mid-stream EOU is a reporting checkpoint, not an audio-stream
+    // boundary: it snapshots is_final=true/transcript_so_far for the caller
+    // but leaves encoder cache and predictor state alone, so the *next*
+    // segment naturally continues the same utterance (right capitalization,
+    // no spurious terminal punctuation, no lost acoustic/linguistic
+    // context). See fire_eou's already-soft Decoder::reset_utterance() (not
+    // Decoder::reset()) -- this just stops layering a second, harder reset
+    // on top of it.
+    void finish_endpoint(StreamingUpdate& update);
     void upload_attn_mask();
     void zero_caches();
     // Poll the endpointer on the decode clock (now = encoder frames emitted;
     // last speech = VAD bits over decoded mel frames, or the decoder's
-    // last_emit_frame). Called after each processed chunk. On EOU it runs the
-    // normal EOS path, then starts the next utterance with fresh encoder and
-    // predictor state. The chunk loop breaks when this returns true.
-    bool poll_endpoint(StreamingUpdate& update, bool after_chunk);
+    // last_emit_frame). Called after each processed chunk. On EOU it reports
+    // a soft checkpoint via finish_endpoint (see its doc comment) -- encoder
+    // and predictor state carry on unchanged. The chunk loop breaks when
+    // this returns true.
+    bool poll_endpoint(StreamingUpdate& update);
     // Drop the audio prefix that FE and VAD have both consumed.
     void trim_buffers();
     void compact_mel_buffer();
@@ -321,12 +330,12 @@ class CacheStreamRunner final : public AsrRunner {
     // GLOBAL sample count already fed to vad_.
     size_t audio_fed_to_vad_ = 0;
 
-    // Always constructed so force_eou() works with threshold endpointing off. Polled
-    // after each chunk; on fire the runner emits is_final and resets
-    // per-utterance state. Encoder and predictor state are reset at the
-    // boundary so delayed tokens cannot leak into the next utterance.
+    // Always constructed so force_eou() works with threshold endpointing off.
+    // Polled after each chunk; on fire the runner emits is_final as a soft
+    // reporting checkpoint (see finish_endpoint's doc comment) -- encoder and
+    // predictor state are deliberately NOT reset at the boundary, so the next
+    // segment keeps full acoustic/linguistic context.
     std::unique_ptr<VadEndpointer> endpointer_;
-    bool force_eou_pending_ = false;
     // VAD-driven EOU scan state: next global mel frame to scan, and the last
     // speech mel frame seen at or before the decode cursor.
     int64_t vad_scan_frame_ = 0;
