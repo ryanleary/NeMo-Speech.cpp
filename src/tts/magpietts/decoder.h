@@ -72,8 +72,6 @@ struct MagpieWaveDecodeItem {
     // Length is this chunk's own text_len, not the wave's widest.
     const std::vector<float>* prior = nullptr;
     std::vector<float>* alignment_scores = nullptr;
-    magpietts_backend_tensor* cond_hidden = nullptr;
-    magpietts_backend_tensor* uncond_hidden = nullptr;
 };
 
 struct decoder_result {
@@ -152,9 +150,13 @@ class MagpieDecoder {
     // Each item must already have been stepped once through the single-item
     // path: that is the only path that can prefill a chunk's baked context, and
     // its K/V caches are what seed this one's columns.
+    // cond_hidden_out and uncond_hidden_out are [n_embd, items] -- the whole
+    // wave's guidance pair in one pair of tensors, which is what the batched
+    // local transformer reads.
     bool evalWave(
         std::vector<MagpieWaveDecodeItem>& items, int speaker, int threads,
-        int stacked_position_budget) const;
+        int stacked_position_budget, magpietts_backend_tensor* cond_hidden_out,
+        magpietts_backend_tensor* uncond_hidden_out) const;
 
     // Drop a wave runtime so the next call rebuilds it. A wave's width and its
     // items' cross-K/V addresses are baked into the graph.

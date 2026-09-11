@@ -72,6 +72,7 @@ class LocalTransformerGraph {
 
     int codebook_idx = -1;
     int seq_len = 0;
+    int batch = 1;
     bool pair = false;
 
     std::vector<float> logits_cond_data;
@@ -89,7 +90,7 @@ class LocalTransformerGraphBank {
     LocalTransformerGraphBank& operator=(LocalTransformerGraphBank&& other) noexcept;
 
     void reset();
-    bool beginFrame(const magpietts_model& model, bool pair);
+    bool beginFrame(const magpietts_model& model, bool pair, int batch = 1);
 
     std::vector<LocalTransformerGraph> single_graphs;
     std::vector<LocalTransformerGraph> pair_graphs;
@@ -97,6 +98,9 @@ class LocalTransformerGraphBank {
     DecoderKvCache cond_cache;
     DecoderKvCache uncond_cache;
     LocalTransformerCudaAttentionCache pair_cuda_attention_cache;
+    // Width the composed sampler chain was last built at, so a change forces a
+    // rebuild instead of replaying a graph shaped for another wave.
+    int sequence_batch = 0;
 };
 
 using local_transformer_graph = LocalTransformerGraph;
@@ -563,11 +567,18 @@ LocalTransformerGraphBank::reset() {
 }
 
 bool
-LocalTransformerGraphBank::beginFrame(const magpietts_model& model, bool pair) {
+LocalTransformerGraphBank::beginFrame(const magpietts_model& model, bool pair, int batch) {
     const auto& h = model.hparams;
+    batch = batch > 0 ? batch : 1;
     if (pair) {
         if (magpietts_fused_cached_attention_available(model.backend)) {
-            return pair_cuda_attention_cache.init(model, 2);
+            // Two guidance lanes per item, and one K/V history per lane: a
+            // batch item must not read another's codebook history.
+            return pair_cuda_attention_cache.init(model, 2 * batch);
+        }
+        if (batch > 1) {
+            fprintf(stderr, "batched local transformer requires the fused cached attention\n");
+            return false;
         }
         if (!cond_cache.init(
                 model.backend, h.lt_layers, h.lt_ctx, h.lt_hidden, "local conditional") ||
@@ -591,7 +602,9 @@ local_self_attention_cuda_cached_pair(
     ggml_context* ctx, const magpietts_transformer& tr, const magpietts_layer& layer,
     LocalTransformerCudaAttentionCache& cache, int layer_index, ggml_tensor* cache_state,
     ggml_tensor* x) {
-    constexpr int kCfgLanes = 2;
+    // Conditional columns for every item, then unconditional: 2B lanes, which
+    // is what the cache, the slot ids and the cache state are all sized to.
+    const int64_t kCfgLanes = x->ne[1];
     const int64_t n_embd = tr.n_embd;
     const int64_t d_head = n_embd / tr.n_head;
     ggml_tensor* qkv =
@@ -755,7 +768,7 @@ local_transformer_forward_cached_pair_fixed_pos(
 static bool
 local_transformer_graph_init(
     const magpietts_model& model, bool pair, int codebook_idx, local_transformer_graph_bank& bank,
-    local_transformer_graph& graph) {
+    local_transformer_graph& graph, int batch = 1) {
     const ggml_nvtx::range nvtx_range(
         pair ? "magpietts_local_transformer_pair_graph_init"
              : "magpietts_local_transformer_graph_init");
@@ -784,6 +797,7 @@ local_transformer_graph_init(
     graph.gf = ggml_new_graph_custom(graph.ctx, MAGPIETTS_MAX_NODES, false);
     graph.codebook_idx = codebook_idx;
     graph.seq_len = 1;
+    graph.batch = batch > 0 ? batch : 1;
     graph.pair = pair;
     const bool cuda_cached_attention =
         pair && magpietts_fused_cached_attention_available(model.backend);
@@ -810,22 +824,25 @@ local_transformer_graph_init(
 
         ggml_tensor* input_cond = nullptr;
         ggml_tensor* input_uncond = nullptr;
+        const int batch_columns = graph.batch;
         if (codebook_idx == 0) {
-            graph.dec_cond = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, h.n_embd, 1);
+            graph.dec_cond =
+                ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, h.n_embd, batch_columns);
             ggml_set_name(
                 graph.dec_cond, pair ? "magpietts_local_transformer_dec_cond"
                                      : "magpietts_local_transformer_dec_last");
             ggml_set_input(graph.dec_cond);
             input_cond = graph.dec_cond;
             if (pair) {
-                graph.dec_uncond = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, h.n_embd, 1);
+                graph.dec_uncond =
+                    ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, h.n_embd, batch_columns);
                 ggml_set_name(graph.dec_uncond, "magpietts_local_transformer_dec_uncond");
                 ggml_set_input(graph.dec_uncond);
                 input_uncond = graph.dec_uncond;
             }
         } else {
             const std::string name = "magpietts_local_transformer_prev_code";
-            graph.prev_token = ggml_new_tensor_1d(graph.ctx, GGML_TYPE_I32, 1);
+            graph.prev_token = ggml_new_tensor_1d(graph.ctx, GGML_TYPE_I32, batch_columns);
             ggml_set_name(graph.prev_token, name.c_str());
             ggml_set_input(graph.prev_token);
             ggml_tensor* emb = ggml_get_rows(
@@ -854,11 +871,12 @@ local_transformer_graph_init(
             ggml_tensor* logits_pair = linear(
                 graph.ctx, model.lt_out_w[codebook_idx], out_pair, model.lt_out_b[codebook_idx]);
             logits_pair = as_f32_contig(graph.ctx, logits_pair);
-            graph.logits_cond =
-                ggml_view_2d(graph.ctx, logits_pair, h.audio_vocab_size, 1, logits_pair->nb[1], 0);
+            graph.logits_cond = ggml_view_2d(
+                graph.ctx, logits_pair, h.audio_vocab_size, batch_columns, logits_pair->nb[1], 0);
             graph.logits_uncond = ggml_view_2d(
-                graph.ctx, logits_pair, h.audio_vocab_size, 1, logits_pair->nb[1],
-                cuda_cached_attention ? logits_pair->nb[1] : logits_pair->nb[2]);
+                graph.ctx, logits_pair, h.audio_vocab_size, batch_columns, logits_pair->nb[1],
+                cuda_cached_attention ? (size_t)batch_columns * logits_pair->nb[1]
+                                      : logits_pair->nb[2]);
             ggml_set_name(graph.logits_cond, "magpietts_local_transformer_logits_cond");
             ggml_set_name(graph.logits_uncond, "magpietts_local_transformer_logits_uncond");
             ggml_set_output(graph.logits_cond);
@@ -1067,9 +1085,10 @@ local_transformer_graph_eval_cuda(
                 return false;
             }
             char error[256] = {};
+            const int batch = graph.batch > 0 ? graph.batch : 1;
             if (!magpietts_cuda_copy_sampled_code_to_device(
-                    cuda_sample.sampler, prev_code_count - 1, graph.prev_token->data, error,
-                    sizeof(error))) {
+                    cuda_sample.sampler, (prev_code_count - 1) * batch, batch,
+                    graph.prev_token->data, error, sizeof(error))) {
                 fprintf(
                     stderr, "CUDA local-transformer previous-token copy failed: %s\n",
                     error[0] ? error : "unknown error");
@@ -1120,9 +1139,15 @@ local_transformer_graph_eval_cuda(
     const float* logits_uncond =
         graph.pair ? (const float*)graph.logits_uncond->data + off : nullptr;
     char error[256] = {};
+    // One codebook per item. Codes are round-major -- round c occupies slots
+    // [c*B, c*B+B) -- so the next round's handoff is one contiguous copy, and
+    // the codebook offset seeding the RNG becomes c*B+b, distinct for every
+    // (round, item) pair. At batch one that expression is c, unchanged.
+    const int sample_batch = graph.batch > 0 ? graph.batch : 1;
     const bool ok = magpietts_cuda_sample_codebooks_device_configured(
-        cuda_sample.sampler, logits_cond, logits_uncond, 1, model.hparams.audio_vocab_size,
-        model.hparams.audio_codebook_size, model.hparams.audio_eos_id, codebook_idx, codebook_idx,
+        cuda_sample.sampler, logits_cond, logits_uncond, sample_batch,
+        model.hparams.audio_vocab_size, model.hparams.audio_codebook_size,
+        model.hparams.audio_eos_id, codebook_idx * sample_batch, codebook_idx * sample_batch,
         error, sizeof(error));
     if (!ok) {
         fprintf(
@@ -1165,16 +1190,19 @@ local_transformer_graph_bank_eval_cuda(
     const magpietts_model& model, local_transformer_graph_bank& bank, bool use_cfg,
     const magpietts_backend_tensor& cond_hidden, const magpietts_backend_tensor& uncond_hidden,
     int prev_code_count, int codebook_idx, int threads,
-    magpietts_cuda_sample_request& cuda_sample) {
+    magpietts_cuda_sample_request& cuda_sample, int batch) {
     std::vector<local_transformer_graph>& graphs = use_cfg ? bank.pair_graphs : bank.single_graphs;
     if ((int)graphs.size() <= codebook_idx) {
         graphs.resize((size_t)codebook_idx + 1);
     }
+    batch = batch > 0 ? batch : 1;
 
     local_transformer_graph& graph = graphs[(size_t)codebook_idx];
+    // The batch is part of the shape, so a wave of a different width rebuilds.
+    // Waves are hundreds of steps long, so that is once per wave.
     if (!graph.ctx || !graph.gf || !graph.allocr || graph.codebook_idx != codebook_idx ||
-        graph.pair != use_cfg) {
-        if (!local_transformer_graph_init(model, use_cfg, codebook_idx, bank, graph)) {
+        graph.pair != use_cfg || graph.batch != batch) {
+        if (!local_transformer_graph_init(model, use_cfg, codebook_idx, bank, graph, batch)) {
             return false;
         }
     }
@@ -1309,11 +1337,16 @@ sample_local_codebooks_cuda_impl(
     const magpietts_backend_tensor& uncond_hidden, bool use_cfg, float cfg_scale, float temperature,
     int top_k, bool forbid_audio_eos, int threads, local_transformer_graph_bank& local_graphs,
     magpietts_cuda_sampler* cuda_sampler, uint64_t seed, int frame_index,
-    std::vector<int32_t>& codes, std::vector<int32_t>& argmax_codes) {
+    std::vector<int32_t>& codes, std::vector<int32_t>& argmax_codes, int batch) {
     const ggml_nvtx::range nvtx_range("magpietts_sample_local_codebooks_cuda");
     const auto& h = model.hparams;
-    if (!local_graphs.beginFrame(model, use_cfg)) {
+    batch = batch > 0 ? batch : 1;
+    if (!local_graphs.beginFrame(model, use_cfg, batch)) {
         return false;
+    }
+    if (local_graphs.sequence_batch != batch) {
+        magpietts_cuda_sampler_sequence_invalidate(cuda_sampler);
+        local_graphs.sequence_batch = batch;
     }
     char stream_error[256] = {};
     if (!magpietts_cuda_sampler_bind_stream(
@@ -1349,7 +1382,7 @@ sample_local_codebooks_cuda_impl(
         for (int c = 0; c < h.stacked_audio_codebooks(); ++c) {
             if (!local_transformer_graph_bank_eval_cuda(
                     model, local_graphs, use_cfg, cond_hidden, uncond_hidden, c, c, threads,
-                    cuda_sample)) {
+                    cuda_sample, batch)) {
                 return false;
             }
         }
@@ -1405,11 +1438,12 @@ sample_local_codebooks_cuda_impl(
             error[0] ? error : "unknown error");
         return false;
     }
-    codes.assign((size_t)h.stacked_audio_codebooks(), 0);
-    argmax_codes.assign((size_t)h.stacked_audio_codebooks(), 0);
+    const int sampled_slots = h.stacked_audio_codebooks() * batch;
+    codes.assign((size_t)sampled_slots, 0);
+    argmax_codes.assign((size_t)sampled_slots, 0);
     error[0] = '\0';
     if (!magpietts_cuda_copy_sampled_codebooks(
-            cuda_sampler, h.stacked_audio_codebooks(), codes.data(), argmax_codes.data(), error,
+            cuda_sampler, sampled_slots, codes.data(), argmax_codes.data(), error,
             sizeof(error))) {
         fprintf(
             stderr, "CUDA local-transformer sampled-code host copy failed: %s\n",
@@ -1471,11 +1505,11 @@ LocalCodebookSampler::sampleCuda(
     const magpietts_backend_tensor& cond_hidden, const magpietts_backend_tensor& uncond_hidden,
     bool use_cfg, float cfg_scale, float temperature, int top_k, bool forbid_audio_eos,
     magpietts_cuda_sampler* cuda_sampler, uint64_t seed, int frame_index,
-    std::vector<int32_t>& codes, std::vector<int32_t>& argmax_codes) {
+    std::vector<int32_t>& codes, std::vector<int32_t>& argmax_codes, int batch) {
     return sample_local_codebooks_cuda_impl(
         model_, cond_hidden, uncond_hidden, use_cfg, cfg_scale, temperature, top_k,
         forbid_audio_eos, threads_, *graph_bank_, cuda_sampler, seed, frame_index, codes,
-        argmax_codes);
+        argmax_codes, batch);
 }
 #endif
 

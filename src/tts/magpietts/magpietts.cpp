@@ -155,7 +155,10 @@ class MagpieStreamingWorkspace {
         : magpie_(magpie), encoder(magpie), decoder(magpie), local_sampler(magpie, 1),
           codec_decoder(codec) {}
 
-    bool beginRequest(int threads, bool use_cuda_sampling, int audio_codebooks) {
+    // A wave samples `batch` items per round, so the sampler's code and top-k
+    // buffers have to hold stacked_codebooks * batch slots, not just one item's.
+    bool beginRequest(int threads, bool use_cuda_sampling, int audio_codebooks, int batch = 1) {
+        audio_codebooks *= batch > 0 ? batch : 1;
         local_sampler.setThreads(threads);
         if (local_transformer_cpu_sampler) {
             local_transformer_cpu_sampler->setThreads(threads);
@@ -1213,7 +1216,9 @@ stream_magpie_to_audio(
     metrics.begin();
     outputs.metrics = &metrics;
 
-    if (!workspace.beginRequest(params.threads, use_cuda_sampling, h.stacked_audio_codebooks())) {
+    if (!workspace.beginRequest(
+            params.threads, use_cuda_sampling, h.stacked_audio_codebooks(),
+            std::max(1, params.batch_size))) {
         return false;
     }
     LocalCodebookSampler* local_sampler = nullptr;
@@ -1413,24 +1418,16 @@ stream_magpie_to_audio(
                     plan.size(), wave_width, params.longform_history_tokens);
             }
 
-            // The local transformer composes its codebook chain into one
-            // reusable CUDA graph, and that graph captures the *device
-            // pointers* of the hidden tensors it was built against. Handing it
-            // a different tensor per item makes every later item replay the
-            // first one's stale hidden state. So the sampler always reads this
-            // one pair, and each item's hidden is copied in before its turn.
-            magpietts_backend_tensor lt_cond;
-            magpietts_backend_tensor lt_uncond;
-            if (!lt_cond.alloc2d(magpie, GGML_TYPE_F32, h.n_embd, 1, "wave_lt_cond") ||
-                !lt_uncond.alloc2d(magpie, GGML_TYPE_F32, h.n_embd, 1, "wave_lt_uncond")) {
-                return cancel_worker();
-            }
-
             // Everything a step does once its hidden state exists: sample the
             // codebooks, advance the prior, decide whether the chunk is over,
             // and buffer the frames. Shared by the step-0 warmup and the wave.
+            // Codes arrive round-major from the batched sampler: round c of a
+            // wave of B occupies slots [c*B, c*B+B), so item b's codebook c is
+            // at c*B+b.
             auto wave_step_finish = [&](WaveItem& item, int step, std::vector<float>& scores,
-                                        bool collected) -> bool {
+                                        bool collected, const std::vector<int32_t>& all_codes,
+                                        const std::vector<int32_t>& all_argmax, int item_index,
+                                        int width) -> bool {
                 // A finished item still has to advance: the wave shares one ring
                 // head, so every column's history must grow by a frame a step.
                 // What it decodes is discarded, so it repeats its last frame.
@@ -1456,23 +1453,17 @@ stream_magpie_to_audio(
                 }
                 const bool forbid_eos =
                     step * h.frame_stacking_factor < h.min_generated_frames;
-                std::vector<int32_t> next_codes;
-                std::vector<int32_t> argmax_codes;
-                ggml_backend_tensor_copy_async(
-                    magpie.backend, magpie.backend, item.cond_hidden.tensor, lt_cond.tensor);
-                ggml_backend_tensor_copy_async(
-                    magpie.backend, magpie.backend, item.uncond_hidden.tensor, lt_uncond.tensor);
-                if (!local_sampler->sampleCuda(
-                        lt_cond, lt_uncond, params.use_cfg, h.cfg_scale,
-                        h.temperature, h.top_k, forbid_eos, workspace.cudaSampler(),
-                        (uint64_t)(uint32_t)params.seed, item.frames_made, next_codes,
-                        argmax_codes)) {
-                    return false;
-                }
-                if ((int)next_codes.size() != h.stacked_audio_codebooks() ||
-                    (int)argmax_codes.size() != h.stacked_audio_codebooks()) {
+                const int stacked = h.stacked_audio_codebooks();
+                if ((int)all_codes.size() != stacked * width ||
+                    (int)all_argmax.size() != stacked * width) {
                     fprintf(stderr, "CUDA sampler returned an unexpected number of codebooks\n");
                     return false;
+                }
+                std::vector<int32_t> next_codes((size_t)stacked);
+                std::vector<int32_t> argmax_codes((size_t)stacked);
+                for (int c = 0; c < stacked; ++c) {
+                    next_codes[(size_t)c] = all_codes[(size_t)(c * width + item_index)];
+                    argmax_codes[(size_t)c] = all_argmax[(size_t)(c * width + item_index)];
                 }
 
                 const bool final_chunk = item.chunk_index + 1 == token_chunks.size();
@@ -1601,17 +1592,30 @@ stream_magpie_to_audio(
                 // Step 0 goes through the single-item path: it is the only one
                 // that can prefill a chunk's baked context, and its K/V caches
                 // are what seed the wave's columns.
-                bool group_ok = true;
-                for (size_t k = 0; k < width && group_ok; ++k) {
+                // One [n_embd, width] pair carries the whole wave's guidance
+                // states, which is what the batched local transformer reads.
+                magpietts_backend_tensor wave_cond;
+                magpietts_backend_tensor wave_uncond;
+                if (!wave_cond.alloc2d(
+                        magpie, GGML_TYPE_F32, h.n_embd, (int)width, "wave_hidden_cond") ||
+                    !wave_uncond.alloc2d(
+                        magpie, GGML_TYPE_F32, h.n_embd, (int)width, "wave_hidden_uncond")) {
+                    return cancel_worker();
+                }
+
+                std::vector<std::vector<float>> step0_scores(width);
+                std::vector<char> step0_collect(width, 0);
+                std::vector<float> hidden_row((size_t)h.n_embd);
+                for (size_t k = 0; k < width; ++k) {
                     WaveItem& item = *plan[base + k];
                     decoder_result cond, uncond;
                     cond.logits_required = false;
                     uncond.logits_required = false;
-                    std::vector<float> scores;
                     magpietts_decoder_attention attn;
                     attn.prior = item.prior.priorForStep(h, item.text_len);
                     if (item.prior.shouldCollect(h, 0, item.text_len)) {
-                        attn.alignment_scores = &scores;
+                        step0_collect[k] = 1;
+                        attn.alignment_scores = &step0_scores[k];
                     }
                     const magpietts_decoder_attention* attn_arg =
                         (attn.prior || attn.alignment_scores) ? &attn : nullptr;
@@ -1620,15 +1624,37 @@ stream_magpie_to_audio(
                             params.threads, item.cond_kv, item.uncond_kv, cond, uncond,
                             max_decoder_positions, nullptr, &item.text_cond_device,
                             &item.cond_hidden, &item.uncond_hidden, &item.cross_kv, attn_arg)) {
-                        group_ok = false;
-                        break;
+                        return cancel_worker();
                     }
-                    if (!wave_step_finish(item, 0, scores, attn.alignment_scores != nullptr)) {
-                        group_ok = false;
-                    }
+                    // Gather this item's opening state into its column. Once per
+                    // group, so a host round-trip is cheaper than a wider graph.
+                    const size_t row_bytes = hidden_row.size() * sizeof(float);
+                    const size_t column = k * row_bytes;
+                    ggml_backend_tensor_get(
+                        item.cond_hidden.tensor, hidden_row.data(), 0, row_bytes);
+                    ggml_backend_tensor_set(
+                        wave_cond.tensor, hidden_row.data(), column, row_bytes);
+                    ggml_backend_tensor_get(
+                        item.uncond_hidden.tensor, hidden_row.data(), 0, row_bytes);
+                    ggml_backend_tensor_set(
+                        wave_uncond.tensor, hidden_row.data(), column, row_bytes);
                 }
-                if (!group_ok) {
-                    return cancel_worker();
+                {
+                    std::vector<int32_t> codes;
+                    std::vector<int32_t> argmax;
+                    if (!local_sampler->sampleCuda(
+                            wave_cond, wave_uncond, params.use_cfg, h.cfg_scale, h.temperature,
+                            h.top_k, 0 < h.min_generated_frames, workspace.cudaSampler(),
+                            (uint64_t)(uint32_t)params.seed, 0, codes, argmax, (int)width)) {
+                        return cancel_worker();
+                    }
+                    for (size_t k = 0; k < width; ++k) {
+                        if (!wave_step_finish(
+                                *plan[base + k], 0, step0_scores[k], step0_collect[k] != 0, codes,
+                                argmax, (int)k, (int)width)) {
+                            return cancel_worker();
+                        }
+                    }
                 }
                 for (int step = 1; step < max_decoder_positions; ++step) {
                     bool all_done = true;
@@ -1668,18 +1694,29 @@ stream_magpie_to_audio(
                             collect[k] = 1;
                             slot.alignment_scores = &scores[k];
                         }
-                        slot.cond_hidden = &item.cond_hidden;
-                        slot.uncond_hidden = &item.uncond_hidden;
                     }
                     const ggml_nvtx::range nvtx_step("magpietts_stream_wave_step");
                     if (!decoder.evalWave(
-                            slots, params.speaker, params.threads, max_decoder_positions)) {
+                            slots, params.speaker, params.threads, max_decoder_positions,
+                            &wave_cond, &wave_uncond)) {
                         fprintf(stderr, "%s wave decode step %d failed\n", label, step);
+                        return cancel_worker();
+                    }
+                    // One sampler call for the whole wave: the local transformer
+                    // runs its 8 rounds once, with width items per round.
+                    std::vector<int32_t> codes;
+                    std::vector<int32_t> argmax;
+                    if (!local_sampler->sampleCuda(
+                            wave_cond, wave_uncond, params.use_cfg, h.cfg_scale, h.temperature,
+                            h.top_k, step * h.frame_stacking_factor < h.min_generated_frames,
+                            workspace.cudaSampler(), (uint64_t)(uint32_t)params.seed, step, codes,
+                            argmax, (int)width)) {
                         return cancel_worker();
                     }
                     for (size_t k = 0; k < width; ++k) {
                         if (!wave_step_finish(
-                                *plan[base + k], step, scores[k], collect[k] != 0)) {
+                                *plan[base + k], step, scores[k], collect[k] != 0, codes, argmax,
+                                (int)k, (int)width)) {
                             return cancel_worker();
                         }
                     }

@@ -674,26 +674,21 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
         if (tr.norm_out)
             x = layer_norm(ctx, x, tr.norm_out);
 
-        // One [n_embd, 1] output per item per guidance half: conditional columns
-        // first, then unconditional. Splitting inside the captured graph costs a
-        // pair of tiny copies and hands the sampler a tensor it can already read,
-        // which a [n_embd, items] block is not. At one item this is the same
-        // single column the graph emitted before.
+        // Both guidance halves as [n_embd, items]: the conditional block, then
+        // the unconditional one. That is exactly the shape the batched local
+        // transformer consumes, so the wave hands these straight to it. At one
+        // item it is the single column the graph emitted before.
+        ggml_tensor* cond = ggml_cont_2d(
+            ctx, ggml_view_2d(ctx, x, tr.n_embd, items, x->nb[1], 0), tr.n_embd, items);
+        ggml_tensor* uncond = ggml_cont_2d(
+            ctx,
+            ggml_view_2d(ctx, x, tr.n_embd, items, x->nb[1], static_cast<size_t>(items) * x->nb[1]),
+            tr.n_embd, items);
+        ggml_set_name(cond, "magpietts_decoder_runtime_hidden_cond");
+        ggml_set_name(uncond, "magpietts_decoder_runtime_hidden_uncond");
         ggml_runtime::TensorBag outputs;
-        for (int half = 0; half < kMagpieCfgLanesPerItem; ++half) {
-            for (int item = 0; item < items; ++item) {
-                const int lane = half * items + item;
-                ggml_tensor* column = ggml_cont_2d(
-                    ctx,
-                    ggml_view_2d(
-                        ctx, x, tr.n_embd, 1, x->nb[1], static_cast<size_t>(lane) * x->nb[1]),
-                    tr.n_embd, 1);
-                ggml_set_name(
-                    column, half == 0 ? "magpietts_decoder_runtime_hidden_cond"
-                                      : "magpietts_decoder_runtime_hidden_uncond");
-                outputs.add_tensor({column, bf_ctx.buft});
-            }
-        }
+        outputs.add_tensor({cond, bf_ctx.buft});
+        outputs.add_tensor({uncond, bf_ctx.buft});
         for (const std::vector<ggml_tensor*>& per_item : alignment_outputs) {
             if (per_item.size() != alignment_count_) {
                 throw std::runtime_error("Magpie persistent decoder alignment topology changed");
@@ -968,10 +963,10 @@ class MagpieDecoder::PersistentDecoderRuntime {
         std::vector<ggml_runtime::Session::Output> outputs(has_alignment ? 3 : 2);
         outputs[0].index = 0;
         outputs[0].device_tensor = &cond_device;
-        outputs[1].index = items;
+        outputs[1].index = 1;
         outputs[1].device_tensor = &uncond_device;
         if (has_alignment) {
-            outputs[2].index = kMagpieCfgLanesPerItem * items;
+            outputs[2].index = 2;
             outputs[2].host_buffer = alignment.data();
             outputs[2].nbytes = alignment.size() * sizeof(float);
         }
@@ -1004,11 +999,15 @@ class MagpieDecoder::PersistentDecoderRuntime {
     // A wave step. The ring, the mask and the position are shared -- items move
     // in lockstep -- so what differs per item is its tokens, its prior, and
     // where its hidden state and alignment row are written back.
-    bool evalWave(std::vector<MagpieWaveDecodeItem>& wave) {
+    bool evalWave(
+        std::vector<MagpieWaveDecodeItem>& wave, magpietts_backend_tensor* cond_hidden_out,
+        magpietts_backend_tensor* uncond_hidden_out) {
         const ggml_nvtx::range nvtx_range("magpietts_persistent_decoder_eval_wave");
         const magpietts_hparams& h = model_.hparams;
         const int items = items_();
-        if (static_cast<int>(wave.size()) != items || n_tokens_ >= cache_len_) {
+        if (static_cast<int>(wave.size()) != items || n_tokens_ >= cache_len_ || !cond_hidden_out ||
+            !uncond_hidden_out || !cond_hidden_out->tensor || !uncond_hidden_out->tensor ||
+            cond_hidden_out->tensor->ne[1] != items || uncond_hidden_out->tensor->ne[1] != items) {
             return false;
         }
 
@@ -1016,8 +1015,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
             static_cast<size_t>(items) * static_cast<size_t>(h.stacked_audio_codebooks()));
         for (int item = 0; item < items; ++item) {
             MagpieWaveDecodeItem& slot = wave[static_cast<size_t>(item)];
-            if (!slot.audio_codes || !slot.cond_hidden || !slot.uncond_hidden ||
-                !slot.cond_hidden->tensor || !slot.uncond_hidden->tensor ||
+            if (!slot.audio_codes ||
                 static_cast<int>(slot.audio_codes->size()) != h.audio_codebooks) {
                 return false;
             }
@@ -1089,29 +1087,26 @@ class MagpieDecoder::PersistentDecoderRuntime {
         const bool has_alignment = module_.alignment_count() > 0;
         std::vector<float> alignment(
             static_cast<size_t>(text_len_) * static_cast<size_t>(items));
-        std::vector<ggml_runtime::DeviceTensor> hidden(
-            static_cast<size_t>(kMagpieCfgLanesPerItem * items));
-        std::vector<ggml_runtime::Session::Output> outputs(
-            hidden.size() + (has_alignment ? 1 : 0));
-        for (size_t i = 0; i < hidden.size(); ++i) {
-            outputs[i].index = static_cast<int>(i);
-            outputs[i].device_tensor = &hidden[i];
-        }
+        ggml_runtime::DeviceTensor cond_device;
+        ggml_runtime::DeviceTensor uncond_device;
+        std::vector<ggml_runtime::Session::Output> outputs(has_alignment ? 3 : 2);
+        outputs[0].index = 0;
+        outputs[0].device_tensor = &cond_device;
+        outputs[1].index = 1;
+        outputs[1].device_tensor = &uncond_device;
         if (has_alignment) {
-            outputs.back().index = kMagpieCfgLanesPerItem * items;
-            outputs.back().host_buffer = alignment.data();
-            outputs.back().nbytes = alignment.size() * sizeof(float);
+            outputs[2].index = 2;
+            outputs[2].host_buffer = alignment.data();
+            outputs[2].nbytes = alignment.size() * sizeof(float);
         }
         session_.run(inputs, outputs);
+        ggml_backend_tensor_copy_async(
+            model_.backend, model_.backend, cond_device.tensor, cond_hidden_out->tensor);
+        ggml_backend_tensor_copy_async(
+            model_.backend, model_.backend, uncond_device.tensor, uncond_hidden_out->tensor);
 
         for (int item = 0; item < items; ++item) {
             MagpieWaveDecodeItem& slot = wave[static_cast<size_t>(item)];
-            ggml_backend_tensor_copy_async(
-                model_.backend, model_.backend, hidden[static_cast<size_t>(item)].tensor,
-                slot.cond_hidden->tensor);
-            ggml_backend_tensor_copy_async(
-                model_.backend, model_.backend,
-                hidden[static_cast<size_t>(items + item)].tensor, slot.uncond_hidden->tensor);
             if (slot.alignment_scores) {
                 const int len = module_.item_text_len(item);
                 const float* row = alignment.data() + static_cast<size_t>(item) * text_len_;
@@ -1226,7 +1221,8 @@ MagpieDecoder::resetWave() const {
 bool
 MagpieDecoder::evalWave(
     std::vector<MagpieWaveDecodeItem>& items, int speaker, int threads,
-    int stacked_position_budget) const {
+    int stacked_position_budget, magpietts_backend_tensor* cond_hidden_out,
+    magpietts_backend_tensor* uncond_hidden_out) const {
     (void)speaker;
     (void)threads;
     if (items.empty()) {
@@ -1268,7 +1264,7 @@ MagpieDecoder::evalWave(
                 "device K/V arena enabled\n",
                 items.size());
         }
-        if (wave_runtime_->evalWave(items)) {
+        if (wave_runtime_->evalWave(items, cond_hidden_out, uncond_hidden_out)) {
             return true;
         }
         wave_runtime_.reset();
