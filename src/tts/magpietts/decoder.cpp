@@ -413,6 +413,10 @@ runtime_layer_selected(const std::vector<int32_t>& layers, int layer) {
            std::find(layers.begin(), layers.end(), static_cast<int32_t>(layer)) != layers.end();
 }
 
+// ggml's flash attention wants the mask's query axis padded; 64 is what
+// llama.cpp uses for the same reason and is a multiple of every warp tiling.
+static constexpr int64_t kMagpieKqMaskPad = 64;
+
 std::string
 runtime_kv_name(int layer) {
     return "magpietts.decoder.runtime.kv." + std::to_string(layer);
@@ -463,11 +467,20 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
 
         session->model_tensor_container->create_tensor_1d(
             "magpietts.decoder.runtime.slot_ids", GGML_TYPE_I32, kMagpieCfgLanes);
+        // F16 because ggml's flash attention wants it: handed an F32 cache it
+        // converts K and V on every call, which is the bulk of the win.
         for (int layer = 0; layer < model_.hparams.n_dec_layer; ++layer) {
             session->model_tensor_container->create_tensor_3d(
-                runtime_kv_name(layer), GGML_TYPE_F32,
+                runtime_kv_name(layer), GGML_TYPE_F16,
                 static_cast<int64_t>(model_.hparams.n_embd) * cache_len_, kMagpieCfgLanes, 2);
         }
+        // The ring rotates every step, so which slots are live changes while the
+        // shapes do not -- exactly what a captured graph allows. One mask serves
+        // both lanes: they share a ring head and a valid length.
+        session->model_tensor_container->create_tensor_2d(
+            "magpietts.decoder.runtime.fa_mask", GGML_TYPE_F16, cache_len_, kMagpieKqMaskPad);
+        session->model_tensor_container->create_tensor_1d(
+            "magpietts.decoder.runtime.write_rows", GGML_TYPE_I64, kMagpieCfgLanes);
     }
 
     ggml_runtime::TensorBag build_graph(
@@ -500,6 +513,10 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
         const int64_t d_head = tr.n_embd / tr.n_head;
         auto slots = session->model_tensor_container->get_tensor_by_name(
             "magpietts.decoder.runtime.slot_ids");
+        auto fa_mask = session->model_tensor_container->get_tensor_by_name(
+            "magpietts.decoder.runtime.fa_mask");
+        auto write_rows = session->model_tensor_container->get_tensor_by_name(
+            "magpietts.decoder.runtime.write_rows");
         std::vector<ggml_tensor*> alignment_outputs;
 
         for (int layer_index = 0; layer_index < static_cast<int>(tr.layers.size()); ++layer_index) {
@@ -519,20 +536,50 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
             ggml_tensor* v = split_heads(static_cast<size_t>(2 * tr.n_embd) * element);
             auto kv =
                 session->model_tensor_container->get_tensor_by_name(runtime_kv_name(layer_index));
-#if defined(NEMO_SPEECH_GGML_PATCHED)
-            ggml_tensor* heads = ggml_fused_attn_cached(
-                ctx, q, k, v, nullptr, kv.tensor, slots.tensor, cache_meta.tensor, cache_len_,
-                1.0f / std::sqrt(static_cast<float>(d_head)), true);
-#else
-            (void)q;
-            (void)k;
-            (void)v;
-            (void)kv;
-            ggml_tensor* heads = nullptr;
-            throw std::runtime_error("Magpie persistent decoder requires patched ggml");
-#endif
-            ggml_tensor* merged = ggml_reshape_2d(
-                ctx, ggml_permute(ctx, heads, 0, 2, 1, 3), tr.n_embd, kMagpieCfgLanes);
+            ggml_tensor* arena = kv.tensor;
+            const size_t aes = ggml_element_size(arena);
+
+            // Append this step's K and V. Lanes are consecutive slabs, so the
+            // two planes flatten to [n_embd, lanes * cache_len] and one row
+            // index per lane places both writes.
+            auto plane_rows = [&](int plane) {
+                return ggml_view_2d(
+                    ctx, arena, tr.n_embd, static_cast<int64_t>(kMagpieCfgLanes) * cache_len_,
+                    static_cast<size_t>(tr.n_embd) * aes,
+                    static_cast<size_t>(plane) * arena->nb[2]);
+            };
+            // The rows to append are already contiguous inside qkv -- one
+            // [n_embd] run per lane -- so take a 2d view rather than permuting
+            // the head-split view back and materialising it.
+            auto lane_rows = [&](size_t offset) {
+                return ggml_view_2d(ctx, qkv, tr.n_embd, kMagpieCfgLanes, qkv->nb[1], offset);
+            };
+            // Reading through the set_rows result rather than the arena makes
+            // the append an explicit dependency of the attention, so this step's
+            // K and V are in the ring before it is read regardless of node order.
+            ggml_tensor* k_plane = ggml_set_rows(
+                ctx, plane_rows(0), lane_rows(static_cast<size_t>(tr.n_embd) * element),
+                write_rows.tensor);
+            ggml_tensor* v_plane = ggml_set_rows(
+                ctx, plane_rows(1), lane_rows(static_cast<size_t>(2 * tr.n_embd) * element),
+                write_rows.tensor);
+
+            // Read the whole ring every step -- fixed shape, mask picks the live
+            // slots. Stored order is [d_head, n_head, cache_len] per lane, so a
+            // permute puts positions where flash attention wants them.
+            auto plane_heads = [&](ggml_tensor* plane) {
+                return ggml_permute(
+                    ctx,
+                    ggml_view_4d(
+                        ctx, plane, d_head, tr.n_head, cache_len_, kMagpieCfgLanes,
+                        static_cast<size_t>(d_head) * aes, static_cast<size_t>(tr.n_embd) * aes,
+                        arena->nb[1], 0),
+                    0, 2, 1, 3);
+            };
+            ggml_tensor* heads = ggml_flash_attn_ext(
+                ctx, q, plane_heads(k_plane), plane_heads(v_plane), fa_mask.tensor,
+                1.0f / std::sqrt(static_cast<float>(d_head)), 0.0f, 0.0f);
+            ggml_tensor* merged = ggml_reshape_2d(ctx, heads, tr.n_embd, kMagpieCfgLanes);
             x = ggml_add(ctx, residual, linear(ctx, layer.self_o, merged));
 
             // Text cross-attention applies only to the conditional lane.
@@ -661,6 +708,10 @@ class MagpieDecoder::PersistentDecoderRuntime {
         }
         ggml_context* ctx = new_graph_context();
         const size_t element = sizeof(float);
+        // The staging caches are F32 and the arena is F16, so seeding converts
+        // through a graph of ggml_cpy nodes rather than copying bytes.
+        ggml_cgraph* seed_gf = ggml_new_graph_custom(
+            ctx, static_cast<size_t>(16) * cond.n_layers * kMagpieCfgLanes + 256, false);
         const size_t source_layer_bytes = static_cast<size_t>(cond.n_ctx) * cond.n_embd * element;
         const size_t copy_elements = static_cast<size_t>(cond.n_tokens) * cond.n_embd;
         const size_t destination_token = static_cast<size_t>(cache_len_ - cond.n_tokens);
@@ -676,14 +727,16 @@ class MagpieDecoder::PersistentDecoderRuntime {
                     ggml_tensor* src = ggml_view_1d(
                         ctx, const_cast<ggml_tensor*>(sources[lane]), copy_elements,
                         static_cast<size_t>(layer) * source_layer_bytes);
-                    const size_t dst_offset = static_cast<size_t>(plane) * dst_base->nb[2] +
-                                              static_cast<size_t>(lane) * dst_base->nb[1] +
-                                              destination_token * cond.n_embd * element;
+                    const size_t dst_offset =
+                        static_cast<size_t>(plane) * dst_base->nb[2] +
+                        static_cast<size_t>(lane) * dst_base->nb[1] +
+                        destination_token * cond.n_embd * ggml_element_size(dst_base);
                     ggml_tensor* dst = ggml_view_1d(ctx, dst_base, copy_elements, dst_offset);
-                    ggml_backend_tensor_copy_async(model_.backend, model_.backend, src, dst);
+                    ggml_build_forward_expand(seed_gf, ggml_cpy(ctx, src, dst));
                 }
             }
         }
+        ggml_backend_graph_compute(model_.backend, seed_gf);
         ggml_backend_synchronize(model_.backend);
         ggml_free(ctx);
         n_tokens_ = cond.n_tokens;
@@ -728,6 +781,29 @@ class MagpieDecoder::PersistentDecoderRuntime {
         // only the active suffix while the graph and arena shapes remain constant.
         const int32_t cache_meta[kMagpieCfgLanes * 2] = {
             ring_head_, ring_head_, valid_tokens_, valid_tokens_};
+
+        // This step appends at physical slot ring_head_, and the live window is
+        // the valid_tokens_ most recent appends, which wraps. Positions are baked
+        // into K before projection, so attention is order-agnostic: the mask only
+        // has to say which slots are live, never reorder them.
+        {
+            auto mask = session_.model_tensor_container->get_tensor_by_name(
+                "magpietts.decoder.runtime.fa_mask");
+            auto rows = session_.model_tensor_container->get_tensor_by_name(
+                "magpietts.decoder.runtime.write_rows");
+            const int live = std::min(valid_tokens_ + 1, cache_len_);
+            std::vector<ggml_fp16_t> mask_host(
+                static_cast<size_t>(cache_len_) * kMagpieKqMaskPad, ggml_fp32_to_fp16(-INFINITY));
+            for (int t = 0; t < live; ++t) {
+                const int slot = ((ring_head_ - t) % cache_len_ + cache_len_) % cache_len_;
+                mask_host[static_cast<size_t>(slot)] = ggml_fp32_to_fp16(0.0f);
+            }
+            ggml_backend_tensor_set(
+                mask.tensor, mask_host.data(), 0, mask_host.size() * sizeof(ggml_fp16_t));
+            const int64_t write_rows[kMagpieCfgLanes] = {
+                ring_head_, static_cast<int64_t>(cache_len_) + ring_head_};
+            ggml_backend_tensor_set(rows.tensor, write_rows, 0, sizeof(write_rows));
+        }
         std::vector<float> log_prior(static_cast<size_t>(text_len_), 0.0f);
         if (attention && attention->prior) {
             if (static_cast<int>(attention->prior->size()) != text_len_)
