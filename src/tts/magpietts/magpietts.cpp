@@ -1761,6 +1761,20 @@ stream_magpie_to_audio(
                             argmax, (int)width)) {
                         return cancel_worker();
                     }
+                    if (step == 1) {
+                        // The wave arena now owns every column's history. The
+                        // per-item caches that seeded it are full-size decoder
+                        // caches -- 288 MiB a chunk for the guidance pair -- and
+                        // holding them for the whole run costs tens of GiB on a
+                        // long script. Only n_tokens is read from here on.
+                        for (size_t k = 0; k < width; ++k) {
+                            plan[base + k]->cond_kv.reset();
+                            plan[base + k]->uncond_kv.reset();
+                            plan[base + k]->text_cond_device.reset();
+                            plan[base + k]->text_cond.clear();
+                            plan[base + k]->text_cond.shrink_to_fit();
+                        }
+                    }
                     for (size_t k = 0; k < width; ++k) {
                         if (!wave_step_finish(
                                 *plan[base + k], step, scores[k], collect[k] != 0, codes, argmax,
@@ -1790,6 +1804,11 @@ stream_magpie_to_audio(
                     if (!flush_item(item, last_chunk)) {
                         return false;
                     }
+                }
+                // The wave graph held pointers to these for the group's life.
+                decoder.resetWave();
+                for (size_t k = 0; k < width; ++k) {
+                    plan[base + k]->cross_kv.reset();
                 }
             }
         }

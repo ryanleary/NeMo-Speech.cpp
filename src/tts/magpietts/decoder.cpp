@@ -450,6 +450,21 @@ item_prior(ggml_context* ctx, ggml_tensor* prior, int item, int item_text_len) {
 }
 
 
+// A one-shot copy graph whose node count scales with the wave width can run
+// past MAGPIETTS_MAX_NODES, which new_graph_context() is sized for. Size the
+// context to the graph instead of asserting inside ggml.
+static ggml_context*
+sized_graph_context(size_t nodes) {
+    const size_t buf_size =
+        ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false);
+    ggml_init_params params = {
+        /*.mem_size   =*/buf_size,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    return ggml_init(params);
+}
+
 // Cross-attention for a whole wave in one pass. Every item's K/V lives in one
 // arena padded to the wave's widest text, with an additive mask that is zero
 // inside a chunk's own length and -inf past it, so a single batched matmul
@@ -928,9 +943,9 @@ class MagpieDecoder::PersistentDecoderRuntime {
         ggml_backend_tensor_memset(wk.tensor, 0, 0, ggml_nbytes(wk.tensor));
         ggml_backend_tensor_memset(wv.tensor, 0, 0, ggml_nbytes(wv.tensor));
 
-        ggml_context* ctx = new_graph_context();
-        ggml_cgraph* gf =
-            ggml_new_graph_custom(ctx, static_cast<size_t>(8 * items * n_layers) + 1024, false);
+        const size_t fill_nodes = static_cast<size_t>(8 * items * n_layers) + 1024;
+        ggml_context* ctx = sized_graph_context(fill_nodes);
+        ggml_cgraph* gf = ggml_new_graph_custom(ctx, fill_nodes, false);
         const size_t dst_es = ggml_element_size(wk.tensor);
         const size_t item_stride =
             static_cast<size_t>(n_layers) * static_cast<size_t>(text_len_) * cross_dim;
@@ -1022,12 +1037,12 @@ class MagpieDecoder::PersistentDecoderRuntime {
                 throw std::runtime_error("persistent decoder: wave columns are not in lockstep");
             }
         }
-        ggml_context* ctx = new_graph_context();
+        const size_t seed_nodes = static_cast<size_t>(16) * cond.n_layers * lanes_ + 256;
+        ggml_context* ctx = sized_graph_context(seed_nodes);
         const size_t element = sizeof(float);
         // The staging caches are F32 and the arena is F16, so seeding converts
         // through a graph of ggml_cpy nodes rather than copying bytes.
-        ggml_cgraph* seed_gf = ggml_new_graph_custom(
-            ctx, static_cast<size_t>(16) * cond.n_layers * lanes_ + 256, false);
+        ggml_cgraph* seed_gf = ggml_new_graph_custom(ctx, seed_nodes, false);
         const size_t source_layer_bytes = static_cast<size_t>(cond.n_ctx) * cond.n_embd * element;
         const size_t copy_elements = static_cast<size_t>(cond.n_tokens) * cond.n_embd;
         const size_t destination_token = static_cast<size_t>(cache_len_ - cond.n_tokens);
