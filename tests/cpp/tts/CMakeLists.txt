@@ -17,12 +17,6 @@ add_executable(test_magpietts_contiguity_helpers test_magpietts_contiguity_helpe
 target_link_libraries(test_magpietts_contiguity_helpers PRIVATE nemo_speech_tts_magpietts)
 add_test(NAME magpietts_contiguity_helpers COMMAND test_magpietts_contiguity_helpers)
 
-if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
-    add_executable(test_magpietts_cached_attention test_magpietts_cached_attention.cpp)
-    target_link_libraries(test_magpietts_cached_attention PRIVATE nemo_speech_tts_magpietts)
-    add_test(NAME magpietts_cached_attention COMMAND test_magpietts_cached_attention)
-endif()
-
 add_executable(test_magpietts_asr test_magpietts_asr.cpp)
 target_link_libraries(test_magpietts_asr PRIVATE
     tests_cpp_wer

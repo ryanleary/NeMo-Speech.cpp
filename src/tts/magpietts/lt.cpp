@@ -21,6 +21,8 @@
 
 namespace nemo_speech::tts {
 
+static constexpr int64_t kMagpieLocalKqMaskPad = 64;
+
 class LocalTransformerCudaAttentionCache {
    public:
     LocalTransformerCudaAttentionCache() = default;
@@ -39,8 +41,11 @@ class LocalTransformerCudaAttentionCache {
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
     std::vector<ggml_tensor*> layers;
-    std::vector<ggml_tensor*> cache_states;
-    ggml_tensor* slot_ids = nullptr;
+    // One append row and one mask per codebook round. Both are constant -- round
+    // c always writes slot c and reads slots 0..c -- so they are filled once at
+    // init and never touched per step.
+    std::vector<ggml_tensor*> write_rows;
+    std::vector<ggml_tensor*> masks;
     int n_ctx = 0;
     int n_embd = 0;
     int lanes = 0;
@@ -66,7 +71,6 @@ class LocalTransformerGraph {
     ggml_tensor* dec_uncond = nullptr;
     ggml_tensor* pos_emb = nullptr;
     ggml_tensor* prev_token = nullptr;
-    ggml_tensor* cache_state = nullptr;
     ggml_tensor* logits_cond = nullptr;
     ggml_tensor* logits_uncond = nullptr;
 
@@ -372,14 +376,13 @@ LocalTransformerCudaAttentionCache::operator=(LocalTransformerCudaAttentionCache
         ctx = other.ctx;
         buffer = other.buffer;
         layers = std::move(other.layers);
-        cache_states = std::move(other.cache_states);
-        slot_ids = other.slot_ids;
+        write_rows = std::move(other.write_rows);
+        masks = std::move(other.masks);
         n_ctx = other.n_ctx;
         n_embd = other.n_embd;
         lanes = other.lanes;
         other.ctx = nullptr;
         other.buffer = nullptr;
-        other.slot_ids = nullptr;
         other.n_ctx = 0;
         other.n_embd = 0;
         other.lanes = 0;
@@ -398,8 +401,8 @@ LocalTransformerCudaAttentionCache::reset() {
         ctx = nullptr;
     }
     layers.clear();
-    cache_states.clear();
-    slot_ids = nullptr;
+    write_rows.clear();
+    masks.clear();
     n_ctx = 0;
     n_embd = 0;
     lanes = 0;
@@ -411,15 +414,16 @@ LocalTransformerCudaAttentionCache::init(const magpietts_model& model, int lane_
     if (ctx) {
         if (n_ctx == h.lt_ctx && n_embd == h.lt_hidden && lanes == lane_count &&
             static_cast<int>(layers.size()) == h.lt_layers &&
-            static_cast<int>(cache_states.size()) == h.stacked_audio_codebooks()) {
+            static_cast<int>(write_rows.size()) == h.stacked_audio_codebooks()) {
             return true;
         }
         reset();
     }
 
     ggml_init_params params = {
+        // One arena per layer, plus an append row and a mask per codebook round.
         /*.mem_size   =*/ggml_tensor_overhead() *
-            static_cast<size_t>(h.lt_layers + h.stacked_audio_codebooks() + 1),
+            static_cast<size_t>(h.lt_layers + 2 * h.stacked_audio_codebooks() + 2),
         /*.mem_buffer =*/nullptr,
         /*.no_alloc   =*/true,
     };
@@ -437,14 +441,15 @@ LocalTransformerCudaAttentionCache::init(const magpietts_model& model, int lane_
         ggml_set_name(arena, name.c_str());
         layers.push_back(arena);
     }
-    slot_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, lane_count);
-    ggml_set_name(slot_ids, "magpietts_local_cuda_slot_ids");
-    cache_states.reserve(static_cast<size_t>(h.stacked_audio_codebooks()));
+    write_rows.reserve(static_cast<size_t>(h.stacked_audio_codebooks()));
+    masks.reserve(static_cast<size_t>(h.stacked_audio_codebooks()));
     for (int codebook = 0; codebook < h.stacked_audio_codebooks(); ++codebook) {
-        ggml_tensor* state_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, lane_count, 2);
-        const std::string name = "magpietts_local_cuda_cache_state_" + std::to_string(codebook);
-        ggml_set_name(state_tensor, name.c_str());
-        cache_states.push_back(state_tensor);
+        ggml_tensor* rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, lane_count);
+        ggml_set_name(rows, ("magpietts_local_cuda_rows_" + std::to_string(codebook)).c_str());
+        write_rows.push_back(rows);
+        ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, h.lt_ctx, kMagpieLocalKqMaskPad);
+        ggml_set_name(mask, ("magpietts_local_cuda_mask_" + std::to_string(codebook)).c_str());
+        masks.push_back(mask);
     }
 
     buffer = ggml_backend_alloc_ctx_tensors(ctx, model.backend);
@@ -453,18 +458,27 @@ LocalTransformerCudaAttentionCache::init(const magpietts_model& model, int lane_
         reset();
         return false;
     }
-    std::vector<int32_t> slots(static_cast<size_t>(lane_count));
-    for (int lane = 0; lane < lane_count; ++lane) slots[static_cast<size_t>(lane)] = lane;
-    ggml_backend_tensor_set(slot_ids, slots.data(), 0, slots.size() * sizeof(int32_t));
     for (ggml_tensor* arena : layers) {
         ggml_backend_tensor_memset(arena, 0, 0, ggml_nbytes(arena));
     }
-    std::vector<int32_t> state(static_cast<size_t>(lane_count) * 2);
+    std::vector<int64_t> rows(static_cast<size_t>(lane_count));
+    std::vector<ggml_fp16_t> mask_host(
+        static_cast<size_t>(h.lt_ctx) * kMagpieLocalKqMaskPad, ggml_fp32_to_fp16(-INFINITY));
     for (int codebook = 0; codebook < h.stacked_audio_codebooks(); ++codebook) {
-        std::fill(state.begin(), state.end(), codebook);
+        for (int lane = 0; lane < lane_count; ++lane) {
+            rows[static_cast<size_t>(lane)] =
+                static_cast<int64_t>(lane) * h.lt_ctx + std::min(codebook, h.lt_ctx - 1);
+        }
         ggml_backend_tensor_set(
-            cache_states[static_cast<size_t>(codebook)], state.data(), 0,
-            state.size() * sizeof(int32_t));
+            write_rows[static_cast<size_t>(codebook)], rows.data(), 0,
+            rows.size() * sizeof(int64_t));
+        std::fill(mask_host.begin(), mask_host.end(), ggml_fp32_to_fp16(-INFINITY));
+        for (int slot = 0; slot <= std::min(codebook, h.lt_ctx - 1); ++slot) {
+            mask_host[static_cast<size_t>(slot)] = ggml_fp32_to_fp16(0.0f);
+        }
+        ggml_backend_tensor_set(
+            masks[static_cast<size_t>(codebook)], mask_host.data(), 0,
+            mask_host.size() * sizeof(ggml_fp16_t));
     }
     n_ctx = h.lt_ctx;
     n_embd = h.lt_hidden;
@@ -491,7 +505,6 @@ LocalTransformerGraph::operator=(LocalTransformerGraph&& other) noexcept {
         dec_uncond = other.dec_uncond;
         pos_emb = other.pos_emb;
         prev_token = other.prev_token;
-        cache_state = other.cache_state;
         logits_cond = other.logits_cond;
         logits_uncond = other.logits_uncond;
         codebook_idx = other.codebook_idx;
@@ -507,7 +520,6 @@ LocalTransformerGraph::operator=(LocalTransformerGraph&& other) noexcept {
         other.dec_uncond = nullptr;
         other.pos_emb = nullptr;
         other.prev_token = nullptr;
-        other.cache_state = nullptr;
         other.logits_cond = nullptr;
         other.logits_uncond = nullptr;
         other.codebook_idx = -1;
@@ -532,7 +544,6 @@ LocalTransformerGraph::reset() {
     dec_uncond = nullptr;
     pos_emb = nullptr;
     prev_token = nullptr;
-    cache_state = nullptr;
     logits_cond = nullptr;
     logits_uncond = nullptr;
     codebook_idx = -1;
@@ -608,41 +619,52 @@ LocalTransformerGraphBank::beginFrame(const magpietts_model& model, bool pair, i
 static ggml_tensor*
 local_self_attention_cuda_cached_pair(
     ggml_context* ctx, const magpietts_transformer& tr, const magpietts_layer& layer,
-    LocalTransformerCudaAttentionCache& cache, int layer_index, ggml_tensor* cache_state,
-    ggml_tensor* x) {
+    LocalTransformerCudaAttentionCache& cache, int layer_index, int codebook_idx, ggml_tensor* x) {
     // Conditional columns for every item, then unconditional: 2B lanes, which
-    // is what the cache, the slot ids and the cache state are all sized to.
-    const int64_t kCfgLanes = x->ne[1];
+    // is what the cache and its per-round rows are sized to.
+    const int64_t lanes = x->ne[1];
     const int64_t n_embd = tr.n_embd;
     const int64_t d_head = n_embd / tr.n_head;
-    ggml_tensor* qkv =
-        ggml_reshape_3d(ctx, linear(ctx, layer.self_qkv, x), 3 * n_embd, 1, kCfgLanes);
+    ggml_tensor* qkv = ggml_reshape_3d(ctx, linear(ctx, layer.self_qkv, x), 3 * n_embd, 1, lanes);
     const size_t element = ggml_element_size(qkv);
-    auto split_heads = [&](size_t offset) {
-        return ggml_view_4d(
-            ctx, qkv, d_head, 1, tr.n_head, kCfgLanes, qkv->nb[1],
-            static_cast<size_t>(d_head) * element, qkv->nb[2], offset);
+    ggml_tensor* q = ggml_permute(
+        ctx,
+        ggml_view_4d(
+            ctx, qkv, d_head, 1, tr.n_head, lanes, qkv->nb[1],
+            static_cast<size_t>(d_head) * element, qkv->nb[2], 0),
+        0, 2, 1, 3);
+
+    ggml_tensor* arena = cache.layers[static_cast<size_t>(layer_index)];
+    const size_t aes = ggml_element_size(arena);
+    // Round c writes slot c and reads slots 0..c, so both the append row and the
+    // mask are baked into this codebook's graph and never uploaded per step.
+    ggml_tensor* rows = cache.write_rows[static_cast<size_t>(codebook_idx)];
+    ggml_tensor* mask = cache.masks[static_cast<size_t>(codebook_idx)];
+    auto plane_rows = [&](int plane) {
+        return ggml_view_2d(
+            ctx, arena, n_embd, static_cast<int64_t>(lanes) * cache.n_ctx,
+            static_cast<size_t>(n_embd) * aes, static_cast<size_t>(plane) * arena->nb[2]);
     };
-    ggml_tensor* q = split_heads(0);
-    ggml_tensor* k = split_heads(static_cast<size_t>(n_embd) * element);
-    ggml_tensor* v = split_heads(static_cast<size_t>(2 * n_embd) * element);
-#if defined(NEMO_SPEECH_GGML_PATCHED)
-    ggml_tensor* heads = ggml_fused_attn_cached(
-        ctx, q, k, v, nullptr, cache.layers[static_cast<size_t>(layer_index)], cache.slot_ids,
-        cache_state, cache.n_ctx, 1.0f / std::sqrt(static_cast<float>(d_head)), true);
-#else
-    (void)q;
-    (void)k;
-    (void)v;
-    (void)cache;
-    (void)layer_index;
-    (void)cache_state;
-    ggml_tensor* heads = nullptr;
-    throw std::runtime_error("Magpie cached local attention requires patched ggml");
-#endif
-    ggml_tensor* merged =
-        ggml_reshape_2d(ctx, ggml_permute(ctx, heads, 0, 2, 1, 3), n_embd, kCfgLanes);
-    return linear(ctx, layer.self_o, merged);
+    auto lane_rows = [&](size_t offset) {
+        return ggml_view_2d(ctx, qkv, n_embd, lanes, qkv->nb[1], offset);
+    };
+    ggml_tensor* k_plane =
+        ggml_set_rows(ctx, plane_rows(0), lane_rows(static_cast<size_t>(n_embd) * element), rows);
+    ggml_tensor* v_plane = ggml_set_rows(
+        ctx, plane_rows(1), lane_rows(static_cast<size_t>(2 * n_embd) * element), rows);
+    auto plane_heads = [&](ggml_tensor* plane) {
+        return ggml_permute(
+            ctx,
+            ggml_view_4d(
+                ctx, plane, d_head, tr.n_head, cache.n_ctx, lanes,
+                static_cast<size_t>(d_head) * aes, static_cast<size_t>(n_embd) * aes, arena->nb[1],
+                0),
+            0, 2, 1, 3);
+    };
+    ggml_tensor* heads = ggml_flash_attn_ext(
+        ctx, q, plane_heads(k_plane), plane_heads(v_plane), mask,
+        1.0f / std::sqrt(static_cast<float>(d_head)), 0.0f, 0.0f);
+    return linear(ctx, layer.self_o, ggml_reshape_2d(ctx, heads, n_embd, lanes));
 }
 
 static ggml_tensor*
@@ -748,8 +770,7 @@ static ggml_tensor*
 local_transformer_forward_cached_pair_fixed_pos(
     ggml_context* ctx, ggml_cgraph* gf, const magpietts_transformer& tr, ggml_tensor* x,
     ggml_tensor* pos_emb, DecoderKvCache& cond_cache, DecoderKvCache& uncond_cache,
-    LocalTransformerCudaAttentionCache* cuda_attention_cache, ggml_tensor* cache_state,
-    int n_past) {
+    LocalTransformerCudaAttentionCache* cuda_attention_cache, int cuda_codebook_idx, int n_past) {
     pos_emb = as_f32_contig(ctx, pos_emb);
     x = ggml_add(ctx, x, pos_emb);
     for (int il = 0; il < static_cast<int>(tr.layers.size()); ++il) {
@@ -758,7 +779,7 @@ local_transformer_forward_cached_pair_fixed_pos(
         ggml_tensor* cur = layer_norm(ctx, x, layer.norm_self);
         cur = cuda_attention_cache
                   ? local_self_attention_cuda_cached_pair(
-                        ctx, tr, layer, *cuda_attention_cache, il, cache_state, cur)
+                        ctx, tr, layer, *cuda_attention_cache, il, cuda_codebook_idx, cur)
                   : local_self_attention_cached_pair(
                         ctx, gf, tr, layer, cond_cache, uncond_cache, il, n_past, cur);
         x = ggml_add(ctx, residual, cur);
@@ -810,10 +831,6 @@ local_transformer_graph_init(
     const bool cuda_cached_attention =
         pair && magpietts_fused_cached_attention_available(model.backend);
 
-    if (cuda_cached_attention) {
-        graph.cache_state =
-            bank.pair_cuda_attention_cache.cache_states[static_cast<size_t>(codebook_idx)];
-    }
 
     if (!model.local.pos_emb || model.local.pos_emb->ne[0] != model.local.n_embd ||
         model.local.pos_emb->ne[1] <= codebook_idx) {
@@ -873,8 +890,8 @@ local_transformer_graph_init(
             ggml_tensor* out_pair = local_transformer_forward_cached_pair_fixed_pos(
                 graph.ctx, graph.gf, model.local, cur_pair, graph.pos_emb, bank.cond_cache,
                 bank.uncond_cache,
-                cuda_cached_attention ? &bank.pair_cuda_attention_cache : nullptr,
-                graph.cache_state, codebook_idx);
+                cuda_cached_attention ? &bank.pair_cuda_attention_cache : nullptr, codebook_idx,
+                codebook_idx);
             ggml_tensor* logits_pair = linear(
                 graph.ctx, model.lt_out_w[codebook_idx], out_pair, model.lt_out_b[codebook_idx]);
             logits_pair = as_f32_contig(graph.ctx, logits_pair);
