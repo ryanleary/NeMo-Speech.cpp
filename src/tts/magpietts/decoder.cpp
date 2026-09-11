@@ -852,17 +852,17 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
         if (alignment_count_ > 0) {
             ggml_tensor* sum = nullptr;
             for (ggml_tensor* alignment : per_layer) {
-                ggml_tensor* row = tr.n_cross_head > 1
-                                       ? ggml_reshape_2d(
-                                             ctx,
-                                             ggml_sum_rows(
-                                                 ctx, ggml_cont(ctx, ggml_transpose(ctx, alignment))),
-                                             text_len_, 1)
-                                       : ggml_reshape_2d(ctx, alignment, text_len_, 1);
+                ggml_tensor* row =
+                    tr.n_cross_head > 1
+                        ? ggml_reshape_2d(
+                              ctx,
+                              ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, alignment))),
+                              text_len_, 1)
+                        : ggml_reshape_2d(ctx, alignment, text_len_, 1);
                 sum = sum ? ggml_add(ctx, sum, row) : row;
             }
-            ggml_tensor* mean = ggml_scale(
-                ctx, sum, 1.0f / static_cast<float>(per_layer.size() * tr.n_cross_head));
+            ggml_tensor* mean =
+                ggml_scale(ctx, sum, 1.0f / static_cast<float>(per_layer.size() * tr.n_cross_head));
             ggml_set_name(mean, "magpietts_decoder_runtime_alignment_mean");
             outputs.add_tensor({mean, bf_ctx.buft});
         }
