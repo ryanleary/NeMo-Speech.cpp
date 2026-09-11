@@ -574,8 +574,6 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
             import(xkv->memory_v);
         }
 
-        session->model_tensor_container->create_tensor_1d(
-            "magpietts.decoder.runtime.slot_ids", GGML_TYPE_I32, lanes_);
         // F16 because ggml's flash attention wants it: handed an F32 cache it
         // converts K and V on every call, which is the bulk of the win.
         for (int layer = 0; layer < model_.hparams.n_dec_layer; ++layer) {
@@ -609,13 +607,12 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
     ggml_runtime::TensorBag build_graph(
         ggml_runtime::Session* session, ggml_runtime::TensorBag inputs,
         ggml_runtime::TensorContainer* tc) override {
-        if (inputs.tensor_count() != 4) {
-            throw std::runtime_error("Magpie persistent decoder expects four inputs");
+        if (inputs.tensor_count() != 3) {
+            throw std::runtime_error("Magpie persistent decoder expects three inputs");
         }
         const auto tokens = inputs.get_tensor(0);
         const auto position = inputs.get_tensor(1);
-        const auto cache_meta = inputs.get_tensor(2);
-        const auto prior = inputs.get_tensor(3);
+        const auto prior = inputs.get_tensor(2);
         const auto bf_ctx = tc->get_ctx_of_buffer_type(tokens.buft);
         ggml_context* ctx = bf_ctx.ctx;
         const magpietts_hparams& h = model_.hparams;
@@ -641,8 +638,6 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
         ggml_tensor* x = ggml_concat(ctx, audio, audio, 1);
 
         const int64_t d_head = tr.n_embd / tr.n_head;
-        auto slots = session->model_tensor_container->get_tensor_by_name(
-            "magpietts.decoder.runtime.slot_ids");
         auto fa_mask = session->model_tensor_container->get_tensor_by_name(
             "magpietts.decoder.runtime.fa_mask");
         auto write_rows = session->model_tensor_container->get_tensor_by_name(
@@ -679,8 +674,6 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
                     static_cast<size_t>(d_head) * element, qkv->nb[1], offset);
             };
             ggml_tensor* q = split_heads(0);
-            ggml_tensor* k = split_heads(static_cast<size_t>(tr.n_embd) * element);
-            ggml_tensor* v = split_heads(static_cast<size_t>(2 * tr.n_embd) * element);
             auto kv =
                 session->model_tensor_container->get_tensor_by_name(runtime_kv_name(layer_index));
             ggml_tensor* arena = kv.tensor;
@@ -864,13 +857,6 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
     }
 
     void set_data(ggml_runtime::Session* session) override {
-        std::vector<int32_t> slots(static_cast<size_t>(lanes_));
-        for (int lane = 0; lane < lanes_; ++lane) {
-            slots[static_cast<size_t>(lane)] = lane;
-        }
-        auto slot_ids = session->model_tensor_container->get_tensor_by_name(
-            "magpietts.decoder.runtime.slot_ids");
-        ggml_backend_tensor_set(slot_ids.tensor, slots.data(), 0, slots.size() * sizeof(int32_t));
         for (int layer = 0; layer < model_.hparams.n_dec_layer; ++layer) {
             auto kv = session->model_tensor_container->get_tensor_by_name(runtime_kv_name(layer));
             ggml_backend_tensor_memset(kv.tensor, 0, 0, ggml_nbytes(kv.tensor));
@@ -1125,13 +1111,6 @@ class MagpieDecoder::PersistentDecoderRuntime {
             }
         }
         const int32_t position = n_tokens_;
-        // Column-major [CFG lane, {ring head, valid length}]. The fused attention kernel reads
-        // only the active suffix while the graph and arena shapes remain constant.
-        std::vector<int32_t> cache_meta(static_cast<size_t>(lanes_) * 2);
-        for (int lane = 0; lane < lanes_; ++lane) {
-            cache_meta[static_cast<size_t>(lane)] = ring_head_;
-            cache_meta[static_cast<size_t>(lanes_ + lane)] = valid_tokens_;
-        }
 
         // This step appends at physical slot ring_head_, and the live window is
         // the valid_tokens_ most recent appends, which wraps. Positions are baked
@@ -1154,7 +1133,6 @@ class MagpieDecoder::PersistentDecoderRuntime {
              tokens.data(),
              {items, h.stacked_audio_codebooks()}},
             {"magpietts.decoder.runtime.position", GGML_TYPE_I32, &position, {1}},
-            {"magpietts.decoder.runtime.cache_meta", GGML_TYPE_I32, cache_meta.data(), {lanes_, 2}},
             {"magpietts.decoder.runtime.prior", GGML_TYPE_F32, log_prior.data(), {text_len_}}};
 
         ggml_runtime::DeviceTensor cond_device;
@@ -1246,11 +1224,6 @@ class MagpieDecoder::PersistentDecoderRuntime {
         }
 
         const int32_t position = n_tokens_;
-        std::vector<int32_t> cache_meta(static_cast<size_t>(lanes_) * 2);
-        for (int lane = 0; lane < lanes_; ++lane) {
-            cache_meta[static_cast<size_t>(lane)] = ring_head_;
-            cache_meta[static_cast<size_t>(lanes_ + lane)] = valid_tokens_;
-        }
         write_step_state();
 
         // [max_text_len, items]. Each column is only read to its own chunk's
@@ -1280,7 +1253,6 @@ class MagpieDecoder::PersistentDecoderRuntime {
              tokens.data(),
              {items, h.stacked_audio_codebooks()}},
             {"magpietts.decoder.runtime.position", GGML_TYPE_I32, &position, {1}},
-            {"magpietts.decoder.runtime.cache_meta", GGML_TYPE_I32, cache_meta.data(), {lanes_, 2}},
             {"magpietts.decoder.runtime.prior",
              GGML_TYPE_F32,
              log_prior.data(),
