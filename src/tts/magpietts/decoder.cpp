@@ -439,14 +439,39 @@ runtime_kv_name(int layer) {
     return "magpietts.decoder.runtime.kv." + std::to_string(layer);
 }
 
+// The prior is [text_len] for a single item and [max_text_len, items] for a
+// wave, since each chunk guides attention over its own text. Slicing here keeps
+// the single-item shape byte-for-byte what it was.
+static ggml_tensor*
+item_prior(ggml_context* ctx, ggml_tensor* prior, int item) {
+    if (!prior) {
+        return nullptr;
+    }
+    if (prior->ne[1] <= 1) {
+        return prior;
+    }
+    return ggml_view_1d(ctx, prior, prior->ne[0], static_cast<size_t>(item) * prior->nb[1]);
+}
+
 // Single-token decoder graph with external cross-K/V and persistent self-K/V storage.
 class PersistentDecoderModule final : public ggml_runtime::Module {
    public:
     PersistentDecoderModule(
         const magpietts_model& model, const DecoderCrossKvCache& cross_kv, int text_len,
-        int cache_len, int lanes = kMagpieCfgLanes)
+        int cache_len, int lanes = kMagpieCfgLanes,
+        std::vector<const DecoderCrossKvCache*> item_cross_kv = {})
         : model_(model), cross_kv_(cross_kv), text_len_(text_len), cache_len_(cache_len),
-          lanes_(lanes) {
+          lanes_(lanes), item_cross_kv_(std::move(item_cross_kv)) {
+        // One item is the common case and leaves the single-cache path exactly as
+        // it was. A wave supplies one cache per item, because every chunk carries
+        // different text.
+        const int items = lanes_ / kMagpieCfgLanesPerItem;
+        if (item_cross_kv_.empty()) {
+            item_cross_kv_.assign(static_cast<size_t>(items), &cross_kv_);
+        }
+        if (static_cast<int>(item_cross_kv_.size()) != items) {
+            throw std::runtime_error("persistent decoder: one cross-K/V cache per item required");
+        }
         for (int layer = 0; layer < static_cast<int>(model_.decoder.layers.size()); ++layer) {
             if (model_.decoder.layers[layer].has_cross &&
                 runtime_layer_selected(model_.decoder.estimate_alignment_from_layers, layer)) {
@@ -480,8 +505,10 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
             for (ggml_tensor* tensor : layer.ff_proj) import(tensor);
             for (ggml_tensor* tensor : layer.ff_out) import(tensor);
         }
-        import(cross_kv_.memory_k);
-        import(cross_kv_.memory_v);
+        for (const DecoderCrossKvCache* xkv : item_cross_kv_) {
+            import(xkv->memory_k);
+            import(xkv->memory_v);
+        }
 
         session->model_tensor_container->create_tensor_1d(
             "magpietts.decoder.runtime.slot_ids", GGML_TYPE_I32, lanes_);
@@ -609,20 +636,33 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
                 ggml_tensor* uncond = ggml_view_2d(
                     ctx, x, tr.n_embd, items, x->nb[1], static_cast<size_t>(items) * x->nb[1]);
                 ggml_tensor* cross_in = layer_norm(ctx, cond, layer.norm_xattn_query);
-                ggml_tensor* last_attn = nullptr;
                 const bool apply_prior =
                     tr.apply_attention_prior &&
                     runtime_layer_selected(tr.apply_prior_to_layers, layer_index);
                 const bool collect =
                     runtime_layer_selected(tr.estimate_alignment_from_layers, layer_index);
-                ggml_tensor* cross = cross_attention_cached(
-                    ctx, tr, layer, cross_kv_, layer_index, cross_in,
-                    apply_prior ? prior.tensor : nullptr, collect ? &last_attn : nullptr, true);
-                cond = ggml_add(ctx, cond, cross);
-                x = ggml_concat(ctx, cond, uncond, 1);
-                if (last_attn) {
-                    alignment_outputs.push_back(last_attn);
+
+                // Self-attention batches across items because they share a K/V
+                // layout; cross-attention cannot, because each item attends to a
+                // different text of a different length. One call per item, each
+                // on its own column and its own cache.
+                ggml_tensor* attended = nullptr;
+                for (int item = 0; item < items; ++item) {
+                    ggml_tensor* q = ggml_view_2d(
+                        ctx, cross_in, tr.n_embd, 1, cross_in->nb[1],
+                        static_cast<size_t>(item) * cross_in->nb[1]);
+                    ggml_tensor* last_attn = nullptr;
+                    ggml_tensor* cross = cross_attention_cached(
+                        ctx, tr, layer, *item_cross_kv_[static_cast<size_t>(item)], layer_index, q,
+                        apply_prior ? item_prior(ctx, prior.tensor, item) : nullptr,
+                        collect && item == 0 ? &last_attn : nullptr, true);
+                    attended = attended ? ggml_concat(ctx, attended, cross, 1) : cross;
+                    if (last_attn) {
+                        alignment_outputs.push_back(last_attn);
+                    }
                 }
+                cond = ggml_add(ctx, cond, attended);
+                x = ggml_concat(ctx, cond, uncond, 1);
             }
 
             residual = x;
@@ -695,6 +735,7 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
     int text_len_ = 0;
     int cache_len_ = 0;
     int lanes_ = kMagpieCfgLanes;
+    std::vector<const DecoderCrossKvCache*> item_cross_kv_;
     size_t alignment_count_ = 0;
 };
 
