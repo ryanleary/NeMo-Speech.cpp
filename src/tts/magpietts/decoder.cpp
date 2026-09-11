@@ -1157,17 +1157,24 @@ class MagpieDecoder::PersistentDecoderRuntime {
     // K/V land straight in the ring the steps append to, so a wave opened this
     // way needs no seeding and no per-chunk staging caches.
     bool prefill(
-        std::vector<MagpieWavePrefillItem>& wave, int speaker, int threads,
+        std::vector<MagpieWavePrefillItem>& wave, int first_item, int speaker, int threads,
         magpietts_backend_tensor* cond_hidden_out, magpietts_backend_tensor* uncond_hidden_out) {
         const ggml_nvtx::range nvtx_range("magpietts_decoder_prefill_wave");
         const magpietts_hparams& h = model_.hparams;
         const magpietts_transformer& tr = model_.decoder;
-        const int items = items_();
-        if (static_cast<int>(wave.size()) != items || h.dec_kernel != 1 || !cond_hidden_out ||
-            !uncond_hidden_out || !cond_hidden_out->tensor || !uncond_hidden_out->tensor ||
-            cond_hidden_out->tensor->ne[1] != items || uncond_hidden_out->tensor->ne[1] != items) {
+        // `items` is how many lanes this call opens, starting at first_item --
+        // a contiguous run, which is what lets the cross arena and the mask be
+        // reached by one offset view rather than a scatter. The runtime may be
+        // wider: a re-form prefills only the lanes it just admitted.
+        const int width = items_();
+        const int items = static_cast<int>(wave.size());
+        if (items <= 0 || first_item < 0 || first_item + items > width || h.dec_kernel != 1 ||
+            !cond_hidden_out || !uncond_hidden_out || !cond_hidden_out->tensor ||
+            !uncond_hidden_out->tensor || cond_hidden_out->tensor->ne[1] != width ||
+            uncond_hidden_out->tensor->ne[1] != width) {
             return false;
         }
+        const int lanes = kMagpieCfgLanesPerItem * items;
 
         // A wave steps in lockstep, so every column has to open at the same
         // length. Only the text differs between them.
@@ -1194,7 +1201,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
         std::vector<std::pair<std::string, std::vector<int32_t>>> i32_inputs;
         std::vector<std::pair<std::string, std::vector<float>>> f32_inputs;
         i32_inputs.push_back(
-            {"magpietts_prefill_speaker",
+            {std::string("magpietts_prefill_speaker"),
              std::vector<int32_t>(static_cast<size_t>(items), speaker)});
         for (int codebook = 0; codebook < h.stacked_audio_codebooks(); ++codebook) {
             // Item-major, so a reshape turns one get_rows into [n_embd, T, items].
@@ -1219,7 +1226,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
             if (!prior) {
                 continue;
             }
-            const int len = module_.item_text_len(item);
+            const int len = module_.item_text_len(first_item + item);
             if (static_cast<int>(prior->size()) != len) {
                 return false;
             }
@@ -1306,7 +1313,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
             // Q, K and V as [d_head, n_head, T, lanes] views of one projection.
             auto heads = [&](int part) {
                 return ggml_view_4d(
-                    ctx, qkv, d_head, tr.n_head, total_len, lanes_,
+                    ctx, qkv, d_head, tr.n_head, total_len, lanes,
                     static_cast<size_t>(d_head) * element, qkv->nb[1], qkv->nb[2],
                     static_cast<size_t>(part) * tr.n_embd * element);
             };
@@ -1318,15 +1325,24 @@ class MagpieDecoder::PersistentDecoderRuntime {
             const size_t arena_element = ggml_element_size(arena.tensor);
             const size_t ring_base =
                 static_cast<size_t>(cache_len_ - total_len) * tr.n_embd * arena_element;
+            // Items [first_item, first_item + items) map to two contiguous lane
+            // runs -- the conditional half and the unconditional one -- so each
+            // plane takes two copies rather than one, and a re-form can open a
+            // subset of a wider runtime without scattering.
             for (int plane = 0; plane < 2; ++plane) {
-                ggml_tensor* src = ggml_view_3d(
-                    ctx, qkv, tr.n_embd, total_len, lanes_, qkv->nb[1], qkv->nb[2],
-                    static_cast<size_t>(plane + 1) * tr.n_embd * element);
-                ggml_tensor* dst = ggml_view_3d(
-                    ctx, arena.tensor, tr.n_embd, total_len, lanes_,
-                    static_cast<size_t>(tr.n_embd) * arena_element, arena.tensor->nb[1],
-                    static_cast<size_t>(plane) * arena.tensor->nb[2] + ring_base);
-                ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
+                for (int half = 0; half < kMagpieCfgLanesPerItem; ++half) {
+                    ggml_tensor* src = ggml_view_3d(
+                        ctx, qkv, tr.n_embd, total_len, items, qkv->nb[1], qkv->nb[2],
+                        static_cast<size_t>(plane + 1) * tr.n_embd * element +
+                            static_cast<size_t>(half) * items * qkv->nb[2]);
+                    ggml_tensor* dst = ggml_view_3d(
+                        ctx, arena.tensor, tr.n_embd, total_len, items,
+                        static_cast<size_t>(tr.n_embd) * arena_element, arena.tensor->nb[1],
+                        static_cast<size_t>(plane) * arena.tensor->nb[2] + ring_base +
+                            static_cast<size_t>(half * width + first_item) *
+                                arena.tensor->nb[1]);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
+                }
             }
 
             // Attention reads the F32 projection it just produced rather than
@@ -1386,6 +1402,10 @@ class MagpieDecoder::PersistentDecoderRuntime {
                 ctx, ggml_view_2d(ctx, x, tr.n_embd, items, x->nb[2], last_row + lane_base),
                 tr.n_embd, items);
         };
+        // The output pair is runtime-wide; this run fills columns
+        // [first_item, first_item + items).
+        const size_t hidden_column_bytes = static_cast<size_t>(tr.n_embd) * sizeof(float);
+        const size_t hidden_offset = static_cast<size_t>(first_item) * hidden_column_bytes;
         ggml_tensor* cond_hidden = last_of(0);
         ggml_tensor* uncond_hidden = last_of(static_cast<size_t>(items) * x->nb[2]);
         ggml_set_output(cond_hidden);
@@ -1409,8 +1429,17 @@ class MagpieDecoder::PersistentDecoderRuntime {
             ggml_free(ctx);
             return false;
         }
-        ggml_backend_tensor_copy(cond_hidden, cond_hidden_out->tensor);
-        ggml_backend_tensor_copy(uncond_hidden, uncond_hidden_out->tensor);
+        // Device-to-device copy needs matching shapes, and this run is narrower
+        // than the pair it writes into, so the opening states go through the host
+        // once. Once per prefill, not once per step.
+        const size_t run_bytes = static_cast<size_t>(items) * hidden_column_bytes;
+        std::vector<float> hidden_staging(static_cast<size_t>(items) * tr.n_embd);
+        ggml_backend_tensor_get(cond_hidden, hidden_staging.data(), 0, run_bytes);
+        ggml_backend_tensor_set(
+            cond_hidden_out->tensor, hidden_staging.data(), hidden_offset, run_bytes);
+        ggml_backend_tensor_get(uncond_hidden, hidden_staging.data(), 0, run_bytes);
+        ggml_backend_tensor_set(
+            uncond_hidden_out->tensor, hidden_staging.data(), hidden_offset, run_bytes);
         if (alignment_out) {
             std::vector<float> alignment(
                 static_cast<size_t>(text_len_) * static_cast<size_t>(items));
@@ -1422,15 +1451,21 @@ class MagpieDecoder::PersistentDecoderRuntime {
                     continue;
                 }
                 const float* row = alignment.data() + static_cast<size_t>(item) * text_len_;
-                scores->assign(row, row + module_.item_text_len(item));
+                scores->assign(row, row + module_.item_text_len(first_item + item));
             }
         }
         ggml_gallocr_free(allocr);
         ggml_free(ctx);
 
-        n_tokens_.assign(static_cast<size_t>(items_()), total_len);
-        valid_tokens_.assign(static_cast<size_t>(items_()), total_len);
-        ring_heads_.assign(static_cast<size_t>(items_()), 0);
+        n_tokens_.resize(static_cast<size_t>(width));
+        valid_tokens_.resize(static_cast<size_t>(width));
+        ring_heads_.resize(static_cast<size_t>(width));
+        for (int item = 0; item < items; ++item) {
+            const size_t at = static_cast<size_t>(first_item + item);
+            n_tokens_[at] = total_len;
+            valid_tokens_[at] = total_len;
+            ring_heads_[at] = 0;
+        }
         reset_mask();
         return true;
     }
@@ -1879,7 +1914,8 @@ MagpieDecoder::prefillWave(
             "MagpieTTS wave runtime: fixed-shape CUDA graph, %zu chunks x CFG batch=2, "
             "device K/V arena enabled\n",
             items.size());
-        if (wave_runtime_->prefill(items, speaker, threads, cond_hidden_out, uncond_hidden_out)) {
+        if (wave_runtime_->prefill(
+                items, 0, speaker, threads, cond_hidden_out, uncond_hidden_out)) {
             return true;
         }
     }
