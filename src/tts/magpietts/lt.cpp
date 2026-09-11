@@ -627,12 +627,12 @@ local_self_attention_cuda_cached_pair(
     const int64_t d_head = n_embd / tr.n_head;
     ggml_tensor* qkv = ggml_reshape_3d(ctx, linear(ctx, layer.self_qkv, x), 3 * n_embd, 1, lanes);
     const size_t element = ggml_element_size(qkv);
-    ggml_tensor* q = ggml_permute(
-        ctx,
-        ggml_view_4d(
-            ctx, qkv, d_head, 1, tr.n_head, lanes, qkv->nb[1],
-            static_cast<size_t>(d_head) * element, qkv->nb[2], 0),
-        0, 2, 1, 3);
+    // [d_head, n_q, n_head, lanes], which is the layout flash attention wants
+    // and what K/V below are permuted into. A permute here would transpose
+    // n_head against n_q and only happen to work at lt_heads == 1.
+    ggml_tensor* q = ggml_view_4d(
+        ctx, qkv, d_head, 1, tr.n_head, lanes, qkv->nb[1], static_cast<size_t>(d_head) * element,
+        qkv->nb[2], 0);
 
     ggml_tensor* arena = cache.layers[static_cast<size_t>(layer_index)];
     const size_t aes = ggml_element_size(arena);
