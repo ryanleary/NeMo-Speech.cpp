@@ -1703,6 +1703,11 @@ stream_magpie_to_audio(
                     groups.emplace_back(at, std::min((size_t)wave_width, chunk_ids.size() - at));
                 }
             }
+            // The CUDA sampler seeds every draw with (seed, frame_index,
+            // round*width + item). A group-local step index would make each
+            // group replay the previous group's uniforms, so this counts across
+            // the whole run.
+            int wave_frame_index = 0;
             for (const std::pair<size_t, size_t>& group : groups) {
                 const size_t base = group.first;
                 const size_t width = group.second;
@@ -1770,9 +1775,11 @@ stream_magpie_to_audio(
                     if (!local_sampler->sampleCuda(
                             wave_cond, wave_uncond, params.use_cfg, h.cfg_scale, h.temperature,
                             h.top_k, 0 < h.min_generated_frames, workspace.cudaSampler(),
-                            (uint64_t)(uint32_t)params.seed, 0, codes, argmax, (int)width)) {
+                            (uint64_t)(uint32_t)params.seed, wave_frame_index, codes, argmax,
+                            (int)width)) {
                         return cancel_worker();
                     }
+                    ++wave_frame_index;
                     for (size_t k = 0; k < width; ++k) {
                         if (!wave_step_finish(
                                 *plan[base + k], 0, step0_scores[k], step0_collect[k] != 0, codes,
@@ -1830,8 +1837,13 @@ stream_magpie_to_audio(
                         }
                     }
                     const ggml_nvtx::range nvtx_step("magpietts_stream_wave_step");
+                    // One slot more than the step budget: the prefill takes one
+                    // and each step takes another, so at exactly the budget the
+                    // last step finds the ring full. The single-item path
+                    // survives that by falling back to the non-persistent
+                    // decoder; a wave has no fallback and fails the run.
                     if (!decoder.evalWave(
-                            slots, params.speaker, params.threads, max_decoder_positions,
+                            slots, params.speaker, params.threads, max_decoder_positions + 1,
                             &wave_cond, &wave_uncond)) {
                         fprintf(stderr, "%s wave decode step %d failed\n", label, step);
                         return cancel_worker();
@@ -1843,8 +1855,8 @@ stream_magpie_to_audio(
                     if (!local_sampler->sampleCuda(
                             wave_cond, wave_uncond, params.use_cfg, h.cfg_scale, h.temperature,
                             h.top_k, step * h.frame_stacking_factor < h.min_generated_frames,
-                            workspace.cudaSampler(), (uint64_t)(uint32_t)params.seed, step, codes,
-                            argmax, (int)width)) {
+                            workspace.cudaSampler(), (uint64_t)(uint32_t)params.seed,
+                            wave_frame_index, codes, argmax, (int)width)) {
                         return cancel_worker();
                     }
                     if (step == 1) {
@@ -1861,6 +1873,7 @@ stream_magpie_to_audio(
                             plan[base + k]->text_cond.shrink_to_fit();
                         }
                     }
+                    ++wave_frame_index;
                     for (size_t k = 0; k < width; ++k) {
                         if (!wave_step_finish(
                                 *plan[base + k], step, scores[k], collect[k] != 0, codes, argmax,
