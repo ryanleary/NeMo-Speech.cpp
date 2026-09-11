@@ -409,6 +409,19 @@ namespace {
 // raises it, and everything below is written in terms of the count rather than
 // the constant so that stays a one-line change.
 constexpr int kMagpieCfgLanesPerItem = 2;
+
+// MAGPIETTS_WAVE_PROBE=B decodes the live item in B identical slots. It exists
+// to measure how the step scales with batch -- item 0's output must not move,
+// and if the step cost grows far slower than B, the wave is worth building.
+static int
+wave_probe_items() {
+    const char* env = std::getenv("MAGPIETTS_WAVE_PROBE");
+    if (!env) {
+        return 1;
+    }
+    const int value = std::atoi(env);
+    return value > 0 ? value : 1;
+}
 constexpr int kMagpieCfgLanes = kMagpieCfgLanesPerItem;
 
 bool
@@ -512,8 +525,10 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
         }
         audio = ggml_scale(ctx, audio, 1.0f / static_cast<float>(h.stacked_audio_codebooks()));
         audio = ggml_add(ctx, audio, ggml_get_rows(ctx, tr.pos_emb, position.tensor));
-        // Store CFG lanes as projection columns for two-column MMVF.
-        ggml_tensor* x = ggml_concat(ctx, audio, audio, 1);  // [E,CFG=2]
+        // Guidance lanes as projection columns, conditional items first then
+        // unconditional. At one item this is the same two columns as before; at
+        // B items it is the batch the decode step is meant to amortise over.
+        ggml_tensor* x = ggml_repeat_4d(ctx, audio, tr.n_embd, lanes_, 1, 1);
 
         const int64_t d_head = tr.n_embd / tr.n_head;
         auto slots = session->model_tensor_container->get_tensor_by_name(
@@ -589,8 +604,10 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
 
             // Text cross-attention applies only to the conditional lane.
             if (tr.has_cross && layer.has_cross) {
-                ggml_tensor* cond = ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], 0);
-                ggml_tensor* uncond = ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], x->nb[1]);
+                const int items = lanes_ / kMagpieCfgLanesPerItem;
+                ggml_tensor* cond = ggml_view_2d(ctx, x, tr.n_embd, items, x->nb[1], 0);
+                ggml_tensor* uncond = ggml_view_2d(
+                    ctx, x, tr.n_embd, items, x->nb[1], static_cast<size_t>(items) * x->nb[1]);
                 ggml_tensor* cross_in = layer_norm(ctx, cond, layer.norm_xattn_query);
                 ggml_tensor* last_attn = nullptr;
                 const bool apply_prior =
@@ -618,10 +635,15 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
         if (tr.norm_out)
             x = layer_norm(ctx, x, tr.norm_out);
 
+        // Item 0's guidance pair. Later items are read the same way at
+        // lane i and lane items + i.
+        const int items_out = lanes_ / kMagpieCfgLanesPerItem;
         ggml_tensor* cond =
             ggml_cont_2d(ctx, ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], 0), tr.n_embd, 1);
-        ggml_tensor* uncond =
-            ggml_cont_2d(ctx, ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], x->nb[1]), tr.n_embd, 1);
+        ggml_tensor* uncond = ggml_cont_2d(
+            ctx,
+            ggml_view_2d(ctx, x, tr.n_embd, 1, x->nb[1], static_cast<size_t>(items_out) * x->nb[1]),
+            tr.n_embd, 1);
         ggml_set_name(cond, "magpietts_decoder_runtime_hidden_cond");
         ggml_set_name(uncond, "magpietts_decoder_runtime_hidden_uncond");
         ggml_runtime::TensorBag outputs;
@@ -696,8 +718,9 @@ class MagpieDecoder::PersistentDecoderRuntime {
         : model_(model), cross_kv_(&cross_kv), text_len_(text_len),
           stacked_position_budget_(stacked_position_budget),
           cache_len_(checked_persistent_cache_len(model, stacked_position_budget)),
+          lanes_(kMagpieCfgLanesPerItem * wave_probe_items()),
           backend_manager_(ggml_runtime::Params{true, 0, nullptr}, model.backend),
-          module_(model, cross_kv, text_len, cache_len_),
+          module_(model, cross_kv, text_len, cache_len_, lanes_),
           session_(backend_manager_, &module_, nullptr) {
         session_.set_run_cache_capacity(1);
         session_.setup();
