@@ -740,6 +740,9 @@ Session::run_impl(
         collect_state_views(cr.gf, cr.state_views);
 
         const int actual_nodes = ggml_graph_n_nodes(cr.gf);
+        if (std::getenv("NEMO_SPEECH_GRAPH_NODES")) {
+            fprintf(stderr, "[graph] built %d nodes\n", actual_nodes);
+        }
         if (actual_nodes > static_cast<int>(kSchedGraphErrorFrac * kSchedGraphSize)) {
             throw std::runtime_error(format(
                 "graph has %d nodes, above %.0f%% of scheduler cap %zu — bump "

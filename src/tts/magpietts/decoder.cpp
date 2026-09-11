@@ -880,6 +880,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
         n_tokens_ = cond.n_tokens;
         valid_tokens_ = cond.n_tokens;
         ring_head_ = 0;
+        reset_mask();
     }
 
     bool eval(
@@ -1050,7 +1051,10 @@ class MagpieDecoder::PersistentDecoderRuntime {
             cache_meta[static_cast<size_t>(lane)] = ring_head_;
             cache_meta[static_cast<size_t>(lanes_ + lane)] = valid_tokens_;
         }
-        write_step_state();
+        {
+            const ggml_nvtx::range r("wave_write_step_state");
+            write_step_state();
+        }
 
         // [max_text_len, items]. Each column is only read to its own chunk's
         // length, so the tail past it is never sampled.
@@ -1099,7 +1103,10 @@ class MagpieDecoder::PersistentDecoderRuntime {
             outputs[2].host_buffer = alignment.data();
             outputs[2].nbytes = alignment.size() * sizeof(float);
         }
-        session_.run(inputs, outputs);
+        {
+            const ggml_nvtx::range r("wave_session_run");
+            session_.run(inputs, outputs);
+        }
         ggml_backend_tensor_copy_async(
             model_.backend, model_.backend, cond_device.tensor, cond_hidden_out->tensor);
         ggml_backend_tensor_copy_async(
@@ -1128,20 +1135,35 @@ class MagpieDecoder::PersistentDecoderRuntime {
     // Which slots are live, and where this step appends. The ring rotates every
     // step while the shapes do not -- exactly what a captured graph allows. One
     // mask serves every lane: they share a ring head and a valid length.
+    // The whole mask, written once per seed. Every step after that only adds
+    // the single slot the ring head is about to occupy, so the steady state is
+    // a two-byte upload rather than a full one.
+    void reset_mask() {
+        auto mask = session_.model_tensor_container->get_tensor_by_name(
+            "magpietts.decoder.runtime.fa_mask");
+        std::vector<ggml_fp16_t> mask_host(
+            static_cast<size_t>(cache_len_) * kMagpieKqMaskPad, ggml_fp32_to_fp16(-INFINITY));
+        const int live = std::min(valid_tokens_, cache_len_);
+        for (int t = 0; t < live; ++t) {
+            const int slot = ((ring_head_ - 1 - t) % cache_len_ + cache_len_) % cache_len_;
+            mask_host[static_cast<size_t>(slot)] = ggml_fp32_to_fp16(0.0f);
+        }
+        ggml_backend_tensor_set(
+            mask.tensor, mask_host.data(), 0, mask_host.size() * sizeof(ggml_fp16_t));
+    }
+
     void write_step_state() {
         auto mask = session_.model_tensor_container->get_tensor_by_name(
             "magpietts.decoder.runtime.fa_mask");
         auto rows = session_.model_tensor_container->get_tensor_by_name(
             "magpietts.decoder.runtime.write_rows");
-        const int live = std::min(valid_tokens_ + 1, cache_len_);
-        std::vector<ggml_fp16_t> mask_host(
-            static_cast<size_t>(cache_len_) * kMagpieKqMaskPad, ggml_fp32_to_fp16(-INFINITY));
-        for (int t = 0; t < live; ++t) {
-            const int slot = ((ring_head_ - t) % cache_len_ + cache_len_) % cache_len_;
-            mask_host[static_cast<size_t>(slot)] = ggml_fp32_to_fp16(0.0f);
-        }
+        // Slots only ever go from dead to live, and exactly one does so per
+        // step: the one this step appends at. Re-uploading the whole mask was
+        // 78 KB of blocking transfer for a two-byte change.
+        const ggml_fp16_t live_value = ggml_fp32_to_fp16(0.0f);
         ggml_backend_tensor_set(
-            mask.tensor, mask_host.data(), 0, mask_host.size() * sizeof(ggml_fp16_t));
+            mask.tensor, &live_value, static_cast<size_t>(ring_head_) * sizeof(ggml_fp16_t),
+            sizeof(ggml_fp16_t));
         // Lane slabs are consecutive, so a lane's append row is its slab base
         // plus the ring head.
         std::vector<int64_t> write_rows(static_cast<size_t>(lanes_));
