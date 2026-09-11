@@ -1755,7 +1755,8 @@ MagpieDecoder::resetWave() const {
 bool
 MagpieDecoder::prefillWave(
     std::vector<MagpieWavePrefillItem>& items, int speaker, int threads,
-    int stacked_position_budget, magpietts_backend_tensor* cond_hidden_out,
+    int stacked_position_budget, int text_capacity,
+    magpietts_backend_tensor* cond_hidden_out,
     magpietts_backend_tensor* uncond_hidden_out) const {
     static const std::vector<float> no_host_text;
     if (items.empty() || model_.hparams.dec_kernel != 1) {
@@ -1771,9 +1772,13 @@ MagpieDecoder::prefillWave(
             return false;
         }
         item_cross_kv.push_back(item.cross_kv);
-        // The graph is shaped to the widest chunk; shorter ones are read to
-        // their own length and padded on the way out.
+        // The arena is shaped to the run's widest window, not this group's, so a
+        // chunk admitted into a freed lane later always fits. Shorter chunks are
+        // read to their own length and the mask hides the rest.
         text_len = std::max(text_len, item.cross_kv->text_len);
+    }
+    if (text_capacity > text_len) {
+        text_len = text_capacity;
     }
     try {
         wave_runtime_ = std::make_unique<PersistentDecoderRuntime>(
@@ -1797,7 +1802,7 @@ MagpieDecoder::prefillWave(
 
 bool
 MagpieDecoder::evalWave(
-    std::vector<MagpieWaveDecodeItem>& items, int stacked_position_budget,
+    std::vector<MagpieWaveDecodeItem>& items, int stacked_position_budget, int text_capacity,
     magpietts_backend_tensor* cond_hidden_out, magpietts_backend_tensor* uncond_hidden_out) const {
     if (items.empty() || !wave_runtime_) {
         return false;
@@ -1811,6 +1816,9 @@ MagpieDecoder::evalWave(
         }
         item_cross_kv.push_back(item.cross_kv);
         text_len = std::max(text_len, item.cross_kv->text_len);
+    }
+    if (text_capacity > text_len) {
+        text_len = text_capacity;
     }
     try {
         // The runtime prefillWave built holds this wave's history; a mismatch

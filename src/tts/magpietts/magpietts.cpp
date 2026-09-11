@@ -1515,6 +1515,19 @@ stream_magpie_to_audio(
                 chunk_ids.push_back(ci);
             }
 
+            // The cross-K/V arena is shaped once for the whole run, not per
+            // group, so a chunk admitted into a lane a finished chunk freed
+            // always fits. plan_text_chunk bounds a window at its pinned history
+            // plus its own tokens, so the widest any chunk can be is known here,
+            // before a single one is encoded.
+            int wave_text_capacity = 0;
+            for (size_t ci : chunk_ids) {
+                wave_text_capacity = std::max(
+                    wave_text_capacity,
+                    params.longform_history_tokens + (int)token_chunks[ci].size());
+            }
+            wave_text_capacity = std::min(wave_text_capacity, h.n_ctx);
+
             // Chunk N's conditioning splices from chunk N-1's encoder output,
             // so chunks must be encoded in order -- but only just before the
             // group that decodes them. Encoding the whole script up front put
@@ -1762,7 +1775,7 @@ stream_magpie_to_audio(
                 }
                 if (!decoder.prefillWave(
                         opening, params.speaker, params.threads, max_decoder_positions + 1,
-                        &wave_cond, &wave_uncond)) {
+                        wave_text_capacity, &wave_cond, &wave_uncond)) {
                     fprintf(stderr, "%s wave prefill failed\n", label);
                     return cancel_worker();
                 }
@@ -1853,7 +1866,8 @@ stream_magpie_to_audio(
                     // survives that by falling back to the non-persistent
                     // decoder; a wave has no fallback and fails the run.
                     if (!decoder.evalWave(
-                            slots, max_decoder_positions + 1, &wave_cond, &wave_uncond)) {
+                            slots, max_decoder_positions + 1, wave_text_capacity, &wave_cond,
+                            &wave_uncond)) {
                         fprintf(stderr, "%s wave decode step %d failed\n", label, step);
                         return cancel_worker();
                     }

@@ -164,7 +164,7 @@ class MagpieDecoder {
     // wave's guidance pair in one pair of tensors, which is what the batched
     // local transformer reads.
     bool evalWave(
-        std::vector<MagpieWaveDecodeItem>& items, int stacked_position_budget,
+        std::vector<MagpieWaveDecodeItem>& items, int stacked_position_budget, int text_capacity,
         magpietts_backend_tensor* cond_hidden_out,
         magpietts_backend_tensor* uncond_hidden_out) const;
 
@@ -173,9 +173,14 @@ class MagpieDecoder {
     // ring evalWave appends to, and step 0's guidance pair comes back in the
     // same [n_embd, items] tensors the steps use. Call once per wave, before
     // the first evalWave.
+    // text_capacity is the widest text window any chunk in the run will need,
+    // not the widest in this group. Sizing the cross arena to the run lets a
+    // later chunk take a freed lane without rebuilding it, and costs only the
+    // padding the mask already hides.
     bool prefillWave(
         std::vector<MagpieWavePrefillItem>& items, int speaker, int threads,
-        int stacked_position_budget, magpietts_backend_tensor* cond_hidden_out,
+        int stacked_position_budget, int text_capacity,
+        magpietts_backend_tensor* cond_hidden_out,
         magpietts_backend_tensor* uncond_hidden_out) const;
 
     // Drop a wave runtime so the next call rebuilds it. A wave's width and its
