@@ -101,6 +101,14 @@ class LocalTransformerGraphBank {
     // Width the composed sampler chain was last built at, so a change forces a
     // rebuild instead of replaying a graph shaped for another wave.
     int sequence_batch = 0;
+    // The composed chain also captures the address of the hidden tensors it was
+    // built against, so a new pair invalidates it exactly like a new width.
+    const void* sequence_cond_ptr = nullptr;
+    const void* sequence_uncond_ptr = nullptr;
+    // Eager passes still owed before recomposing. ggml needs a couple of runs
+    // at a new shape before it can hand over a capturable graph template, and
+    // composing too early fails and disables the chain for the whole run.
+    int sequence_warmup_left = 0;
 };
 
 using local_transformer_graph = LocalTransformerGraph;
@@ -1344,9 +1352,15 @@ sample_local_codebooks_cuda_impl(
     if (!local_graphs.beginFrame(model, use_cfg, batch)) {
         return false;
     }
-    if (local_graphs.sequence_batch != batch) {
+    const void* cond_ptr = cond_hidden.tensor ? cond_hidden.tensor->data : nullptr;
+    const void* uncond_ptr = uncond_hidden.tensor ? uncond_hidden.tensor->data : nullptr;
+    if (local_graphs.sequence_batch != batch || local_graphs.sequence_cond_ptr != cond_ptr ||
+        local_graphs.sequence_uncond_ptr != uncond_ptr) {
         magpietts_cuda_sampler_sequence_invalidate(cuda_sampler);
         local_graphs.sequence_batch = batch;
+        local_graphs.sequence_cond_ptr = cond_ptr;
+        local_graphs.sequence_uncond_ptr = uncond_ptr;
+        local_graphs.sequence_warmup_left = 3;
     }
     char stream_error[256] = {};
     if (!magpietts_cuda_sampler_bind_stream(
@@ -1427,7 +1441,9 @@ sample_local_codebooks_cuda_impl(
     } else {
         chain_ok =
             magpietts_cuda_sampler_upload_config(cuda_sampler, error, sizeof(error)) && run_chain();
-        if (chain_ok && !magpietts_cuda_sampler_sequence_is_disabled(cuda_sampler)) {
+        if (local_graphs.sequence_warmup_left > 0) {
+            --local_graphs.sequence_warmup_left;
+        } else if (chain_ok && !magpietts_cuda_sampler_sequence_is_disabled(cuda_sampler)) {
             // Initialize the per-codebook graphs before composing them.
             magpietts_cuda_sampler_sequence_mark_warm(cuda_sampler);
         }
