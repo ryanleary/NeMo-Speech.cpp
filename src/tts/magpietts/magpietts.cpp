@@ -1759,6 +1759,11 @@ stream_magpie_to_audio(
                 std::vector<std::vector<float>> step0_scores(width);
                 std::vector<char> step0_collect(width, 0);
                 std::vector<MagpieWavePrefillItem> opening(width);
+                // Lane k for item k: this group opens every lane it has.
+                std::vector<int> opening_lanes(width);
+                for (size_t k = 0; k < width; ++k) {
+                    opening_lanes[k] = (int)k;
+                }
                 for (size_t k = 0; k < width; ++k) {
                     WaveItem& item = *plan[base + k];
                     MagpieWavePrefillItem& slot = opening[k];
@@ -1774,8 +1779,8 @@ stream_magpie_to_audio(
                     }
                 }
                 if (!decoder.prefillWave(
-                        opening, params.speaker, params.threads, max_decoder_positions + 1,
-                        wave_text_capacity, &wave_cond, &wave_uncond)) {
+                        opening, opening_lanes, (int)width, params.speaker, params.threads,
+                        max_decoder_positions + 1, wave_text_capacity, &wave_cond, &wave_uncond)) {
                     fprintf(stderr, "%s wave prefill failed\n", label);
                     return cancel_worker();
                 }
@@ -1852,7 +1857,6 @@ stream_magpie_to_audio(
                         WaveItem& item = *plan[base + k];
                         MagpieWaveDecodeItem& slot = slots[k];
                         slot.audio_codes = &item.audio_codes;
-                        slot.cross_kv = &item.cross_kv;
                         slot.prior = item.prior.priorForStep(h, item.text_len);
                         if (!item.done && item.prior.shouldCollect(h, step, item.text_len)) {
                             collect[k] = 1;

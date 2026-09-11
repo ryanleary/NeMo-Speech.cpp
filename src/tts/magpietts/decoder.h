@@ -66,10 +66,14 @@ class DecoderCrossKvCache {
 // reads its codes and history and writes back its hidden state and alignment.
 struct MagpieWaveDecodeItem {
     const std::vector<std::vector<int32_t>>* audio_codes = nullptr;
-    DecoderCrossKvCache* cross_kv = nullptr;
     // Length is this chunk's own text_len, not the wave's widest.
     const std::vector<float>* prior = nullptr;
     std::vector<float>* alignment_scores = nullptr;
+    // False once this lane's chunk has finished and before another is admitted
+    // into it. The graph is a fixed width, so the lane is decoded either way;
+    // what `live` says is that its result is discarded and its position must not
+    // advance. Its tokens are still read, so they must stay in range.
+    bool live = true;
 };
 
 // One chunk's opening in a wave. A wave prefills every chunk's baked context
@@ -168,6 +172,9 @@ class MagpieDecoder {
         magpietts_backend_tensor* cond_hidden_out,
         magpietts_backend_tensor* uncond_hidden_out) const;
 
+    // How many lanes the open wave runtime has, or 0 if there is none.
+    int waveWidth() const;
+
     // Open a whole wave: build every chunk's cross-K/V, then prefill all of
     // their baked contexts through one graph. The self-K/V land directly in the
     // ring evalWave appends to, and step 0's guidance pair comes back in the
@@ -177,9 +184,15 @@ class MagpieDecoder {
     // not the widest in this group. Sizing the cross arena to the run lets a
     // later chunk take a freed lane without rebuilding it, and costs only the
     // padding the mask already hides.
+    //
+    // `lanes` says which lane each item opens in, and `width` how many lanes the
+    // runtime has. The first call builds the runtime; later ones admit chunks
+    // into lanes that finished ones freed, leaving every other lane's history
+    // untouched. The lanes need not be contiguous or in order: the graph runs the
+    // full width and only the write-back is narrowed to them.
     bool prefillWave(
-        std::vector<MagpieWavePrefillItem>& items, int speaker, int threads,
-        int stacked_position_budget, int text_capacity,
+        std::vector<MagpieWavePrefillItem>& items, const std::vector<int>& lanes, int width,
+        int speaker, int threads, int stacked_position_budget, int text_capacity,
         magpietts_backend_tensor* cond_hidden_out,
         magpietts_backend_tensor* uncond_hidden_out) const;
 
