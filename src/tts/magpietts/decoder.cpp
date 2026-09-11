@@ -640,8 +640,14 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
             session->model_tensor_container->create_tensor_2d(
                 "magpietts.decoder.runtime.cross_mask", GGML_TYPE_F32, text_len_, items);
         }
-        session->model_tensor_container->create_tensor_2d(
-            "magpietts.decoder.runtime.fa_mask", GGML_TYPE_F16, cache_len_, kMagpieKqMaskPad);
+        // One mask per lane. ggml_flash_attn_ext requires only that q->ne[2] and
+        // q->ne[3] be divisible by the mask's, and q is [d_head, n_q, n_head,
+        // lanes], so ne2=1 broadcasts over heads while ne3=lanes gives every lane
+        // its own live-slot set. The shape is fixed; only the contents move, which
+        // is what keeps the captured graph valid.
+        session->model_tensor_container->create_tensor_4d(
+            "magpietts.decoder.runtime.fa_mask", GGML_TYPE_F16, cache_len_, kMagpieKqMaskPad, 1,
+            lanes_);
         session->model_tensor_container->create_tensor_1d(
             "magpietts.decoder.runtime.write_rows", GGML_TYPE_I64, lanes_);
     }
@@ -672,7 +678,9 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
             audio = audio ? ggml_add(ctx, audio, embedding) : embedding;
         }
         audio = ggml_scale(ctx, audio, 1.0f / static_cast<float>(h.stacked_audio_codebooks()));
-        // Items step in lockstep, so one position row broadcasts across them.
+        // One position per item. While a group is fixed they are all equal and
+        // get_rows returns the same row it did before; continuous batching lets
+        // them differ, and the shape does not move either way.
         audio = ggml_add(ctx, audio, ggml_get_rows(ctx, tr.pos_emb, position.tensor));
         // Guidance lanes as projection columns, conditional items first then
         // unconditional. At one item this is the same two columns as before; at
@@ -1052,8 +1060,8 @@ class MagpieDecoder::PersistentDecoderRuntime {
         ggml_backend_synchronize(model_.backend);
         ggml_free(ctx);
         n_tokens_ = cond.n_tokens;
-        valid_tokens_ = cond.n_tokens;
-        ring_head_ = 0;
+        valid_tokens_.assign(static_cast<size_t>(items_()), cond.n_tokens);
+        ring_heads_.assign(static_cast<size_t>(items_()), 0);
         reset_mask();
     }
 
@@ -1335,8 +1343,8 @@ class MagpieDecoder::PersistentDecoderRuntime {
         ggml_free(ctx);
 
         n_tokens_ = total_len;
-        valid_tokens_ = total_len;
-        ring_head_ = 0;
+        valid_tokens_.assign(static_cast<size_t>(items_()), total_len);
+        ring_heads_.assign(static_cast<size_t>(items_()), 0);
         reset_mask();
         return true;
     }
@@ -1382,7 +1390,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
                 }
             }
         }
-        const int32_t position = n_tokens_;
+        const std::vector<int32_t> positions(static_cast<size_t>(items), n_tokens_);
 
         // This step appends at physical slot ring_head_, and the live window is
         // the valid_tokens_ most recent appends, which wraps. Positions are baked
@@ -1404,7 +1412,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
              GGML_TYPE_I32,
              tokens.data(),
              {items, h.stacked_audio_codebooks()}},
-            {"magpietts.decoder.runtime.position", GGML_TYPE_I32, &position, {1}},
+            {"magpietts.decoder.runtime.position", GGML_TYPE_I32, positions.data(), {items}},
             {"magpietts.decoder.runtime.prior", GGML_TYPE_F32, log_prior.data(), {text_len_}}};
 
         ggml_runtime::DeviceTensor cond_device;
@@ -1445,8 +1453,12 @@ class MagpieDecoder::PersistentDecoderRuntime {
         }
 
         ++n_tokens_;
-        valid_tokens_ = std::min(cache_len_, valid_tokens_ + 1);
-        ring_head_ = (ring_head_ + 1) % cache_len_;
+        for (int item = 0; item < items_(); ++item) {
+            valid_tokens_[static_cast<size_t>(item)] =
+                std::min(cache_len_, valid_tokens_[static_cast<size_t>(item)] + 1);
+            ring_heads_[static_cast<size_t>(item)] =
+                (ring_heads_[static_cast<size_t>(item)] + 1) % cache_len_;
+        }
         cond_kv.n_tokens = n_tokens_;
         uncond_kv.n_tokens = n_tokens_;
         cond_result.hidden_last.clear();
@@ -1503,7 +1515,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
             }
         }
 
-        const int32_t position = n_tokens_;
+        const std::vector<int32_t> positions(static_cast<size_t>(items), n_tokens_);
         write_step_state();
 
         // [max_text_len, items]. Each column is only read to its own chunk's
@@ -1532,7 +1544,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
              GGML_TYPE_I32,
              tokens.data(),
              {items, h.stacked_audio_codebooks()}},
-            {"magpietts.decoder.runtime.position", GGML_TYPE_I32, &position, {1}},
+            {"magpietts.decoder.runtime.position", GGML_TYPE_I32, positions.data(), {items}},
             {"magpietts.decoder.runtime.prior",
              GGML_TYPE_F32,
              log_prior.data(),
@@ -1576,8 +1588,12 @@ class MagpieDecoder::PersistentDecoderRuntime {
         }
 
         ++n_tokens_;
-        valid_tokens_ = std::min(cache_len_, valid_tokens_ + 1);
-        ring_head_ = (ring_head_ + 1) % cache_len_;
+        for (int item = 0; item < items_(); ++item) {
+            valid_tokens_[static_cast<size_t>(item)] =
+                std::min(cache_len_, valid_tokens_[static_cast<size_t>(item)] + 1);
+            ring_heads_[static_cast<size_t>(item)] =
+                (ring_heads_[static_cast<size_t>(item)] + 1) % cache_len_;
+        }
         return true;
     }
 
@@ -1588,15 +1604,25 @@ class MagpieDecoder::PersistentDecoderRuntime {
     // The whole mask, written once per seed. Every step after that only adds
     // the single slot the ring head is about to occupy, so the steady state is
     // a two-byte upload rather than a full one.
+    // Conditional lanes come first, then unconditional; both halves of an item
+    // share its ring.
+    int item_of_lane(int lane) const { return lane % items_(); }
+
     void reset_mask() {
         auto mask = session_.model_tensor_container->get_tensor_by_name(
             "magpietts.decoder.runtime.fa_mask");
+        const size_t lane_stride = static_cast<size_t>(cache_len_) * kMagpieKqMaskPad;
         std::vector<ggml_fp16_t> mask_host(
-            static_cast<size_t>(cache_len_) * kMagpieKqMaskPad, ggml_fp32_to_fp16(-INFINITY));
-        const int live = std::min(valid_tokens_, cache_len_);
-        for (int t = 0; t < live; ++t) {
-            const int slot = ((ring_head_ - 1 - t) % cache_len_ + cache_len_) % cache_len_;
-            mask_host[static_cast<size_t>(slot)] = ggml_fp32_to_fp16(0.0f);
+            lane_stride * static_cast<size_t>(lanes_), ggml_fp32_to_fp16(-INFINITY));
+        for (int lane = 0; lane < lanes_; ++lane) {
+            const int item = item_of_lane(lane);
+            const int head = ring_heads_[static_cast<size_t>(item)];
+            const int live = std::min(valid_tokens_[static_cast<size_t>(item)], cache_len_);
+            for (int t = 0; t < live; ++t) {
+                const int slot = ((head - 1 - t) % cache_len_ + cache_len_) % cache_len_;
+                mask_host[static_cast<size_t>(lane) * lane_stride + static_cast<size_t>(slot)] =
+                    ggml_fp32_to_fp16(0.0f);
+            }
         }
         ggml_backend_tensor_set(
             mask.tensor, mask_host.data(), 0, mask_host.size() * sizeof(ggml_fp16_t));
@@ -1611,18 +1637,48 @@ class MagpieDecoder::PersistentDecoderRuntime {
         // step: the one this step appends at. Re-uploading the whole mask was
         // 78 KB of blocking transfer for a two-byte change.
         const ggml_fp16_t live_value = ggml_fp32_to_fp16(0.0f);
-        ggml_backend_tensor_set(
-            mask.tensor, &live_value, static_cast<size_t>(ring_head_) * sizeof(ggml_fp16_t),
-            sizeof(ggml_fp16_t));
+        const size_t lane_stride = static_cast<size_t>(cache_len_) * kMagpieKqMaskPad;
+        const int head0 = ring_heads_[0];
+        bool uniform = true;
+        for (int item = 1; item < items_(); ++item) {
+            if (ring_heads_[static_cast<size_t>(item)] != head0) {
+                uniform = false;
+                break;
+            }
+        }
+        if (uniform) {
+            // Every lane turns on the same slot, at a fixed stride between lanes:
+            // one strided upload rather than one call per lane. Sixty-four small
+            // synchronous transfers a step cost 4.8% of end-to-end at width 32.
+            // cudaMemcpy2D needs a real source pitch, so the source is one value
+            // per lane rather than a single value re-read.
+            mask_live_scratch_.assign(static_cast<size_t>(lanes_), live_value);
+            ggml_backend_tensor_set_2d(
+                mask.tensor, mask_live_scratch_.data(),
+                static_cast<size_t>(head0) * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t),
+                static_cast<size_t>(lanes_), lane_stride * sizeof(ggml_fp16_t),
+                sizeof(ggml_fp16_t));
+        } else {
+            for (int lane = 0; lane < lanes_; ++lane) {
+                const int head = ring_heads_[static_cast<size_t>(item_of_lane(lane))];
+                ggml_backend_tensor_set(
+                    mask.tensor, &live_value,
+                    (static_cast<size_t>(lane) * lane_stride + static_cast<size_t>(head)) *
+                        sizeof(ggml_fp16_t),
+                    sizeof(ggml_fp16_t));
+            }
+        }
         // Lane slabs are consecutive, so a lane's append row is its slab base
-        // plus the ring head.
-        std::vector<int64_t> write_rows(static_cast<size_t>(lanes_));
+        // plus its own ring head.
+        write_rows_scratch_.resize(static_cast<size_t>(lanes_));
         for (int lane = 0; lane < lanes_; ++lane) {
-            write_rows[static_cast<size_t>(lane)] =
-                static_cast<int64_t>(lane) * cache_len_ + ring_head_;
+            write_rows_scratch_[static_cast<size_t>(lane)] =
+                static_cast<int64_t>(lane) * cache_len_ +
+                ring_heads_[static_cast<size_t>(item_of_lane(lane))];
         }
         ggml_backend_tensor_set(
-            rows.tensor, write_rows.data(), 0, write_rows.size() * sizeof(int64_t));
+            rows.tensor, write_rows_scratch_.data(), 0,
+            write_rows_scratch_.size() * sizeof(int64_t));
     }
 
     int items_() const { return lanes_ / kMagpieCfgLanesPerItem; }
@@ -1636,8 +1692,13 @@ class MagpieDecoder::PersistentDecoderRuntime {
     bool wave_ = false;
     std::vector<const DecoderCrossKvCache*> item_cross_kv_;
     int n_tokens_ = 0;
-    int valid_tokens_ = 0;
-    int ring_head_ = 0;
+    // Per item, not per runtime. They advance together while a group is fixed,
+    // which is what keeps this change behaviour-preserving; continuous batching
+    // lets them diverge.
+    std::vector<int> valid_tokens_;
+    std::vector<int> ring_heads_;
+    std::vector<int64_t> write_rows_scratch_;
+    std::vector<ggml_fp16_t> mask_live_scratch_;
     ggml_runtime::BackendManager backend_manager_;
     PersistentDecoderModule module_;
     ggml_runtime::Session session_;
