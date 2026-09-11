@@ -175,6 +175,7 @@ main() {
         {"as_f32_contig / F32", identity, bi_f32, he_f32, 0},
         // Permuted: exactly one real copy, and bytes equal to ggml's.
         {"as_contig / permuted", permuted, bi_cont, he_cont, 1},
+        {"as_contig_2d / permuted", permuted, bi_cont2, he_cont2, 1},
         {"as_contig_3d / permuted", permuted, bi_cont3, he_cont3, 1},
         {"as_f32_contig / permuted", permuted, bi_f32, he_f32, 1},
         // F16 in: the cast is required, so the helper must still emit it. Counts
