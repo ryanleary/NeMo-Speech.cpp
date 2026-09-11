@@ -1016,7 +1016,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
                stacked_position_budget == stacked_position_budget_;
     }
 
-    bool sequence_matches(int n_tokens) const { return n_tokens == n_tokens_; }
+    bool sequence_matches(int n_tokens) const { return n_tokens == n_tokens_[0]; }
 
     // Open the runtime from the caches the non-persistent path filled. A wave
     // opens through prefill() instead, which writes the same rows directly.
@@ -1059,7 +1059,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
         ggml_backend_graph_compute(model_.backend, seed_gf);
         ggml_backend_synchronize(model_.backend);
         ggml_free(ctx);
-        n_tokens_ = cond.n_tokens;
+        n_tokens_.assign(static_cast<size_t>(items_()), cond.n_tokens);
         valid_tokens_.assign(static_cast<size_t>(items_()), cond.n_tokens);
         ring_heads_.assign(static_cast<size_t>(items_()), 0);
         reset_mask();
@@ -1342,7 +1342,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
         ggml_gallocr_free(allocr);
         ggml_free(ctx);
 
-        n_tokens_ = total_len;
+        n_tokens_.assign(static_cast<size_t>(items_()), total_len);
         valid_tokens_.assign(static_cast<size_t>(items_()), total_len);
         ring_heads_.assign(static_cast<size_t>(items_()), 0);
         reset_mask();
@@ -1370,7 +1370,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
         }
         const int total_len =
             h.baked_context_length + static_cast<int>(raw_len / h.frame_stacking_factor);
-        if (total_len != n_tokens_ + 1 || n_tokens_ >= cache_len_)
+        if (total_len != n_tokens_[0] + 1 || n_tokens_[0] >= cache_len_)
             return false;
 
         // [items, stacked_codebooks]. This entry point decodes one item, so the
@@ -1390,7 +1390,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
                 }
             }
         }
-        const std::vector<int32_t> positions(static_cast<size_t>(items), n_tokens_);
+        const std::vector<int32_t> positions(n_tokens_.begin(), n_tokens_.end());
 
         // This step appends at physical slot ring_head_, and the live window is
         // the valid_tokens_ most recent appends, which wraps. Positions are baked
@@ -1452,15 +1452,15 @@ class MagpieDecoder::PersistentDecoderRuntime {
             attention->alignment_scores->assign(alignment.begin(), alignment.begin() + text_len_);
         }
 
-        ++n_tokens_;
         for (int item = 0; item < items_(); ++item) {
+            ++n_tokens_[static_cast<size_t>(item)];
             valid_tokens_[static_cast<size_t>(item)] =
                 std::min(cache_len_, valid_tokens_[static_cast<size_t>(item)] + 1);
             ring_heads_[static_cast<size_t>(item)] =
                 (ring_heads_[static_cast<size_t>(item)] + 1) % cache_len_;
         }
-        cond_kv.n_tokens = n_tokens_;
-        uncond_kv.n_tokens = n_tokens_;
+        cond_kv.n_tokens = n_tokens_[0];
+        uncond_kv.n_tokens = n_tokens_[0];
         cond_result.hidden_last.clear();
         uncond_result.hidden_last.clear();
         return true;
@@ -1475,7 +1475,8 @@ class MagpieDecoder::PersistentDecoderRuntime {
         const ggml_nvtx::range nvtx_range("magpietts_persistent_decoder_eval_wave");
         const magpietts_hparams& h = model_.hparams;
         const int items = items_();
-        if (static_cast<int>(wave.size()) != items || n_tokens_ >= cache_len_ || !cond_hidden_out ||
+        if (static_cast<int>(wave.size()) != items || n_tokens_[0] >= cache_len_ ||
+            !cond_hidden_out ||
             !uncond_hidden_out || !cond_hidden_out->tensor || !uncond_hidden_out->tensor ||
             cond_hidden_out->tensor->ne[1] != items || uncond_hidden_out->tensor->ne[1] != items) {
             return false;
@@ -1497,7 +1498,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
             // Lockstep: every column must be the same number of frames in.
             const int total_len =
                 h.baked_context_length + static_cast<int>(raw_len / h.frame_stacking_factor);
-            if (total_len != n_tokens_ + 1) {
+            if (total_len != n_tokens_[static_cast<size_t>(item)] + 1) {
                 return false;
             }
             const size_t frame_start = raw_len - static_cast<size_t>(h.frame_stacking_factor);
@@ -1515,7 +1516,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
             }
         }
 
-        const std::vector<int32_t> positions(static_cast<size_t>(items), n_tokens_);
+        const std::vector<int32_t> positions(n_tokens_.begin(), n_tokens_.end());
         write_step_state();
 
         // [max_text_len, items]. Each column is only read to its own chunk's
@@ -1587,8 +1588,8 @@ class MagpieDecoder::PersistentDecoderRuntime {
             }
         }
 
-        ++n_tokens_;
         for (int item = 0; item < items_(); ++item) {
+            ++n_tokens_[static_cast<size_t>(item)];
             valid_tokens_[static_cast<size_t>(item)] =
                 std::min(cache_len_, valid_tokens_[static_cast<size_t>(item)] + 1);
             ring_heads_[static_cast<size_t>(item)] =
@@ -1691,7 +1692,10 @@ class MagpieDecoder::PersistentDecoderRuntime {
     int lanes_ = kMagpieCfgLanes;
     bool wave_ = false;
     std::vector<const DecoderCrossKvCache*> item_cross_kv_;
-    int n_tokens_ = 0;
+    // Per item. A fixed group holds them equal; once lanes are re-formed with
+    // survivors alongside freshly admitted chunks they differ, and the position
+    // each item feeds the graph is its own.
+    std::vector<int> n_tokens_;
     // Per item, not per runtime. They advance together while a group is fixed,
     // which is what keeps this change behaviour-preserving; continuous batching
     // lets them diverge.
