@@ -1100,6 +1100,18 @@ stream_magpie_to_audio(
         fprintf(stderr, "speaker must be in [0, %d]\n", h.baked_speakers - 1);
         return false;
     }
+    if (params.batch_size > 1 && params.longform_history_tokens < 0) {
+        // Refusing beats silently changing long-form audio: at batch > 1 the
+        // adaptive history cannot be honoured, because it reads the previous
+        // chunk's decode and the wave has not run it yet.
+        fprintf(
+            stderr,
+            "batch-size %d needs a fixed longform-history-tokens: the adaptive history "
+            "derives chunk N's text window from chunk N-1's alignment, which a wave decodes "
+            "at the same time. Pass --tts.longform-history-tokens N (0 disables history).\n",
+            params.batch_size);
+        return false;
+    }
     if (h.audio_codebooks != codec.numCodebooks()) {
         fprintf(
             stderr, "MagpieTTS emits %d codebooks but NanoCodec expects %d\n", h.audio_codebooks,
@@ -1268,16 +1280,27 @@ stream_magpie_to_audio(
             const int max_history = std::max(0, h.n_ctx - (int)current_tokens.size());
             const int default_history = std::min<int>(
                 {(int)prior_text_tokens.size(), (int)current_tokens.size(), 20, max_history});
+            // The adaptive path asks where the *previous chunk's decode* ended up
+            // attending, which makes chunk N's text window depend on chunk N-1's
+            // output. That is fine sequentially and fatal to batching, so a fixed
+            // history is what makes a wave possible -- and it is a real behaviour
+            // change, not a knob, which is why it is opt-in.
             int required_history = 0;
-            if (chunk_index > 0 && attention_prior.initialized()) {
+            if (params.longform_history_tokens < 0 && chunk_index > 0 &&
+                attention_prior.initialized()) {
                 const int last_abs = attention_prior.lastAttendedAbsolute();
                 if (last_abs >= 0 && last_abs < absolute_token_offset) {
                     required_history = absolute_token_offset - last_abs;
                 }
             }
-            const int history_len = std::min<int>(
-                (int)prior_text_tokens.size(),
-                std::min(max_history, std::max(default_history, required_history)));
+            const int history_len =
+                params.longform_history_tokens >= 0
+                    ? std::min<int>(
+                          {params.longform_history_tokens, (int)prior_text_tokens.size(),
+                           max_history})
+                    : std::min<int>(
+                          (int)prior_text_tokens.size(),
+                          std::min(max_history, std::max(default_history, required_history)));
             const int left_offset = absolute_token_offset - history_len;
 
             std::vector<int32_t> text_window;
