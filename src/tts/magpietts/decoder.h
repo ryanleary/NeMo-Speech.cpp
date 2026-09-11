@@ -67,8 +67,19 @@ class DecoderCrossKvCache {
 struct MagpieWaveDecodeItem {
     const std::vector<std::vector<int32_t>>* audio_codes = nullptr;
     DecoderCrossKvCache* cross_kv = nullptr;
-    DecoderKvCache* cond_kv = nullptr;
-    DecoderKvCache* uncond_kv = nullptr;
+    // Length is this chunk's own text_len, not the wave's widest.
+    const std::vector<float>* prior = nullptr;
+    std::vector<float>* alignment_scores = nullptr;
+};
+
+// One chunk's opening in a wave. A wave prefills every chunk's baked context
+// through one graph, so the scheduler hands the whole group over at once.
+struct MagpieWavePrefillItem {
+    const std::vector<float>* text_cond = nullptr;
+    const magpietts_backend_tensor* text_cond_device = nullptr;
+    int text_len = 0;
+    const std::vector<std::vector<int32_t>>* audio_codes = nullptr;
+    DecoderCrossKvCache* cross_kv = nullptr;
     // Length is this chunk's own text_len, not the wave's widest.
     const std::vector<float>* prior = nullptr;
     std::vector<float>* alignment_scores = nullptr;
@@ -147,14 +158,23 @@ class MagpieDecoder {
     // its own history; what they share is the step index, which is what lets a
     // single ring head and a single mask serve them all.
     //
-    // Each item must already have been stepped once through the single-item
-    // path: that is the only path that can prefill a chunk's baked context, and
-    // its K/V caches are what seed this one's columns.
+    // prefillWave must have opened the same items first: it is what puts a
+    // chunk's baked context in the ring these steps append to.
     // cond_hidden_out and uncond_hidden_out are [n_embd, items] -- the whole
     // wave's guidance pair in one pair of tensors, which is what the batched
     // local transformer reads.
     bool evalWave(
-        std::vector<MagpieWaveDecodeItem>& items, int speaker, int threads,
+        std::vector<MagpieWaveDecodeItem>& items, int stacked_position_budget,
+        magpietts_backend_tensor* cond_hidden_out,
+        magpietts_backend_tensor* uncond_hidden_out) const;
+
+    // Open a whole wave: build every chunk's cross-K/V, then prefill all of
+    // their baked contexts through one graph. The self-K/V land directly in the
+    // ring evalWave appends to, and step 0's guidance pair comes back in the
+    // same [n_embd, items] tensors the steps use. Call once per wave, before
+    // the first evalWave.
+    bool prefillWave(
+        std::vector<MagpieWavePrefillItem>& items, int speaker, int threads,
         int stacked_position_budget, magpietts_backend_tensor* cond_hidden_out,
         magpietts_backend_tensor* uncond_hidden_out) const;
 

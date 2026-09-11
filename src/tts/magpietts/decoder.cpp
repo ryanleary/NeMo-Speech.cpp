@@ -38,6 +38,9 @@ static bool decoder_eval_cached_impl(
     magpietts_cuda_sample_request* cuda_sample, const magpietts_backend_tensor* text_cond_device,
     magpietts_backend_tensor* hidden_out, DecoderCrossKvCache* cross_kv,
     MagpiePinnedHostScratch& output_staging, const magpietts_decoder_attention* attention);
+static bool stack_audio_codes(
+    const std::vector<std::vector<int32_t>>& audio_codes, const magpietts_hparams& h,
+    std::vector<std::vector<int32_t>>& stacked);
 static bool decoder_eval_cached_pair_impl(
     const magpietts_model& model, const std::vector<float>& text_cond, int text_len,
     const std::vector<std::vector<int32_t>>& audio_codes, int speaker, int threads,
@@ -470,11 +473,14 @@ sized_graph_context(size_t nodes) {
 // inside a chunk's own length and -inf past it, so a single batched matmul
 // replaces one attention per item. That is the difference between a graph that
 // grows with the wave and one that does not.
+// x is [n_embd, items] for a decode step and [n_embd, n_q, items] for a
+// prefill; everything else is the same, because the padded arena does not care
+// how many queries read it.
 static ggml_tensor*
 cross_attention_wave(
     ggml_context* ctx, const magpietts_transformer& tr, const magpietts_layer& layer,
     ggml_tensor* wave_k, ggml_tensor* wave_v, ggml_tensor* mask, int layer_index, int max_text_len,
-    int items, ggml_tensor* x, ggml_tensor* log_prior, ggml_tensor** last_attn) {
+    int items, int n_q, ggml_tensor* x, ggml_tensor* log_prior, ggml_tensor** last_attn) {
     const int64_t d_head = tr.n_cross_dhead;
     const int64_t n_head = tr.n_cross_head;
     const int64_t cross_dim = d_head * n_head;
@@ -485,7 +491,7 @@ cross_attention_wave(
 
     ggml_tensor* q = linear(ctx, layer.cross_q, x);
     ggml_tensor* qh =
-        ggml_permute(ctx, ggml_reshape_4d(ctx, q, d_head, n_head, 1, items), 0, 2, 1, 3);
+        ggml_permute(ctx, ggml_reshape_4d(ctx, q, d_head, n_head, n_q, items), 0, 2, 1, 3);
 
     auto plane = [&](ggml_tensor* base) {
         return ggml_view_4d(
@@ -508,16 +514,52 @@ cross_attention_wave(
     }
     ggml_tensor* kq_soft = ggml_soft_max(ctx, kq);
     if (last_attn) {
-        *last_attn = kq_soft;
+        // Alignment is read off the newest query, so a prefill reports the same
+        // [max_text_len, 1, n_head, items] row a step does.
+        *last_attn = n_q == 1 ? kq_soft
+                              : ggml_cont_4d(
+                                    ctx,
+                                    ggml_view_4d(
+                                        ctx, kq_soft, max_text_len, 1, n_head, items,
+                                        kq_soft->nb[1], kq_soft->nb[2], kq_soft->nb[3],
+                                        static_cast<size_t>(n_q - 1) * kq_soft->nb[1]),
+                                    max_text_len, 1, n_head, items);
     }
     ggml_tensor* v_trans = ggml_cont_4d(
         ctx, ggml_permute(ctx, plane(wave_v), 1, 2, 0, 3), max_text_len, d_head, n_head, items);
     ggml_tensor* kqv = ggml_mul_mat(ctx, v_trans, kq_soft);
     ggml_tensor* merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
-    return linear(ctx, layer.cross_o, ggml_cont_2d(ctx, merged, cross_dim, items));
+    if (n_q == 1) {
+        return linear(ctx, layer.cross_o, ggml_cont_2d(ctx, merged, cross_dim, items));
+    }
+    return linear(ctx, layer.cross_o, ggml_cont_3d(ctx, merged, cross_dim, n_q, items));
 }
 
 // Single-token decoder graph with external cross-K/V and persistent self-K/V storage.
+// Reduce the per-layer cross-attention rows a wave collected into one
+// [max_text_len, items] readback: mean over layers, then over heads.
+static ggml_tensor*
+wave_alignment_mean(
+    ggml_context* ctx, const magpietts_transformer& tr, const std::vector<ggml_tensor*>& per_layer,
+    int max_text_len, int items) {
+    ggml_tensor* sum = nullptr;
+    for (ggml_tensor* row : per_layer) {
+        sum = sum ? ggml_add(ctx, sum, row) : row;
+    }
+    ggml_tensor* mean =
+        ggml_scale(ctx, sum, 1.0f / static_cast<float>(per_layer.size() * tr.n_cross_head));
+    ggml_tensor* flat = ggml_cont_3d(ctx, mean, max_text_len, tr.n_cross_head, items);
+    if (tr.n_cross_head > 1) {
+        flat = ggml_reshape_2d(
+            ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, flat))), max_text_len,
+            items);
+    } else {
+        flat = ggml_reshape_2d(ctx, flat, max_text_len, items);
+    }
+    ggml_set_name(flat, "magpietts_decoder_runtime_alignment_mean");
+    return flat;
+}
+
 class PersistentDecoderModule final : public ggml_runtime::Module {
    public:
     PersistentDecoderModule(
@@ -525,7 +567,7 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
         int cache_len, int lanes = kMagpieCfgLanes,
         std::vector<const DecoderCrossKvCache*> item_cross_kv = {})
         : model_(model), cross_kv_(cross_kv), text_len_(text_len), cache_len_(cache_len),
-          lanes_(lanes), item_cross_kv_(std::move(item_cross_kv)) {
+          lanes_(lanes), wave_(!item_cross_kv.empty()), item_cross_kv_(std::move(item_cross_kv)) {
         // One item is the common case and leaves the single-cache path exactly as
         // it was. A wave supplies one cache per item, because every chunk carries
         // different text.
@@ -585,7 +627,7 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
         // shapes do not -- exactly what a captured graph allows. One mask serves
         // both lanes: they share a ring head and a valid length.
         const int items = lanes_ / kMagpieCfgLanesPerItem;
-        if (items > 1) {
+        if (wave_) {
             // Every item's cross K/V, padded to the wave's widest text, plus the
             // additive mask that hides each chunk's padding.
             const int64_t cross_dim = model_.decoder.n_cross_dhead * model_.decoder.n_cross_head;
@@ -651,7 +693,7 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
         ggml_tensor* wave_k = nullptr;
         ggml_tensor* wave_v = nullptr;
         ggml_tensor* cross_mask = nullptr;
-        if (items > 1) {
+        if (wave_) {
             wave_k =
                 session->model_tensor_container->get_tensor_by_name(wave_cross_name(false)).tensor;
             wave_v =
@@ -741,11 +783,11 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
                 // batched matmul instead of one attention per item, so the graph
                 // stops growing with the wave.
                 ggml_tensor* attended = nullptr;
-                if (items > 1) {
+                if (wave_) {
                     ggml_tensor* last_attn = nullptr;
                     attended = cross_attention_wave(
                         ctx, tr, layer, wave_k, wave_v, cross_mask, layer_index, text_len_, items,
-                        cross_in, apply_prior ? prior.tensor : nullptr,
+                        1, cross_in, apply_prior ? prior.tensor : nullptr,
                         collect ? &last_attn : nullptr);
                     if (last_attn) {
                         wave_alignment_outputs.push_back(last_attn);
@@ -789,69 +831,40 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
         ggml_runtime::TensorBag outputs;
         outputs.add_tensor({cond, bf_ctx.buft});
         outputs.add_tensor({uncond, bf_ctx.buft});
-        if (items > 1) {
+        if (wave_) {
             if (wave_alignment_outputs.size() != alignment_count_) {
                 throw std::runtime_error("Magpie persistent decoder alignment topology changed");
             }
             if (alignment_count_ > 0) {
-                // Each entry is [text_len, 1, n_cross_head, items]. Average over
-                // layers, then over heads, into one [text_len, items] readback.
-                ggml_tensor* sum = nullptr;
-                for (ggml_tensor* a : wave_alignment_outputs) {
-                    sum = sum ? ggml_add(ctx, sum, a) : a;
-                }
-                ggml_tensor* mean = ggml_scale(
-                    ctx, sum,
-                    1.0f / static_cast<float>(wave_alignment_outputs.size() * tr.n_cross_head));
-                ggml_tensor* flat = ggml_cont_3d(ctx, mean, text_len_, tr.n_cross_head, items);
-                if (tr.n_cross_head > 1) {
-                    flat = ggml_reshape_2d(
-                        ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, flat))),
-                        text_len_, items);
-                } else {
-                    flat = ggml_reshape_2d(ctx, flat, text_len_, items);
-                }
-                ggml_set_name(flat, "magpietts_decoder_runtime_alignment_mean");
-                outputs.add_tensor({flat, bf_ctx.buft});
+                outputs.add_tensor(
+                    {wave_alignment_mean(ctx, tr, wave_alignment_outputs, text_len_, items),
+                     bf_ctx.buft});
             }
             return outputs;
         }
-        for (const std::vector<ggml_tensor*>& per_item : alignment_outputs) {
-            if (per_item.size() != alignment_count_) {
-                throw std::runtime_error("Magpie persistent decoder alignment topology changed");
-            }
+        // Everything past here is the single-item runtime: a wave returned above, and
+        // kMagpieCfgLanes is one item's worth of lanes, so text_len_ is that item's own
+        // text length and there is nothing to pad or stack.
+        const std::vector<ggml_tensor*>& per_layer = alignment_outputs[0];
+        if (per_layer.size() != alignment_count_) {
+            throw std::runtime_error("Magpie persistent decoder alignment topology changed");
         }
         if (alignment_count_ > 0) {
-            // Each item's per-layer scores average into one [text_len] row; the
-            // rows stack into [text_len, items] so one readback serves the wave.
-            ggml_tensor* stacked = nullptr;
-            for (int item = 0; item < items; ++item) {
-                const std::vector<ggml_tensor*>& per_item =
-                    alignment_outputs[static_cast<size_t>(item)];
-                const int len = item_text_len(item);
-                ggml_tensor* sum = nullptr;
-                for (ggml_tensor* alignment : per_item) {
-                    ggml_tensor* per_layer = alignment;
-                    if (tr.n_cross_head > 1) {
-                        per_layer = ggml_reshape_2d(
-                            ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, alignment))),
-                            len, 1);
-                    } else {
-                        per_layer = ggml_reshape_2d(ctx, alignment, len, 1);
-                    }
-                    sum = sum ? ggml_add(ctx, sum, per_layer) : per_layer;
-                }
-                ggml_tensor* mean = ggml_scale(
-                    ctx, sum, 1.0f / static_cast<float>(per_item.size() * tr.n_cross_head));
-                // Shorter chunks pad out to the wave's widest so one readback
-                // covers every row; the scheduler reads each row's own length.
-                if (len < text_len_) {
-                    mean = ggml_pad(ctx, mean, text_len_ - len, 0, 0, 0);
-                }
-                stacked = stacked ? ggml_concat(ctx, stacked, mean, 1) : mean;
+            ggml_tensor* sum = nullptr;
+            for (ggml_tensor* alignment : per_layer) {
+                ggml_tensor* row = tr.n_cross_head > 1
+                                       ? ggml_reshape_2d(
+                                             ctx,
+                                             ggml_sum_rows(
+                                                 ctx, ggml_cont(ctx, ggml_transpose(ctx, alignment))),
+                                             text_len_, 1)
+                                       : ggml_reshape_2d(ctx, alignment, text_len_, 1);
+                sum = sum ? ggml_add(ctx, sum, row) : row;
             }
-            ggml_set_name(stacked, "magpietts_decoder_runtime_alignment_mean");
-            outputs.add_tensor({stacked, bf_ctx.buft});
+            ggml_tensor* mean = ggml_scale(
+                ctx, sum, 1.0f / static_cast<float>(per_layer.size() * tr.n_cross_head));
+            ggml_set_name(mean, "magpietts_decoder_runtime_alignment_mean");
+            outputs.add_tensor({mean, bf_ctx.buft});
         }
         return outputs;
     }
@@ -878,6 +891,9 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
     int text_len_ = 0;
     int cache_len_ = 0;
     int lanes_ = kMagpieCfgLanes;
+    // A wave reads every item's cross-K/V from one padded arena; the
+    // single-item runtime reads its cache directly.
+    bool wave_ = false;
     std::vector<const DecoderCrossKvCache*> item_cross_kv_;
     size_t alignment_count_ = 0;
 };
@@ -903,7 +919,8 @@ class MagpieDecoder::PersistentDecoderRuntime {
         : model_(model), cross_kv_(&cross_kv), text_len_(text_len),
           stacked_position_budget_(stacked_position_budget),
           cache_len_(checked_persistent_cache_len(model, stacked_position_budget)),
-          lanes_(kMagpieCfgLanesPerItem * items), item_cross_kv_(item_cross_kv),
+          lanes_(kMagpieCfgLanesPerItem * items), wave_(!item_cross_kv.empty()),
+          item_cross_kv_(item_cross_kv),
           backend_manager_(ggml_runtime::Params{true, 0, nullptr}, model.backend),
           module_(model, cross_kv, text_len, cache_len_, lanes_, std::move(item_cross_kv)),
           session_(backend_manager_, &module_, nullptr) {
@@ -915,10 +932,10 @@ class MagpieDecoder::PersistentDecoderRuntime {
     // Gather every item's cross K/V into one padded arena, and build the mask
     // that hides each chunk's padding. Once per wave, not once per step.
     void fill_wave_cross() {
-        const int items = items_();
-        if (items <= 1) {
+        if (!wave_) {
             return;
         }
+        const int items = items_();
         const magpietts_transformer& tr = model_.decoder;
         const int64_t cross_dim = tr.n_cross_dhead * tr.n_cross_head;
         const int n_layers = static_cast<int>(tr.layers.size());
@@ -993,35 +1010,12 @@ class MagpieDecoder::PersistentDecoderRuntime {
 
     bool sequence_matches(int n_tokens) const { return n_tokens == n_tokens_; }
 
+    // Open the runtime from the caches the non-persistent path filled. A wave
+    // opens through prefill() instead, which writes the same rows directly.
     void seed(const DecoderKvCache& cond, const DecoderKvCache& uncond) {
-        // One item's history replicated across the lanes it owns.
-        seed(
-            std::vector<const DecoderKvCache*>(static_cast<size_t>(items_()), &cond),
-            std::vector<const DecoderKvCache*>(static_cast<size_t>(items_()), &uncond));
-    }
-
-    // A wave seeds each column from its own chunk's opening history. The
-    // histories differ from the first layer on: the baked context passes through
-    // cross-attention, so a chunk's text is already in its self-K/V.
-    void seed(
-        const std::vector<const DecoderKvCache*>& cond_items,
-        const std::vector<const DecoderKvCache*>& uncond_items) {
         const int items = items_();
-        if (static_cast<int>(cond_items.size()) != items ||
-            static_cast<int>(uncond_items.size()) != items) {
-            throw std::runtime_error("persistent decoder: one K/V history per item required");
-        }
-        const DecoderKvCache& cond = *cond_items.front();
-        const DecoderKvCache& uncond = *uncond_items.front();
         if (cond.n_tokens <= 0 || cond.n_tokens != uncond.n_tokens || cond.n_tokens > cache_len_) {
             throw std::runtime_error("cannot seed persistent decoder from incompatible KV caches");
-        }
-        // A wave steps in lockstep, so every column has to open at the same length.
-        for (int item = 0; item < items; ++item) {
-            if (cond_items[static_cast<size_t>(item)]->n_tokens != cond.n_tokens ||
-                uncond_items[static_cast<size_t>(item)]->n_tokens != cond.n_tokens) {
-                throw std::runtime_error("persistent decoder: wave columns are not in lockstep");
-            }
         }
         const size_t seed_nodes = static_cast<size_t>(16) * cond.n_layers * lanes_ + 256;
         ggml_context* ctx = sized_graph_context(seed_nodes);
@@ -1039,17 +1033,11 @@ class MagpieDecoder::PersistentDecoderRuntime {
                 ggml_tensor* dst_base = arena.tensor;
                 // Conditional lanes first, then unconditional, which is the
                 // order the arena and the guidance split both assume.
-                std::vector<const ggml_tensor*> sources(static_cast<size_t>(lanes_));
-                for (int item = 0; item < items; ++item) {
-                    const DecoderKvCache& c = *cond_items[static_cast<size_t>(item)];
-                    const DecoderKvCache& u = *uncond_items[static_cast<size_t>(item)];
-                    sources[static_cast<size_t>(item)] = plane == 0 ? c.memory_k : c.memory_v;
-                    sources[static_cast<size_t>(items + item)] =
-                        plane == 0 ? u.memory_k : u.memory_v;
-                }
                 for (int lane = 0; lane < lanes_; ++lane) {
+                    const DecoderKvCache& c = lane < items ? cond : uncond;
+                    ggml_tensor* source = plane == 0 ? c.memory_k : c.memory_v;
                     ggml_tensor* src = ggml_view_1d(
-                        ctx, const_cast<ggml_tensor*>(sources[lane]), copy_elements,
+                        ctx, source, copy_elements,
                         static_cast<size_t>(layer) * source_layer_bytes);
                     const size_t dst_offset =
                         static_cast<size_t>(plane) * dst_base->nb[2] +
@@ -1067,6 +1055,290 @@ class MagpieDecoder::PersistentDecoderRuntime {
         valid_tokens_ = cond.n_tokens;
         ring_head_ = 0;
         reset_mask();
+    }
+
+    // Open a whole wave in one graph. Every chunk's baked context is the same
+    // length, so the prefill's sequence is uniform across the batch; only the
+    // text differs, and the padded cross arena already covers that. The self
+    // K/V land straight in the ring the steps append to, so a wave opened this
+    // way needs no seeding and no per-chunk staging caches.
+    bool prefill(
+        std::vector<MagpieWavePrefillItem>& wave, int speaker, int threads,
+        magpietts_backend_tensor* cond_hidden_out, magpietts_backend_tensor* uncond_hidden_out) {
+        const ggml_nvtx::range nvtx_range("magpietts_decoder_prefill_wave");
+        const magpietts_hparams& h = model_.hparams;
+        const magpietts_transformer& tr = model_.decoder;
+        const int items = items_();
+        if (static_cast<int>(wave.size()) != items || h.dec_kernel != 1 || !cond_hidden_out ||
+            !uncond_hidden_out || !cond_hidden_out->tensor || !uncond_hidden_out->tensor ||
+            cond_hidden_out->tensor->ne[1] != items || uncond_hidden_out->tensor->ne[1] != items) {
+            return false;
+        }
+
+        // A wave steps in lockstep, so every column has to open at the same
+        // length. Only the text differs between them.
+        std::vector<std::vector<std::vector<int32_t>>> stacked(wave.size());
+        int audio_len = 0;
+        for (int item = 0; item < items; ++item) {
+            MagpieWavePrefillItem& slot = wave[static_cast<size_t>(item)];
+            if (!slot.audio_codes ||
+                !stack_audio_codes(*slot.audio_codes, h, stacked[static_cast<size_t>(item)])) {
+                return false;
+            }
+            const int len = static_cast<int>(stacked[static_cast<size_t>(item)][0].size());
+            if (item == 0) {
+                audio_len = len;
+            } else if (len != audio_len) {
+                return false;
+            }
+        }
+        const int total_len = h.baked_context_length + audio_len;
+        if (audio_len <= 0 || total_len > cache_len_) {
+            return false;
+        }
+
+        std::vector<std::pair<std::string, std::vector<int32_t>>> i32_inputs;
+        std::vector<std::pair<std::string, std::vector<float>>> f32_inputs;
+        i32_inputs.push_back(
+            {"magpietts_prefill_speaker",
+             std::vector<int32_t>(static_cast<size_t>(items), speaker)});
+        for (int codebook = 0; codebook < h.stacked_audio_codebooks(); ++codebook) {
+            // Item-major, so a reshape turns one get_rows into [n_embd, T, items].
+            std::vector<int32_t> rows(static_cast<size_t>(items) * audio_len);
+            for (int item = 0; item < items; ++item) {
+                const std::vector<int32_t>& src =
+                    stacked[static_cast<size_t>(item)][static_cast<size_t>(codebook)];
+                std::copy(
+                    src.begin(), src.end(), rows.begin() + static_cast<size_t>(item) * audio_len);
+            }
+            i32_inputs.push_back(
+                {"magpietts_prefill_audio_" + std::to_string(codebook), std::move(rows)});
+        }
+        i32_inputs.push_back({"magpietts_prefill_positions", positions(total_len)});
+
+        // [max_text_len, items]. Each column is only read to its own chunk's
+        // length, so the tail past it is never sampled.
+        std::vector<float> log_prior(
+            static_cast<size_t>(text_len_) * static_cast<size_t>(items), 0.0f);
+        for (int item = 0; item < items; ++item) {
+            const std::vector<float>* prior = wave[static_cast<size_t>(item)].prior;
+            if (!prior) {
+                continue;
+            }
+            const int len = module_.item_text_len(item);
+            if (static_cast<int>(prior->size()) != len) {
+                return false;
+            }
+            for (int i = 0; i < len; ++i) {
+                log_prior
+                    [static_cast<size_t>(item) * static_cast<size_t>(text_len_) +
+                     static_cast<size_t>(i)] =
+                        std::log(std::max((*prior)[static_cast<size_t>(i)], 1.0e-20f));
+            }
+        }
+        f32_inputs.push_back({"magpietts_prefill_prior", std::move(log_prior)});
+
+        // Node count is dominated by the layer body; the K/V appends and the
+        // alignment reduction are a fixed tail.
+        const size_t graph_nodes = static_cast<size_t>(96) * tr.layers.size() + 512;
+        ggml_context* ctx = sized_graph_context(graph_nodes);
+        ggml_cgraph* gf = ggml_new_graph_custom(ctx, graph_nodes, false);
+
+        ggml_tensor* speaker_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, items);
+        ggml_set_name(speaker_in, "magpietts_prefill_speaker");
+        ggml_set_input(speaker_in);
+        // One row of baked_context holds a whole speaker context, so items rows
+        // is the whole wave.
+        ggml_tensor* baked = ggml_reshape_3d(
+            ctx, ggml_get_rows(ctx, model_.baked_context, speaker_in), h.n_embd,
+            h.baked_context_length, items);
+
+        ggml_tensor* audio = nullptr;
+        for (int codebook = 0; codebook < h.stacked_audio_codebooks(); ++codebook) {
+            ggml_tensor* rows =
+                ggml_new_tensor_1d(ctx, GGML_TYPE_I32, static_cast<int64_t>(items) * audio_len);
+            ggml_set_name(rows, ("magpietts_prefill_audio_" + std::to_string(codebook)).c_str());
+            ggml_set_input(rows);
+            ggml_tensor* emb = ggml_reshape_3d(
+                ctx, ggml_get_rows(ctx, model_.audio_embeddings[codebook], rows), h.n_embd,
+                audio_len, items);
+            audio = audio ? ggml_add(ctx, audio, emb) : emb;
+        }
+        audio = ggml_scale(ctx, audio, 1.0f / static_cast<float>(h.stacked_audio_codebooks()));
+
+        // Conditional items first, then unconditional, which is the lane order
+        // the arena and the guidance split both assume. Only the baked context
+        // differs between the two halves.
+        ggml_tensor* x = ggml_concat(
+            ctx, ggml_concat(ctx, baked, audio, 1),
+            ggml_concat(ctx, ggml_scale(ctx, baked, 0.0f), audio, 1), 2);
+
+        ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, total_len);
+        ggml_set_name(pos, "magpietts_prefill_positions");
+        ggml_set_input(pos);
+        x = ggml_add(ctx, x, ggml_get_rows(ctx, tr.pos_emb, pos));
+
+        ggml_tensor* prior = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, text_len_, items);
+        ggml_set_name(prior, "magpietts_prefill_prior");
+        ggml_set_input(prior);
+
+        ggml_tensor* wave_k =
+            session_.model_tensor_container->get_tensor_by_name(wave_cross_name(false)).tensor;
+        ggml_tensor* wave_v =
+            session_.model_tensor_container->get_tensor_by_name(wave_cross_name(true)).tensor;
+        ggml_tensor* cross_mask = session_.model_tensor_container
+                                      ->get_tensor_by_name("magpietts.decoder.runtime.cross_mask")
+                                      .tensor;
+
+        // The whole prefill is causal over its own tokens, so one triangular
+        // mask serves every head and every lane.
+        ggml_tensor* causal = nullptr;
+        if (tr.causal) {
+            causal = ggml_tri(
+                ctx,
+                ggml_fill(
+                    ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, total_len, total_len), -1.0e9f),
+                GGML_TRI_TYPE_UPPER);
+        }
+
+        const int64_t d_head = tr.n_embd / tr.n_head;
+        std::vector<ggml_tensor*> alignment_rows;
+        for (int layer_index = 0; layer_index < static_cast<int>(tr.layers.size()); ++layer_index) {
+            const magpietts_layer& layer = tr.layers[layer_index];
+            ggml_tensor* residual = x;
+            ggml_tensor* cur = layer_norm(ctx, x, layer.norm_self);
+            ggml_tensor* qkv = linear(ctx, layer.self_qkv, cur);
+            const size_t element = ggml_element_size(qkv);
+            // Q, K and V as [d_head, n_head, T, lanes] views of one projection.
+            auto heads = [&](int part) {
+                return ggml_view_4d(
+                    ctx, qkv, d_head, tr.n_head, total_len, lanes_,
+                    static_cast<size_t>(d_head) * element, qkv->nb[1], qkv->nb[2],
+                    static_cast<size_t>(part) * tr.n_embd * element);
+            };
+
+            // Append the whole prefill to the ring in one copy per plane: the
+            // steps read K and V from here, and nothing else has to.
+            auto arena =
+                session_.model_tensor_container->get_tensor_by_name(runtime_kv_name(layer_index));
+            const size_t arena_element = ggml_element_size(arena.tensor);
+            const size_t ring_base =
+                static_cast<size_t>(cache_len_ - total_len) * tr.n_embd * arena_element;
+            for (int plane = 0; plane < 2; ++plane) {
+                ggml_tensor* src = ggml_view_3d(
+                    ctx, qkv, tr.n_embd, total_len, lanes_, qkv->nb[1], qkv->nb[2],
+                    static_cast<size_t>(plane + 1) * tr.n_embd * element);
+                ggml_tensor* dst = ggml_view_3d(
+                    ctx, arena.tensor, tr.n_embd, total_len, lanes_,
+                    static_cast<size_t>(tr.n_embd) * arena_element, arena.tensor->nb[1],
+                    static_cast<size_t>(plane) * arena.tensor->nb[2] + ring_base);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
+            }
+
+            // Attention reads the F32 projection it just produced rather than
+            // the F16 ring, which is what the single-item prefill did too.
+            ggml_tensor* q = ggml_permute(ctx, heads(0), 0, 2, 1, 3);
+            ggml_tensor* kq = ggml_mul_mat(ctx, ggml_permute(ctx, heads(1), 0, 2, 1, 3), q);
+            kq = ggml_scale(ctx, kq, 1.0f / std::sqrt(static_cast<float>(d_head)));
+            ggml_tensor* kq_soft =
+                causal ? ggml_soft_max_ext(ctx, kq, causal, 1.0f, 0.0f) : ggml_soft_max(ctx, kq);
+            ggml_tensor* v_trans = ggml_cont_4d(
+                ctx, ggml_permute(ctx, heads(2), 1, 2, 0, 3), total_len, d_head, tr.n_head, lanes_);
+            ggml_tensor* merged =
+                ggml_permute(ctx, ggml_mul_mat(ctx, v_trans, kq_soft), 0, 2, 1, 3);
+            x = ggml_add(
+                ctx, residual,
+                linear(ctx, layer.self_o, ggml_cont_3d(ctx, merged, tr.n_embd, total_len, lanes_)));
+
+            // Text cross-attention applies only to the conditional lanes.
+            if (tr.has_cross && layer.has_cross) {
+                ggml_tensor* cond =
+                    ggml_view_3d(ctx, x, tr.n_embd, total_len, items, x->nb[1], x->nb[2], 0);
+                ggml_tensor* uncond = ggml_view_3d(
+                    ctx, x, tr.n_embd, total_len, items, x->nb[1], x->nb[2],
+                    static_cast<size_t>(items) * x->nb[2]);
+                const bool apply_prior =
+                    tr.apply_attention_prior &&
+                    runtime_layer_selected(tr.apply_prior_to_layers, layer_index);
+                const bool collect =
+                    runtime_layer_selected(tr.estimate_alignment_from_layers, layer_index);
+                ggml_tensor* last_attn = nullptr;
+                ggml_tensor* attended = cross_attention_wave(
+                    ctx, tr, layer, wave_k, wave_v, cross_mask, layer_index, text_len_, items,
+                    total_len, layer_norm(ctx, cond, layer.norm_xattn_query),
+                    apply_prior ? prior : nullptr, collect ? &last_attn : nullptr);
+                if (last_attn) {
+                    alignment_rows.push_back(last_attn);
+                }
+                x = ggml_concat(ctx, ggml_add(ctx, cond, attended), uncond, 2);
+            }
+
+            residual = x;
+            cur = layer_norm(ctx, x, layer.norm_ff);
+            cur = causal_conv1d(ctx, cur, layer.ff_proj);
+            cur = ggml_gelu(ctx, cur);
+            cur = causal_conv1d(ctx, cur, layer.ff_out);
+            x = ggml_add(ctx, residual, cur);
+        }
+        if (tr.norm_out) {
+            x = layer_norm(ctx, x, tr.norm_out);
+        }
+
+        // The opening state is each column's last position, in the same
+        // [n_embd, items] pair the steps write.
+        const size_t last_row = static_cast<size_t>(total_len - 1) * x->nb[1];
+        auto last_of = [&](size_t lane_base) {
+            return ggml_cont_2d(
+                ctx, ggml_view_2d(ctx, x, tr.n_embd, items, x->nb[2], last_row + lane_base),
+                tr.n_embd, items);
+        };
+        ggml_tensor* cond_hidden = last_of(0);
+        ggml_tensor* uncond_hidden = last_of(static_cast<size_t>(items) * x->nb[2]);
+        ggml_set_output(cond_hidden);
+        ggml_set_output(uncond_hidden);
+        ggml_build_forward_expand(gf, cond_hidden);
+        ggml_build_forward_expand(gf, uncond_hidden);
+
+        ggml_tensor* alignment_out = nullptr;
+        if (module_.alignment_count() > 0) {
+            if (alignment_rows.size() != module_.alignment_count()) {
+                ggml_free(ctx);
+                return false;
+            }
+            alignment_out = wave_alignment_mean(ctx, tr, alignment_rows, text_len_, items);
+            ggml_set_output(alignment_out);
+            ggml_build_forward_expand(gf, alignment_out);
+        }
+
+        ggml_gallocr_t allocr = nullptr;
+        if (!compute_graph(model_, ctx, gf, i32_inputs, f32_inputs, threads, &allocr)) {
+            ggml_free(ctx);
+            return false;
+        }
+        ggml_backend_tensor_copy(cond_hidden, cond_hidden_out->tensor);
+        ggml_backend_tensor_copy(uncond_hidden, uncond_hidden_out->tensor);
+        if (alignment_out) {
+            std::vector<float> alignment(
+                static_cast<size_t>(text_len_) * static_cast<size_t>(items));
+            ggml_backend_tensor_get(
+                alignment_out, alignment.data(), 0, alignment.size() * sizeof(float));
+            for (int item = 0; item < items; ++item) {
+                std::vector<float>* scores = wave[static_cast<size_t>(item)].alignment_scores;
+                if (!scores) {
+                    continue;
+                }
+                const float* row = alignment.data() + static_cast<size_t>(item) * text_len_;
+                scores->assign(row, row + module_.item_text_len(item));
+            }
+        }
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx);
+
+        n_tokens_ = total_len;
+        valid_tokens_ = total_len;
+        ring_head_ = 0;
+        reset_mask();
+        return true;
     }
 
     bool eval(
@@ -1290,10 +1562,6 @@ class MagpieDecoder::PersistentDecoderRuntime {
         ++n_tokens_;
         valid_tokens_ = std::min(cache_len_, valid_tokens_ + 1);
         ring_head_ = (ring_head_ + 1) % cache_len_;
-        for (MagpieWaveDecodeItem& slot : wave) {
-            slot.cond_kv->n_tokens = n_tokens_;
-            slot.uncond_kv->n_tokens = n_tokens_;
-        }
         return true;
     }
 
@@ -1349,6 +1617,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
     int stacked_position_budget_ = 0;
     int cache_len_ = 0;
     int lanes_ = kMagpieCfgLanes;
+    bool wave_ = false;
     std::vector<const DecoderCrossKvCache*> item_cross_kv_;
     int n_tokens_ = 0;
     int valid_tokens_ = 0;
@@ -1407,19 +1676,21 @@ MagpieDecoder::resetWave() const {
 }
 
 bool
-MagpieDecoder::evalWave(
-    std::vector<MagpieWaveDecodeItem>& items, int speaker, int threads, int stacked_position_budget,
-    magpietts_backend_tensor* cond_hidden_out, magpietts_backend_tensor* uncond_hidden_out) const {
-    (void)speaker;
-    (void)threads;
-    if (items.empty()) {
+MagpieDecoder::prefillWave(
+    std::vector<MagpieWavePrefillItem>& items, int speaker, int threads,
+    int stacked_position_budget, magpietts_backend_tensor* cond_hidden_out,
+    magpietts_backend_tensor* uncond_hidden_out) const {
+    static const std::vector<float> no_host_text;
+    if (items.empty() || model_.hparams.dec_kernel != 1) {
         return false;
     }
     std::vector<const DecoderCrossKvCache*> item_cross_kv;
     item_cross_kv.reserve(items.size());
     int text_len = 0;
-    for (const MagpieWaveDecodeItem& item : items) {
-        if (!item.cross_kv || !item.cross_kv->initialized() || !item.cond_kv || !item.uncond_kv) {
+    for (MagpieWavePrefillItem& item : items) {
+        if (!item.cross_kv || !ensure_decoder_cross_kv_cache(
+                                  model_, item.text_cond ? *item.text_cond : no_host_text,
+                                  item.text_len, threads, item.cross_kv, item.text_cond_device)) {
             return false;
         }
         item_cross_kv.push_back(item.cross_kv);
@@ -1428,38 +1699,54 @@ MagpieDecoder::evalWave(
         text_len = std::max(text_len, item.cross_kv->text_len);
     }
     try {
-        if (wave_runtime_ &&
-            !wave_runtime_->waveMatches(item_cross_kv, text_len, stacked_position_budget)) {
-            wave_runtime_.reset();
-        }
-        if (!wave_runtime_) {
-            wave_runtime_ = std::make_unique<PersistentDecoderRuntime>(
-                model_, *items.front().cross_kv, text_len, stacked_position_budget,
-                static_cast<int>(items.size()), item_cross_kv);
-            std::vector<const DecoderKvCache*> cond_items;
-            std::vector<const DecoderKvCache*> uncond_items;
-            cond_items.reserve(items.size());
-            uncond_items.reserve(items.size());
-            for (const MagpieWaveDecodeItem& item : items) {
-                cond_items.push_back(item.cond_kv);
-                uncond_items.push_back(item.uncond_kv);
-            }
-            wave_runtime_->seed(cond_items, uncond_items);
-            fprintf(
-                stderr,
-                "MagpieTTS wave runtime: fixed-shape CUDA graph, %zu chunks x CFG batch=2, "
-                "device K/V arena enabled\n",
-                items.size());
-        }
-        if (wave_runtime_->evalWave(items, cond_hidden_out, uncond_hidden_out)) {
+        wave_runtime_ = std::make_unique<PersistentDecoderRuntime>(
+            model_, *items.front().cross_kv, text_len, stacked_position_budget,
+            static_cast<int>(items.size()), item_cross_kv);
+        fprintf(
+            stderr,
+            "MagpieTTS wave runtime: fixed-shape CUDA graph, %zu chunks x CFG batch=2, "
+            "device K/V arena enabled\n",
+            items.size());
+        if (wave_runtime_->prefill(items, speaker, threads, cond_hidden_out, uncond_hidden_out)) {
             return true;
         }
-        wave_runtime_.reset();
+    }
+    catch (const std::exception& e) {
+        fprintf(stderr, "MagpieTTS wave prefill failed: %s\n", e.what());
+    }
+    wave_runtime_.reset();
+    return false;
+}
+
+bool
+MagpieDecoder::evalWave(
+    std::vector<MagpieWaveDecodeItem>& items, int stacked_position_budget,
+    magpietts_backend_tensor* cond_hidden_out, magpietts_backend_tensor* uncond_hidden_out) const {
+    if (items.empty() || !wave_runtime_) {
+        return false;
+    }
+    std::vector<const DecoderCrossKvCache*> item_cross_kv;
+    item_cross_kv.reserve(items.size());
+    int text_len = 0;
+    for (const MagpieWaveDecodeItem& item : items) {
+        if (!item.cross_kv || !item.cross_kv->initialized()) {
+            return false;
+        }
+        item_cross_kv.push_back(item.cross_kv);
+        text_len = std::max(text_len, item.cross_kv->text_len);
+    }
+    try {
+        // The runtime prefillWave built holds this wave's history; a mismatch
+        // means the caller changed the group without reopening it.
+        if (wave_runtime_->waveMatches(item_cross_kv, text_len, stacked_position_budget) &&
+            wave_runtime_->evalWave(items, cond_hidden_out, uncond_hidden_out)) {
+            return true;
+        }
     }
     catch (const std::exception& e) {
         fprintf(stderr, "MagpieTTS wave decoder failed: %s\n", e.what());
-        wave_runtime_.reset();
     }
+    wave_runtime_.reset();
     return false;
 }
 

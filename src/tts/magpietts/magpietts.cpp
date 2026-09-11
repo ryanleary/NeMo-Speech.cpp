@@ -1461,7 +1461,7 @@ stream_magpie_to_audio(
         const bool use_wave = (wave_width > 1) && token_chunks.size() > 1 && use_cuda_sampling &&
                               params.use_local_transformer && params.use_cfg &&
                               params.use_kv_cache && params.longform_history_tokens >= 0 &&
-                              wave_attention_ok;
+                              wave_attention_ok && h.dec_kernel == 1;
         // Asking for a wave and silently getting sequential decode is the worst
         // outcome, so say which requirement was not met. A single chunk is not
         // a failure: there is no wave to form.
@@ -1471,7 +1471,9 @@ stream_magpie_to_audio(
                               : !params.use_cfg               ? "classifier-free guidance is off"
                               : !params.use_kv_cache          ? "the decoder K/V cache is off"
                               : !wave_attention_ok ? "this build lacks the patched cached attention"
-                                                   : "the long-form history is adaptive";
+                              : h.dec_kernel != 1
+                                  ? "this model's decoder feed-forward is a convolution"
+                                  : "the long-form history is adaptive";
             fprintf(
                 stderr, "%s --tts.batch-size %d ignored: %s. Decoding sequentially.\n", label,
                 wave_width, why);
@@ -1490,10 +1492,6 @@ stream_magpie_to_audio(
                 std::vector<float> text_cond;
                 magpietts_backend_tensor text_cond_device;
                 DecoderCrossKvCache cross_kv;
-                DecoderKvCache cond_kv;
-                DecoderKvCache uncond_kv;
-                magpietts_backend_tensor cond_hidden;
-                magpietts_backend_tensor uncond_hidden;
                 std::vector<std::vector<int32_t>> audio_codes;
                 MagpieLongformAttentionPriorState prior;
                 std::vector<std::vector<int32_t>> frames;
@@ -1582,12 +1580,6 @@ stream_magpie_to_audio(
                     for (int c = 0; c < h.audio_codebooks; ++c) {
                         item->audio_codes[c].assign(
                             (size_t)h.frame_stacking_factor, h.audio_bos_id);
-                    }
-                    if (!item->cond_hidden.alloc2d(
-                            magpie, GGML_TYPE_F32, h.n_embd, 1, "wave_hidden_cond") ||
-                        !item->uncond_hidden.alloc2d(
-                            magpie, GGML_TYPE_F32, h.n_embd, 1, "wave_hidden_uncond")) {
-                        return cancel_worker();
                     }
                     seen_tokens.insert(seen_tokens.end(), current.begin(), current.end());
                     absolute += (int)current.size();
@@ -1737,11 +1729,6 @@ stream_magpie_to_audio(
                         return cancel_worker();
                     }
                 }
-                decoder.resetWave();
-
-                // Step 0 goes through the single-item path: it is the only one
-                // that can prefill a chunk's baked context, and its K/V caches
-                // are what seed the wave's columns.
                 // One [n_embd, width] pair carries the whole wave's guidance
                 // states, which is what the batched local transformer reads.
                 magpietts_backend_tensor wave_cond;
@@ -1753,40 +1740,39 @@ stream_magpie_to_audio(
                     return cancel_worker();
                 }
 
+                // Open the group: every chunk's cross-K/V, then all of their
+                // baked contexts through one graph, straight into the ring the
+                // steps append to. Step 0's guidance pair comes back in the same
+                // tensors every later step writes.
                 std::vector<std::vector<float>> step0_scores(width);
                 std::vector<char> step0_collect(width, 0);
-                std::vector<float> hidden_row((size_t)h.n_embd);
+                std::vector<MagpieWavePrefillItem> opening(width);
                 for (size_t k = 0; k < width; ++k) {
                     WaveItem& item = *plan[base + k];
-                    decoder_result cond, uncond;
-                    cond.logits_required = false;
-                    uncond.logits_required = false;
-                    magpietts_decoder_attention attn;
-                    attn.prior = item.prior.priorForStep(h, item.text_len);
+                    MagpieWavePrefillItem& slot = opening[k];
+                    slot.text_cond = &item.text_cond;
+                    slot.text_cond_device = &item.text_cond_device;
+                    slot.text_len = item.text_len;
+                    slot.audio_codes = &item.audio_codes;
+                    slot.cross_kv = &item.cross_kv;
+                    slot.prior = item.prior.priorForStep(h, item.text_len);
                     if (item.prior.shouldCollect(h, 0, item.text_len)) {
                         step0_collect[k] = 1;
-                        attn.alignment_scores = &step0_scores[k];
+                        slot.alignment_scores = &step0_scores[k];
                     }
-                    const magpietts_decoder_attention* attn_arg =
-                        (attn.prior || attn.alignment_scores) ? &attn : nullptr;
-                    if (!decoder.evalCachedPair(
-                            item.text_cond, item.text_len, item.audio_codes, params.speaker,
-                            params.threads, item.cond_kv, item.uncond_kv, cond, uncond,
-                            max_decoder_positions, nullptr, &item.text_cond_device,
-                            &item.cond_hidden, &item.uncond_hidden, &item.cross_kv, attn_arg)) {
-                        return cancel_worker();
-                    }
-                    // Gather this item's opening state into its column. Once per
-                    // group, so a host round-trip is cheaper than a wider graph.
-                    const size_t row_bytes = hidden_row.size() * sizeof(float);
-                    const size_t column = k * row_bytes;
-                    ggml_backend_tensor_get(
-                        item.cond_hidden.tensor, hidden_row.data(), 0, row_bytes);
-                    ggml_backend_tensor_set(wave_cond.tensor, hidden_row.data(), column, row_bytes);
-                    ggml_backend_tensor_get(
-                        item.uncond_hidden.tensor, hidden_row.data(), 0, row_bytes);
-                    ggml_backend_tensor_set(
-                        wave_uncond.tensor, hidden_row.data(), column, row_bytes);
+                }
+                if (!decoder.prefillWave(
+                        opening, params.speaker, params.threads, max_decoder_positions + 1,
+                        &wave_cond, &wave_uncond)) {
+                    fprintf(stderr, "%s wave prefill failed\n", label);
+                    return cancel_worker();
+                }
+                // The encoder output has done its only job: building the
+                // cross-K/V the wave attends over.
+                for (size_t k = 0; k < width; ++k) {
+                    plan[base + k]->text_cond_device.reset();
+                    plan[base + k]->text_cond.clear();
+                    plan[base + k]->text_cond.shrink_to_fit();
                 }
                 {
                     std::vector<int32_t> codes;
@@ -1847,8 +1833,6 @@ stream_magpie_to_audio(
                         MagpieWaveDecodeItem& slot = slots[k];
                         slot.audio_codes = &item.audio_codes;
                         slot.cross_kv = &item.cross_kv;
-                        slot.cond_kv = &item.cond_kv;
-                        slot.uncond_kv = &item.uncond_kv;
                         slot.prior = item.prior.priorForStep(h, item.text_len);
                         if (!item.done && item.prior.shouldCollect(h, step, item.text_len)) {
                             collect[k] = 1;
@@ -1862,8 +1846,7 @@ stream_magpie_to_audio(
                     // survives that by falling back to the non-persistent
                     // decoder; a wave has no fallback and fails the run.
                     if (!decoder.evalWave(
-                            slots, params.speaker, params.threads, max_decoder_positions + 1,
-                            &wave_cond, &wave_uncond)) {
+                            slots, max_decoder_positions + 1, &wave_cond, &wave_uncond)) {
                         fprintf(stderr, "%s wave decode step %d failed\n", label, step);
                         return cancel_worker();
                     }
@@ -1877,20 +1860,6 @@ stream_magpie_to_audio(
                             workspace.cudaSampler(), (uint64_t)(uint32_t)params.seed,
                             wave_frame_index, codes, argmax, (int)width)) {
                         return cancel_worker();
-                    }
-                    if (step == 1) {
-                        // The wave arena now owns every column's history. The
-                        // per-item caches that seeded it are full-size decoder
-                        // caches -- 288 MiB a chunk for the guidance pair -- and
-                        // holding them for the whole run costs tens of GiB on a
-                        // long script. Only n_tokens is read from here on.
-                        for (size_t k = 0; k < width; ++k) {
-                            plan[base + k]->cond_kv.reset();
-                            plan[base + k]->uncond_kv.reset();
-                            plan[base + k]->text_cond_device.reset();
-                            plan[base + k]->text_cond.clear();
-                            plan[base + k]->text_cond.shrink_to_fit();
-                        }
                     }
                     ++wave_frame_index;
                     for (size_t k = 0; k < width; ++k) {
