@@ -251,14 +251,7 @@ advance_chunk_state(
 // adaptive path (longform_history_tokens < 0). A wave must not use that path --
 // there chunk N's text really does depend on chunk N-1's decode -- so it passes
 // required_history = 0 and keeps longform_history_tokens >= 0.
-struct MagpieChunkPlan {
-    std::vector<int32_t> text_window;
-    int history_len = 0;
-    int left_offset = 0;
-    int text_len = 0;
-};
-
-static MagpieChunkPlan
+MagpieChunkPlan
 plan_text_chunk(
     const magpietts_hparams& h, const magpie_stream_params& params,
     const std::vector<int32_t>& prior_text_tokens, const std::vector<int32_t>& current_tokens,
