@@ -262,18 +262,24 @@ static MagpieChunkPlan
 plan_text_chunk(
     const magpietts_hparams& h, const magpie_stream_params& params,
     const std::vector<int32_t>& prior_text_tokens, const std::vector<int32_t>& current_tokens,
-    int absolute_token_offset, int required_history) {
+    int absolute_token_offset, int required_history, int available_history) {
     MagpieChunkPlan plan;
     const int max_history = std::max(0, h.n_ctx - (int)current_tokens.size());
+    // The history tokens are spliced from the *previous chunk's* encoder output, so the
+    // window can never reach back further than that one chunk -- which is unrelated to
+    // how many tokens have been seen in total. Clamping only by prior_text_tokens asks
+    // for history the cache cannot supply as soon as a chunk is shorter than the
+    // requested history, which ordinary prose produces routinely: a short sentence makes
+    // a short chunk, and the next chunk then asks for more than it left behind.
+    const int history_cap =
+        std::min<int>((int)prior_text_tokens.size(), std::max(0, available_history));
     const int default_history =
-        std::min<int>({(int)prior_text_tokens.size(), (int)current_tokens.size(), 20, max_history});
+        std::min<int>({history_cap, (int)current_tokens.size(), 20, max_history});
     plan.history_len =
         params.longform_history_tokens >= 0
-            ? std::min<int>(
-                  {params.longform_history_tokens, (int)prior_text_tokens.size(), max_history})
+            ? std::min<int>({params.longform_history_tokens, history_cap, max_history})
             : std::min<int>(
-                  (int)prior_text_tokens.size(),
-                  std::min(max_history, std::max(default_history, required_history)));
+                  history_cap, std::min(max_history, std::max(default_history, required_history)));
     plan.left_offset = absolute_token_offset - plan.history_len;
     plan.text_window.reserve((size_t)plan.history_len + current_tokens.size());
     if (plan.history_len > 0) {
@@ -1536,7 +1542,7 @@ stream_magpie_to_audio(
                     item->chunk_index = ci;
                     item->current_tokens = &current;
                     const MagpieChunkPlan chunk_plan =
-                        plan_text_chunk(h, params, seen_tokens, current, absolute, 0);
+                        plan_text_chunk(h, params, seen_tokens, current, absolute, 0, carry_len);
                     const int history_len = chunk_plan.history_len;
                     const std::vector<int32_t>& window = chunk_plan.text_window;
                     item->left_offset = chunk_plan.left_offset;
@@ -1943,7 +1949,7 @@ stream_magpie_to_audio(
             }
             const MagpieChunkPlan chunk_plan = plan_text_chunk(
                 h, params, prior_text_tokens, current_tokens, absolute_token_offset,
-                required_history);
+                required_history, history_text_context_len);
             const int history_len = chunk_plan.history_len;
             const int left_offset = chunk_plan.left_offset;
             const std::vector<int32_t>& text_window = chunk_plan.text_window;
