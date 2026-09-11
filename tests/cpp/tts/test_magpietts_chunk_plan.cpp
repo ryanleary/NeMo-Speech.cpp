@@ -136,7 +136,8 @@ main() {
     // leaves no room for history.
     {
         const tts::magpietts_hparams small = hparams(64);
-        const auto p = tts::plan_text_chunk(small, pinned(20), tokens(500), tokens(60), 500, 0, 200);
+        const auto p =
+            tts::plan_text_chunk(small, pinned(20), tokens(500), tokens(60), 500, 0, 200);
         expect(p.text_len <= 64, "window never exceeds the model context");
         expect_eq(p.history_len, 4, "history shrinks to fit the context");
     }
