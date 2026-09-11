@@ -80,14 +80,6 @@ token_count(const std::vector<std::vector<int32_t>>& chunks) {
     return total;
 }
 
-static double
-text_cond_checksum(const std::vector<float>& v) {
-    double acc = 0.0;
-    for (size_t i = 0; i < v.size(); ++i) {
-        acc += (double)v[i] * (double)((i % 97) + 1);
-    }
-    return acc;
-}
 
 static bool
 splice_longform_history_context(
@@ -114,6 +106,184 @@ splice_longform_history_context(
         previous_context.data() + (size_t)(previous_context_len - history_len) * (size_t)n_embd;
     std::copy(src, src + (size_t)history_len * (size_t)n_embd, text_cond.data());
     return true;
+}
+
+
+// Per-chunk decode state that survives across steps.
+struct MagpieChunkDecodeState {
+    int chunk_frames_generated = 0;
+    int near_end_frames = 0;
+    bool suppress_nonfinal_codec_output = false;
+    int suppressed_nonfinal_frames = 0;
+};
+
+// What one decoder step did to one chunk.
+struct MagpieStepOutcome {
+    std::vector<std::vector<int32_t>> frames;
+    bool stop = false;
+};
+
+// Everything a step implies for one chunk once its codes are sampled: advance
+// the attention prior, decide whether the chunk has run to the end of its text,
+// apply the non-final-EOS suppression rule, and split the stacked step into
+// codec frames. Reads only this chunk's state, so a wave runs it once per item
+// and the sequential loop runs it once.
+static bool
+advance_chunk_state(
+    const magpietts_hparams& h, const magpie_stream_params& params, const char* label,
+    size_t chunk_index, size_t chunk_count, int step, int text_len, bool final_chunk,
+    bool forbid_eos, int frames_remaining, const std::vector<int32_t>& next_codes,
+    const std::vector<int32_t>& argmax_codes, const std::vector<float>* alignment_scores,
+    MagpieLongformAttentionPriorState& prior, MagpieChunkDecodeState& chunk,
+    std::vector<std::vector<int32_t>>& audio_codes, MagpieStepOutcome& out) {
+    out.frames.clear();
+    out.stop = false;
+
+    bool end_chunk_after_frame = false;
+    bool start_suppressing_after_frame = false;
+    bool reached_chunk_end = final_chunk;
+    bool can_catch_up_nonfinal = false;
+    if (alignment_scores && !alignment_scores->empty()) {
+        prior.update(h, step, text_len, *alignment_scores);
+        if (params.verbose) {
+            log_longform_attention_prior_trace(label, (int)chunk_index, step, h, prior);
+        }
+        const int near_end_threshold = 3;
+        const int last_rel = prior.lastAttendedRelative();
+        reached_chunk_end = last_rel >= std::max(0, text_len - 1);
+        if (!final_chunk) {
+            can_catch_up_nonfinal = true;
+            if (last_rel >= std::max(0, text_len - near_end_threshold)) {
+                ++chunk.near_end_frames;
+            } else {
+                chunk.near_end_frames = 0;
+            }
+            if (chunk.suppress_nonfinal_codec_output) {
+                end_chunk_after_frame = reached_chunk_end;
+            } else if (
+                chunk.near_end_frames >= 1 &&
+                chunk.chunk_frames_generated >= h.min_generated_frames) {
+                if (reached_chunk_end) {
+                    end_chunk_after_frame = true;
+                } else {
+                    start_suppressing_after_frame = true;
+                }
+            }
+        } else if (reached_chunk_end && chunk.chunk_frames_generated >= h.min_generated_frames) {
+            end_chunk_after_frame = true;
+        }
+    }
+
+    std::vector<std::vector<int32_t>> codec_frames;
+    if (!magpietts_unstack_codes(next_codes, h, codec_frames)) {
+        fprintf(stderr, "sampled an invalid stacked MagpieTTS frame\n");
+        return false;
+    }
+    const int eos_lane = forbid_eos ? -1 : magpietts_first_eos_lane(next_codes, argmax_codes, h);
+    const bool has_eos = eos_lane >= 0 && eos_lane < frames_remaining;
+    if (has_eos) {
+        ggml_nvtx::mark("magpietts_stream_eos");
+        if (params.verbose) {
+            fprintf(
+                stderr, "%s EOS detected at frame %d for text chunk %zu/%zu\n", label, step,
+                chunk_index + 1, chunk_count);
+        }
+        if (final_chunk || reached_chunk_end || !can_catch_up_nonfinal) {
+            out.stop = true;
+        }
+        if (!chunk.suppress_nonfinal_codec_output) {
+            chunk.suppress_nonfinal_codec_output = true;
+            if (params.verbose) {
+                fprintf(
+                    stderr,
+                    "%s suppressing codec output for text chunk %zu/%zu after non-final EOS "
+                    "until attention reaches chunk end (relative=%d text_len=%d)\n",
+                    label, chunk_index + 1, chunk_count, prior.lastAttendedRelative(), text_len);
+            }
+        }
+    }
+
+    for (int c = 0; c < h.audio_codebooks; ++c) {
+        for (int lane = 0; lane < h.frame_stacking_factor; ++lane) {
+            audio_codes[(size_t)c].push_back(next_codes[(size_t)(c + lane * h.audio_codebooks)]);
+        }
+    }
+
+    const int frames_to_emit = magpietts_frames_to_emit(
+        frames_remaining, h.frame_stacking_factor, has_eos ? eos_lane : -1);
+    if (!chunk.suppress_nonfinal_codec_output) {
+        for (int lane = 0; lane < frames_to_emit; ++lane) {
+            out.frames.push_back(codec_frames[(size_t)lane]);
+        }
+        chunk.chunk_frames_generated += frames_to_emit;
+    } else {
+        chunk.suppressed_nonfinal_frames += frames_to_emit;
+    }
+    if (start_suppressing_after_frame) {
+        chunk.suppress_nonfinal_codec_output = true;
+        if (params.verbose) {
+            fprintf(
+                stderr,
+                "%s continuing text chunk %zu/%zu without codec output until attention reaches "
+                "chunk end (relative=%d text_len=%d)\n",
+                label, chunk_index + 1, chunk_count, prior.lastAttendedRelative(), text_len);
+        }
+    }
+    if (end_chunk_after_frame) {
+        if (params.verbose) {
+            fprintf(
+                stderr,
+                "%s ending text chunk %zu/%zu after attention reached chunk end (relative=%d "
+                "text_len=%d suppressed_codec_frames=%d)\n",
+                label, chunk_index + 1, chunk_count, prior.lastAttendedRelative(), text_len,
+                chunk.suppressed_nonfinal_frames);
+        }
+        out.stop = true;
+    }
+    return true;
+}
+
+// The text-only half of starting a chunk: how much already-spoken text to carry
+// into the window, and what that window is. Touches no decoder state, so a wave
+// can run it for a whole group before decoding any of it.
+//
+// required_history is the one decode-time input, and it is only consulted on the
+// adaptive path (longform_history_tokens < 0). A wave must not use that path --
+// there chunk N's text really does depend on chunk N-1's decode -- so it passes
+// required_history = 0 and keeps longform_history_tokens >= 0.
+struct MagpieChunkPlan {
+    std::vector<int32_t> text_window;
+    int history_len = 0;
+    int left_offset = 0;
+    int text_len = 0;
+};
+
+static MagpieChunkPlan
+plan_text_chunk(
+    const magpietts_hparams& h, const magpie_stream_params& params,
+    const std::vector<int32_t>& prior_text_tokens, const std::vector<int32_t>& current_tokens,
+    int absolute_token_offset, int required_history) {
+    MagpieChunkPlan plan;
+    const int max_history = std::max(0, h.n_ctx - (int)current_tokens.size());
+    const int default_history =
+        std::min<int>({(int)prior_text_tokens.size(), (int)current_tokens.size(), 20, max_history});
+    plan.history_len =
+        params.longform_history_tokens >= 0
+            ? std::min<int>(
+                  {params.longform_history_tokens, (int)prior_text_tokens.size(), max_history})
+            : std::min<int>(
+                  (int)prior_text_tokens.size(),
+                  std::min(max_history, std::max(default_history, required_history)));
+    plan.left_offset = absolute_token_offset - plan.history_len;
+    plan.text_window.reserve((size_t)plan.history_len + current_tokens.size());
+    if (plan.history_len > 0) {
+        plan.text_window.insert(
+            plan.text_window.end(), prior_text_tokens.end() - plan.history_len,
+            prior_text_tokens.end());
+    }
+    plan.text_window.insert(plan.text_window.end(), current_tokens.begin(), current_tokens.end());
+    plan.text_len = (int)plan.text_window.size();
+    return plan;
 }
 
 static std::vector<std::vector<int32_t>>
@@ -1283,13 +1453,9 @@ stream_magpie_to_audio(
         // falls through to the sequential loop below, unchanged.
         const int max_decoder_positions =
             (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
-        // Diagnostic: run the wave path at width 1, which should reproduce the
-        // sequential path exactly. It separates a batching bug from a
-        // scheduling one.
-        const bool wave_force = std::getenv("MAGPIETTS_WAVE_FORCE") != nullptr;
         const int wave_width = std::max(1, params.batch_size);
-        const bool use_wave = (wave_width > 1 || wave_force) && token_chunks.size() > 1 &&
-                              use_cuda_sampling && params.use_local_transformer && params.use_cfg &&
+        const bool use_wave = (wave_width > 1) && token_chunks.size() > 1 && use_cuda_sampling &&
+                              params.use_local_transformer && params.use_cfg &&
                               params.use_kv_cache && params.longform_history_tokens >= 0;
         // ---- Wave scheduler -------------------------------------------------
         // Long-form chunks decoded in lockstep, several at a time through one
@@ -1312,10 +1478,7 @@ stream_magpie_to_audio(
                 std::vector<std::vector<int32_t>> audio_codes;
                 MagpieLongformAttentionPriorState prior;
                 std::vector<std::vector<int32_t>> frames;
-                int frames_made = 0;
-                int near_end = 0;
-                bool suppress = false;
-                int suppressed = 0;
+                MagpieChunkDecodeState chunk;
                 bool done = false;
             };
 
@@ -1355,18 +1518,12 @@ stream_magpie_to_audio(
                     auto item = std::make_unique<WaveItem>();
                     item->chunk_index = ci;
                     item->current_tokens = &current;
-                    const int max_history = std::max(0, h.n_ctx - (int)current.size());
-                    const int history_len = std::min<int>(
-                        {params.longform_history_tokens, (int)seen_tokens.size(), max_history});
-                    item->left_offset = absolute - history_len;
-                    std::vector<int32_t> window;
-                    window.reserve((size_t)history_len + current.size());
-                    if (history_len > 0) {
-                        window.insert(
-                            window.end(), seen_tokens.end() - history_len, seen_tokens.end());
-                    }
-                    window.insert(window.end(), current.begin(), current.end());
-                    item->text_len = (int)window.size();
+                    const MagpieChunkPlan chunk_plan =
+                        plan_text_chunk(h, params, seen_tokens, current, absolute, 0);
+                    const int history_len = chunk_plan.history_len;
+                    const std::vector<int32_t>& window = chunk_plan.text_window;
+                    item->left_offset = chunk_plan.left_offset;
+                    item->text_len = chunk_plan.text_len;
 
                     const int64_t enc_start = ggml_time_us();
                     if (!encoder.evalDevice(window, params.threads, item->text_cond_device)) {
@@ -1387,11 +1544,6 @@ stream_magpie_to_audio(
                                 magpie, text_context_staging, item->text_cond_device.tensor,
                                 item->text_cond.data(), 0, item->text_cond.size() * sizeof(float));
                         }
-                    }
-                    if (params.verbose) {
-                        fprintf(
-                            stderr, "%s wave cond chunk %zu: len=%d checksum=%.6f\n", label, ci,
-                            item->text_len, text_cond_checksum(item->text_cond));
                     }
                     carry_cond = item->text_cond;
                     carry_len = item->text_len;
@@ -1476,88 +1628,21 @@ stream_magpie_to_audio(
                     argmax_codes[(size_t)c] = all_argmax[(size_t)(c * width + item_index)];
                 }
 
-                const bool final_chunk = item.chunk_index + 1 == token_chunks.size();
-                bool end_after = false;
-                bool start_suppressing = false;
-                bool reached_end = final_chunk;
-                bool can_catch_up = false;
-                if (collected && !scores.empty()) {
-                    item.prior.update(h, step, item.text_len, scores);
-                    const int near_end_threshold = 3;
-                    const int last_rel = item.prior.lastAttendedRelative();
-                    reached_end = last_rel >= std::max(0, item.text_len - 1);
-                    if (!final_chunk) {
-                        can_catch_up = true;
-                        if (last_rel >= std::max(0, item.text_len - near_end_threshold)) {
-                            ++item.near_end;
-                        } else {
-                            item.near_end = 0;
-                        }
-                        if (item.suppress) {
-                            end_after = reached_end;
-                        } else if (
-                            item.near_end >= 1 && item.frames_made >= h.min_generated_frames) {
-                            if (reached_end) {
-                                end_after = true;
-                            } else {
-                                start_suppressing = true;
-                            }
-                        }
-                    } else if (reached_end && item.frames_made >= h.min_generated_frames) {
-                        end_after = true;
-                    }
-                }
-
-                std::vector<std::vector<int32_t>> codec_frames;
-                if (!magpietts_unstack_codes(next_codes, h, codec_frames)) {
-                    fprintf(stderr, "sampled an invalid stacked MagpieTTS frame\n");
+                MagpieStepOutcome outcome;
+                if (!advance_chunk_state(
+                        h, params, label, item.chunk_index, token_chunks.size(), step,
+                        item.text_len, item.chunk_index + 1 == token_chunks.size(), forbid_eos,
+                        frames_remaining, next_codes, argmax_codes, collected ? &scores : nullptr,
+                        item.prior, item.chunk, item.audio_codes, outcome)) {
                     return false;
                 }
-                const int eos_lane =
-                    forbid_eos ? -1 : magpietts_first_eos_lane(next_codes, argmax_codes, h);
-                const bool has_eos = eos_lane >= 0 && eos_lane < frames_remaining;
-                bool terminate_after = false;
-                if (has_eos) {
-                    if (final_chunk || reached_end || !can_catch_up) {
-                        terminate_after = true;
-                    }
-                    item.suppress = true;
-                }
-
                 bool first_frame = false;
                 metrics.record_decoder_frame(ggml_time_us(), first_frame);
-                for (int c = 0; c < h.audio_codebooks; ++c) {
-                    for (int lane = 0; lane < h.frame_stacking_factor; ++lane) {
-                        item.audio_codes[c].push_back(next_codes[c + lane * h.audio_codebooks]);
-                    }
-                }
-                item.frames_made += h.frame_stacking_factor;
                 decoder_frames_generated += h.frame_stacking_factor;
-
-                const int to_emit = magpietts_frames_to_emit(
-                    frames_remaining, h.frame_stacking_factor, has_eos ? eos_lane : -1);
-                if (!item.suppress) {
-                    for (int lane = 0; lane < to_emit; ++lane) {
-                        item.frames.push_back(codec_frames[(size_t)lane]);
-                    }
-                } else {
-                    item.suppressed += to_emit;
+                for (const std::vector<int32_t>& frame : outcome.frames) {
+                    item.frames.push_back(frame);
                 }
-                if (start_suppressing) {
-                    item.suppress = true;
-                }
-                if (end_after || terminate_after) {
-                    item.done = true;
-                }
-                if (params.verbose && (step % 25 == 0 || item.done)) {
-                    fprintf(
-                        stderr,
-                        "%s wave chunk %zu step %d: rel=%d/%d frames=%d eos=%d suppress=%d "
-                        "collected=%d done=%d\n",
-                        label, item.chunk_index, step, item.prior.lastAttendedRelative(),
-                        item.text_len, item.frames_made, has_eos ? 1 : 0, item.suppress ? 1 : 0,
-                        collected ? 1 : 0, item.done ? 1 : 0);
-                }
+                item.done = outcome.stop;
                 return true;
             };
 
@@ -1584,7 +1669,8 @@ stream_magpie_to_audio(
                 if (params.verbose) {
                     fprintf(
                         stderr, "%s wave flush chunk %zu: %zu frames pending (suppressed %d)\n",
-                        label, item.chunk_index, item.frames.size(), item.suppressed);
+                        label, item.chunk_index, item.frames.size(),
+                        item.chunk.suppressed_nonfinal_frames);
                 }
                 if (!drain_item(item)) {
                     return false;
@@ -1826,14 +1912,10 @@ stream_magpie_to_audio(
                 return cancel_worker();
             }
 
-            const int max_history = std::max(0, h.n_ctx - (int)current_tokens.size());
-            const int default_history = std::min<int>(
-                {(int)prior_text_tokens.size(), (int)current_tokens.size(), 20, max_history});
-            // The adaptive path asks where the *previous chunk's decode* ended up
-            // attending, which makes chunk N's text window depend on chunk N-1's
-            // output. That is fine sequentially and fatal to batching, so a fixed
-            // history is what makes a wave possible -- and it is a real behaviour
-            // change, not a knob, which is why it is opt-in.
+            // The adaptive path asks where the previous chunk's decode ended up
+            // attending, which makes chunk N's window depend on chunk N-1's
+            // output. Fine sequentially, fatal to batching, which is why a wave
+            // requires a pinned history and passes required_history = 0.
             int required_history = 0;
             if (params.longform_history_tokens < 0 && chunk_index > 0 &&
                 attention_prior.initialized()) {
@@ -1842,25 +1924,13 @@ stream_magpie_to_audio(
                     required_history = absolute_token_offset - last_abs;
                 }
             }
-            const int history_len =
-                params.longform_history_tokens >= 0
-                    ? std::min<int>(
-                          {params.longform_history_tokens, (int)prior_text_tokens.size(),
-                           max_history})
-                    : std::min<int>(
-                          (int)prior_text_tokens.size(),
-                          std::min(max_history, std::max(default_history, required_history)));
-            const int left_offset = absolute_token_offset - history_len;
-
-            std::vector<int32_t> text_window;
-            text_window.reserve((size_t)history_len + current_tokens.size());
-            if (history_len > 0) {
-                text_window.insert(
-                    text_window.end(), prior_text_tokens.end() - history_len,
-                    prior_text_tokens.end());
-            }
-            text_window.insert(text_window.end(), current_tokens.begin(), current_tokens.end());
-            const int text_len = (int)text_window.size();
+            const MagpieChunkPlan chunk_plan = plan_text_chunk(
+                h, params, prior_text_tokens, current_tokens, absolute_token_offset,
+                required_history);
+            const int history_len = chunk_plan.history_len;
+            const int left_offset = chunk_plan.left_offset;
+            const std::vector<int32_t>& text_window = chunk_plan.text_window;
+            const int text_len = chunk_plan.text_len;
             const bool first_text_chunk = chunk_index == 0;
             const bool final_text_chunk = chunk_index + 1 == token_chunks.size();
 
@@ -1922,20 +1992,12 @@ stream_magpie_to_audio(
                             0, text_cond.size() * sizeof(float));
                     }
                 }
-                if (params.verbose) {
-                    fprintf(
-                        stderr, "%s seq cond chunk %zu: len=%d checksum=%.6f\n", label, chunk_index,
-                        text_len, text_cond_checksum(text_cond));
-                }
                 history_text_context = text_cond;
                 history_text_context_len = text_len;
             }
             metrics.encoder_ms += (double)(ggml_time_us() - encoder_start_us) / 1000.0;
 
-            int chunk_frames_generated = 0;
-            int near_end_frames = 0;
-            bool suppress_nonfinal_codec_output = false;
-            int suppressed_nonfinal_frames = 0;
+            MagpieChunkDecodeState chunk_state;
             const int max_decoder_positions =
                 (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
             for (int step = 0; step < max_decoder_positions; ++step) {
@@ -2134,126 +2196,27 @@ stream_magpie_to_audio(
                     }
                 }
 
-                bool end_chunk_after_frame = false;
-                bool start_suppressing_after_frame = false;
-                bool reached_chunk_end = final_text_chunk;
-                bool can_catch_up_nonfinal = false;
-                if (decoder_attention.alignment_scores && !alignment_scores.empty()) {
-                    attention_prior.update(h, step, text_len, alignment_scores);
-                    if (params.verbose) {
-                        log_longform_attention_prior_trace(
-                            label, (int)chunk_index, step, h, attention_prior);
-                    }
-                    const int near_end_threshold = 3;
-                    const int last_rel = attention_prior.lastAttendedRelative();
-                    reached_chunk_end = last_rel >= std::max(0, text_len - 1);
-                    if (!final_text_chunk) {
-                        can_catch_up_nonfinal = true;
-                        if (last_rel >= std::max(0, text_len - near_end_threshold)) {
-                            ++near_end_frames;
-                        } else {
-                            near_end_frames = 0;
-                        }
-                        if (suppress_nonfinal_codec_output) {
-                            end_chunk_after_frame = reached_chunk_end;
-                        } else if (
-                            near_end_frames >= 1 &&
-                            chunk_frames_generated >= h.min_generated_frames) {
-                            if (reached_chunk_end) {
-                                end_chunk_after_frame = true;
-                            } else {
-                                start_suppressing_after_frame = true;
-                            }
-                        }
-                    } else if (
-                        reached_chunk_end && chunk_frames_generated >= h.min_generated_frames) {
-                        end_chunk_after_frame = true;
-                    }
-                }
-
-                std::vector<std::vector<int32_t>> codec_frames;
-                if (!magpietts_unstack_codes(next_codes, h, codec_frames)) {
-                    fprintf(stderr, "sampled an invalid stacked MagpieTTS frame\n");
+                MagpieStepOutcome outcome;
+                if (!advance_chunk_state(
+                        h, params, label, chunk_index, token_chunks.size(), step, text_len,
+                        final_text_chunk, forbid_eos, frames_remaining, next_codes, argmax_codes,
+                        decoder_attention.alignment_scores ? &alignment_scores : nullptr,
+                        attention_prior, chunk_state, audio_codes, outcome)) {
                     return cancel_worker();
-                }
-                const int eos_lane =
-                    forbid_eos ? -1 : magpietts_first_eos_lane(next_codes, argmax_codes, h);
-                const bool has_eos = eos_lane >= 0 && eos_lane < frames_remaining;
-                bool terminate_after_frame = false;
-                if (has_eos) {
-                    ggml_nvtx::mark("magpietts_stream_eos");
-                    if (params.verbose) {
-                        fprintf(
-                            stderr, "%s EOS detected at frame %d for text chunk %zu/%zu\n", label,
-                            step, chunk_index + 1, token_chunks.size());
-                    }
-                    if (final_text_chunk || reached_chunk_end || !can_catch_up_nonfinal) {
-                        terminate_after_frame = true;
-                    }
-                    if (!suppress_nonfinal_codec_output) {
-                        suppress_nonfinal_codec_output = true;
-                        if (params.verbose) {
-                            fprintf(
-                                stderr,
-                                "%s suppressing codec output for text chunk %zu/%zu after "
-                                "non-final EOS until attention reaches chunk end "
-                                "(relative=%d text_len=%d)\n",
-                                label, chunk_index + 1, token_chunks.size(),
-                                attention_prior.lastAttendedRelative(), text_len);
-                        }
-                    }
                 }
 
                 bool first_frame = false;
                 metrics.record_decoder_frame(ggml_time_us(), first_frame);
-
-                for (int c = 0; c < h.audio_codebooks; ++c) {
-                    for (int lane = 0; lane < h.frame_stacking_factor; ++lane) {
-                        audio_codes[c].push_back(next_codes[c + lane * h.audio_codebooks]);
-                    }
-                }
-
                 decoder_frames_generated += h.frame_stacking_factor;
-                const int frames_to_emit = magpietts_frames_to_emit(
-                    frames_remaining, h.frame_stacking_factor, has_eos ? eos_lane : -1);
-                if (!suppress_nonfinal_codec_output) {
-                    for (int lane = 0; lane < frames_to_emit; ++lane) {
-                        const auto& frame = codec_frames[(size_t)lane];
-                        if (!code_writer.write_frame(frame) || !codec_worker.write_frame(frame)) {
-                            fprintf(stderr, "failed to write streamed codec frame\n");
-                            codec_worker.join();
-                            return false;
-                        }
-                        ++frames_generated;
-                        ++chunk_frames_generated;
+                for (const std::vector<int32_t>& frame : outcome.frames) {
+                    if (!code_writer.write_frame(frame) || !codec_worker.write_frame(frame)) {
+                        fprintf(stderr, "failed to write streamed codec frame\n");
+                        codec_worker.join();
+                        return false;
                     }
-                } else {
-                    suppressed_nonfinal_frames += frames_to_emit;
+                    ++frames_generated;
                 }
-                if (start_suppressing_after_frame) {
-                    suppress_nonfinal_codec_output = true;
-                    if (params.verbose) {
-                        fprintf(
-                            stderr,
-                            "%s continuing text chunk %zu/%zu without codec output until "
-                            "attention reaches chunk end (relative=%d text_len=%d)\n",
-                            label, chunk_index + 1, token_chunks.size(),
-                            attention_prior.lastAttendedRelative(), text_len);
-                    }
-                }
-                if (end_chunk_after_frame) {
-                    if (params.verbose) {
-                        fprintf(
-                            stderr,
-                            "%s ending text chunk %zu/%zu after attention reached chunk end "
-                            "(relative=%d text_len=%d suppressed_codec_frames=%d)\n",
-                            label, chunk_index + 1, token_chunks.size(),
-                            attention_prior.lastAttendedRelative(), text_len,
-                            suppressed_nonfinal_frames);
-                    }
-                    break;
-                }
-                if (terminate_after_frame) {
+                if (outcome.stop) {
                     break;
                 }
             }

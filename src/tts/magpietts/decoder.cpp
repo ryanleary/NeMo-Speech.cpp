@@ -1251,10 +1251,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
             cache_meta[static_cast<size_t>(lane)] = ring_head_;
             cache_meta[static_cast<size_t>(lanes_ + lane)] = valid_tokens_;
         }
-        {
-            const ggml_nvtx::range r("wave_write_step_state");
-            write_step_state();
-        }
+        write_step_state();
 
         // [max_text_len, items]. Each column is only read to its own chunk's
         // length, so the tail past it is never sampled.
@@ -1303,10 +1300,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
             outputs[2].host_buffer = alignment.data();
             outputs[2].nbytes = alignment.size() * sizeof(float);
         }
-        {
-            const ggml_nvtx::range r("wave_session_run");
-            session_.run(inputs, outputs);
-        }
+        session_.run(inputs, outputs);
         ggml_backend_tensor_copy_async(
             model_.backend, model_.backend, cond_device.tensor, cond_hidden_out->tensor);
         ggml_backend_tensor_copy_async(
