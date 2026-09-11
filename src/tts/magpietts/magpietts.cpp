@@ -80,6 +80,15 @@ token_count(const std::vector<std::vector<int32_t>>& chunks) {
     return total;
 }
 
+static double
+text_cond_checksum(const std::vector<float>& v) {
+    double acc = 0.0;
+    for (size_t i = 0; i < v.size(); ++i) {
+        acc += (double)v[i] * (double)((i % 97) + 1);
+    }
+    return acc;
+}
+
 static bool
 splice_longform_history_context(
     std::vector<float>& text_cond, int text_len, int current_chunk_len, int n_embd,
@@ -1265,7 +1274,429 @@ stream_magpie_to_audio(
     {
         const ggml_nvtx::range nvtx_loop("magpietts_stream_generation_loop");
         int absolute_token_offset = 0;
-        for (size_t chunk_index = 0; chunk_index < token_chunks.size(); ++chunk_index) {
+        // A wave needs the fast CUDA path and a pinned history; anything else
+        // falls through to the sequential loop below, unchanged.
+        const int max_decoder_positions =
+            (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
+        // Diagnostic: run the wave path at width 1, which should reproduce the
+        // sequential path exactly. It separates a batching bug from a
+        // scheduling one.
+        const bool wave_force = std::getenv("MAGPIETTS_WAVE_FORCE") != nullptr;
+        const int wave_width = std::max(1, params.batch_size);
+        const bool use_wave = (wave_width > 1 || wave_force) && token_chunks.size() > 1 &&
+                              use_cuda_sampling &&
+                              params.use_local_transformer && params.use_cfg &&
+                              params.use_kv_cache && params.longform_history_tokens >= 0;
+        // ---- Wave scheduler -------------------------------------------------
+        // Long-form chunks decoded in lockstep, several at a time through one
+        // graph. This needs a pinned history (gated at entry): the adaptive rule
+        // derives chunk N's text window from chunk N-1's alignment, and a wave
+        // has not decoded chunk N-1 when it plans chunk N.
+        if (use_wave) {
+            struct WaveItem {
+                size_t chunk_index = 0;
+                const std::vector<int32_t>* current_tokens = nullptr;
+                int text_len = 0;
+                int left_offset = 0;
+                std::vector<float> text_cond;
+                magpietts_backend_tensor text_cond_device;
+                DecoderCrossKvCache cross_kv;
+                DecoderKvCache cond_kv;
+                DecoderKvCache uncond_kv;
+                magpietts_backend_tensor cond_hidden;
+                magpietts_backend_tensor uncond_hidden;
+                std::vector<std::vector<int32_t>> audio_codes;
+                MagpieLongformAttentionPriorState prior;
+                std::vector<std::vector<int32_t>> frames;
+                int frames_made = 0;
+                int near_end = 0;
+                bool suppress = false;
+                int suppressed = 0;
+                bool done = false;
+            };
+
+            // Encoder pre-pass. Chunk N's conditioning is spliced from chunk
+            // N-1's *encoder* output, not its decode, so the whole plan can be
+            // built before any decoding starts.
+            std::vector<std::unique_ptr<WaveItem>> plan;
+            {
+                std::vector<int32_t> seen_tokens;
+                std::vector<float> carry_cond;
+                int carry_len = 0;
+                int absolute = 0;
+                for (size_t ci = 0; ci < token_chunks.size(); ++ci) {
+                    const std::vector<int32_t>& current = token_chunks[ci];
+                    if (current.empty()) {
+                        continue;
+                    }
+                    if ((int)current.size() > h.n_ctx) {
+                        fprintf(
+                            stderr, "%s text chunk %zu has %zu tokens, exceeding model context %d\n",
+                            label, ci, current.size(), h.n_ctx);
+                        return cancel_worker();
+                    }
+                    auto item = std::make_unique<WaveItem>();
+                    item->chunk_index = ci;
+                    item->current_tokens = &current;
+                    const int max_history = std::max(0, h.n_ctx - (int)current.size());
+                    const int history_len = std::min<int>(
+                        {params.longform_history_tokens, (int)seen_tokens.size(), max_history});
+                    item->left_offset = absolute - history_len;
+                    std::vector<int32_t> window;
+                    window.reserve((size_t)history_len + current.size());
+                    if (history_len > 0) {
+                        window.insert(
+                            window.end(), seen_tokens.end() - history_len, seen_tokens.end());
+                    }
+                    window.insert(window.end(), current.begin(), current.end());
+                    item->text_len = (int)window.size();
+
+                    const int64_t enc_start = ggml_time_us();
+                    if (!encoder.evalDevice(window, params.threads, item->text_cond_device)) {
+                        return cancel_worker();
+                    }
+                    item->text_cond.resize((size_t)h.n_embd * (size_t)item->text_len);
+                    magpietts_backend_tensor_get_staged(
+                        magpie, text_context_staging, item->text_cond_device.tensor,
+                        item->text_cond.data(), 0, item->text_cond.size() * sizeof(float));
+                    if (ci > 0) {
+                        if (!splice_longform_history_context(
+                                item->text_cond, item->text_len, (int)current.size(), h.n_embd,
+                                carry_cond, carry_len)) {
+                            return cancel_worker();
+                        }
+                        if (history_len > 0) {
+                            magpietts_backend_tensor_set_staged(
+                                magpie, text_context_staging, item->text_cond_device.tensor,
+                                item->text_cond.data(), 0,
+                                item->text_cond.size() * sizeof(float));
+                        }
+                    }
+                    if (params.verbose) {
+                        fprintf(
+                            stderr, "%s wave cond chunk %zu: len=%d checksum=%.6f\n", label, ci,
+                            item->text_len, text_cond_checksum(item->text_cond));
+                    }
+                    carry_cond = item->text_cond;
+                    carry_len = item->text_len;
+                    metrics.encoder_ms += (double)(ggml_time_us() - enc_start) / 1000.0;
+
+                    // Without this the chunk resumes at relative 0 and crawls
+                    // through its own history one token a step, re-speaking it.
+                    if (ci > 0) {
+                        item->prior.seedLastAttendedAbsolute(
+                            absolute - 1, std::max(
+                                              h.attention_prior_advance_threshold,
+                                              h.attention_prior_decay_threshold));
+                    }
+                    item->prior.beginChunk(
+                        h, item->left_offset, item->text_len, (int)current.size(), ci == 0);
+                    item->audio_codes.assign(h.audio_codebooks, {});
+                    for (int c = 0; c < h.audio_codebooks; ++c) {
+                        item->audio_codes[c].assign(
+                            (size_t)h.frame_stacking_factor, h.audio_bos_id);
+                    }
+                    if (!item->cond_hidden.alloc2d(
+                            magpie, GGML_TYPE_F32, h.n_embd, 1, "wave_hidden_cond") ||
+                        !item->uncond_hidden.alloc2d(
+                            magpie, GGML_TYPE_F32, h.n_embd, 1, "wave_hidden_uncond")) {
+                        return cancel_worker();
+                    }
+                    seen_tokens.insert(seen_tokens.end(), current.begin(), current.end());
+                    absolute += (int)current.size();
+                    plan.push_back(std::move(item));
+                }
+            }
+            if (params.verbose) {
+                fprintf(
+                    stderr, "%s wave scheduler: %zu chunks, width %d, pinned history %d\n", label,
+                    plan.size(), wave_width, params.longform_history_tokens);
+            }
+
+            // The local transformer composes its codebook chain into one
+            // reusable CUDA graph, and that graph captures the *device
+            // pointers* of the hidden tensors it was built against. Handing it
+            // a different tensor per item makes every later item replay the
+            // first one's stale hidden state. So the sampler always reads this
+            // one pair, and each item's hidden is copied in before its turn.
+            magpietts_backend_tensor lt_cond;
+            magpietts_backend_tensor lt_uncond;
+            if (!lt_cond.alloc2d(magpie, GGML_TYPE_F32, h.n_embd, 1, "wave_lt_cond") ||
+                !lt_uncond.alloc2d(magpie, GGML_TYPE_F32, h.n_embd, 1, "wave_lt_uncond")) {
+                return cancel_worker();
+            }
+
+            // Everything a step does once its hidden state exists: sample the
+            // codebooks, advance the prior, decide whether the chunk is over,
+            // and buffer the frames. Shared by the step-0 warmup and the wave.
+            auto wave_step_finish = [&](WaveItem& item, int step, std::vector<float>& scores,
+                                        bool collected) -> bool {
+                // A finished item still has to advance: the wave shares one ring
+                // head, so every column's history must grow by a frame a step.
+                // What it decodes is discarded, so it repeats its last frame.
+                auto hold_lockstep = [&](WaveItem& held) {
+                    for (int c = 0; c < h.audio_codebooks; ++c) {
+                        std::vector<int32_t>& codes = held.audio_codes[c];
+                        const int32_t last = codes.empty() ? h.audio_bos_id : codes.back();
+                        for (int lane = 0; lane < h.frame_stacking_factor; ++lane) {
+                            codes.push_back(last);
+                        }
+                    }
+                };
+                if (item.done) {
+                    hold_lockstep(item);
+                    return true;
+                }
+                const int frames_remaining =
+                    h.max_decoder_steps - step * h.frame_stacking_factor;
+                if (frames_remaining <= 0) {
+                    item.done = true;
+                    hold_lockstep(item);
+                    return true;
+                }
+                const bool forbid_eos =
+                    step * h.frame_stacking_factor < h.min_generated_frames;
+                std::vector<int32_t> next_codes;
+                std::vector<int32_t> argmax_codes;
+                ggml_backend_tensor_copy_async(
+                    magpie.backend, magpie.backend, item.cond_hidden.tensor, lt_cond.tensor);
+                ggml_backend_tensor_copy_async(
+                    magpie.backend, magpie.backend, item.uncond_hidden.tensor, lt_uncond.tensor);
+                if (!local_sampler->sampleCuda(
+                        lt_cond, lt_uncond, params.use_cfg, h.cfg_scale,
+                        h.temperature, h.top_k, forbid_eos, workspace.cudaSampler(),
+                        (uint64_t)(uint32_t)params.seed, item.frames_made, next_codes,
+                        argmax_codes)) {
+                    return false;
+                }
+                if ((int)next_codes.size() != h.stacked_audio_codebooks() ||
+                    (int)argmax_codes.size() != h.stacked_audio_codebooks()) {
+                    fprintf(stderr, "CUDA sampler returned an unexpected number of codebooks\n");
+                    return false;
+                }
+
+                const bool final_chunk = item.chunk_index + 1 == token_chunks.size();
+                bool end_after = false;
+                bool start_suppressing = false;
+                bool reached_end = final_chunk;
+                bool can_catch_up = false;
+                if (collected && !scores.empty()) {
+                                        item.prior.update(h, step, item.text_len, scores);
+                    const int near_end_threshold = 3;
+                    const int last_rel = item.prior.lastAttendedRelative();
+                    reached_end = last_rel >= std::max(0, item.text_len - 1);
+                    if (!final_chunk) {
+                        can_catch_up = true;
+                        if (last_rel >= std::max(0, item.text_len - near_end_threshold)) {
+                            ++item.near_end;
+                        } else {
+                            item.near_end = 0;
+                        }
+                        if (item.suppress) {
+                            end_after = reached_end;
+                        } else if (
+                            item.near_end >= 1 && item.frames_made >= h.min_generated_frames) {
+                            if (reached_end) {
+                                end_after = true;
+                            } else {
+                                start_suppressing = true;
+                            }
+                        }
+                    } else if (reached_end && item.frames_made >= h.min_generated_frames) {
+                        end_after = true;
+                    }
+                }
+
+                std::vector<std::vector<int32_t>> codec_frames;
+                if (!magpietts_unstack_codes(next_codes, h, codec_frames)) {
+                    fprintf(stderr, "sampled an invalid stacked MagpieTTS frame\n");
+                    return false;
+                }
+                const int eos_lane =
+                    forbid_eos ? -1 : magpietts_first_eos_lane(next_codes, argmax_codes, h);
+                const bool has_eos = eos_lane >= 0 && eos_lane < frames_remaining;
+                bool terminate_after = false;
+                if (has_eos) {
+                    if (final_chunk || reached_end || !can_catch_up) {
+                        terminate_after = true;
+                    }
+                    item.suppress = true;
+                }
+
+                bool first_frame = false;
+                metrics.record_decoder_frame(ggml_time_us(), first_frame);
+                for (int c = 0; c < h.audio_codebooks; ++c) {
+                    for (int lane = 0; lane < h.frame_stacking_factor; ++lane) {
+                        item.audio_codes[c].push_back(
+                            next_codes[c + lane * h.audio_codebooks]);
+                    }
+                }
+                item.frames_made += h.frame_stacking_factor;
+                decoder_frames_generated += h.frame_stacking_factor;
+
+                const int to_emit = magpietts_frames_to_emit(
+                    frames_remaining, h.frame_stacking_factor, has_eos ? eos_lane : -1);
+                if (!item.suppress) {
+                    for (int lane = 0; lane < to_emit; ++lane) {
+                        item.frames.push_back(codec_frames[(size_t)lane]);
+                    }
+                } else {
+                    item.suppressed += to_emit;
+                }
+                if (start_suppressing) {
+                    item.suppress = true;
+                }
+                if (end_after || terminate_after) {
+                    item.done = true;
+                }
+                if (params.verbose && (step % 25 == 0 || item.done)) {
+                    fprintf(
+                        stderr,
+                        "%s wave chunk %zu step %d: rel=%d/%d frames=%d eos=%d suppress=%d "
+                        "collected=%d done=%d\n",
+                        label, item.chunk_index, step, item.prior.lastAttendedRelative(),
+                        item.text_len, item.frames_made, has_eos ? 1 : 0, item.suppress ? 1 : 0,
+                        collected ? 1 : 0, item.done ? 1 : 0);
+                }
+                return true;
+            };
+
+            // Frames leave in chunk order: the codec worker is one stream over a
+            // serial convolution state, so a later chunk cannot overtake.
+            auto flush_item = [&](WaveItem& item, bool last_chunk) -> bool {
+                if (params.verbose) {
+                    fprintf(
+                        stderr, "%s wave flush chunk %zu: %zu frames (suppressed %d)\n", label,
+                        item.chunk_index, item.frames.size(), item.suppressed);
+                }
+                for (const std::vector<int32_t>& frame : item.frames) {
+                    if (!code_writer.write_frame(frame) || !codec_worker.write_frame(frame)) {
+                        fprintf(stderr, "failed to write streamed codec frame\n");
+                        codec_worker.join();
+                        return false;
+                    }
+                    ++frames_generated;
+                }
+                item.frames.clear();
+                if (!last_chunk) {
+                    const int silence_frames = boundary_silence_dist(boundary_silence_rng);
+                    const std::vector<int32_t> silence = codec_worker.silence_frame();
+                    for (int i = 0; i < silence_frames; ++i) {
+                        if (!code_writer.write_frame(silence) ||
+                            !codec_worker.write_frame(silence)) {
+                            fprintf(stderr, "failed to write streamed silence codec frame\n");
+                            codec_worker.join();
+                            return false;
+                        }
+                        ++frames_generated;
+                    }
+                }
+                return true;
+            };
+
+            for (size_t base = 0; base < plan.size(); base += (size_t)wave_width) {
+                const size_t width = std::min((size_t)wave_width, plan.size() - base);
+                decoder.resetWave();
+
+                // Step 0 goes through the single-item path: it is the only one
+                // that can prefill a chunk's baked context, and its K/V caches
+                // are what seed the wave's columns.
+                bool group_ok = true;
+                for (size_t k = 0; k < width && group_ok; ++k) {
+                    WaveItem& item = *plan[base + k];
+                    decoder_result cond, uncond;
+                    cond.logits_required = false;
+                    uncond.logits_required = false;
+                    std::vector<float> scores;
+                    magpietts_decoder_attention attn;
+                    attn.prior = item.prior.priorForStep(h, item.text_len);
+                    if (item.prior.shouldCollect(h, 0, item.text_len)) {
+                        attn.alignment_scores = &scores;
+                    }
+                    const magpietts_decoder_attention* attn_arg =
+                        (attn.prior || attn.alignment_scores) ? &attn : nullptr;
+                    if (!decoder.evalCachedPair(
+                            item.text_cond, item.text_len, item.audio_codes, params.speaker,
+                            params.threads, item.cond_kv, item.uncond_kv, cond, uncond,
+                            max_decoder_positions, nullptr, &item.text_cond_device,
+                            &item.cond_hidden, &item.uncond_hidden, &item.cross_kv, attn_arg)) {
+                        group_ok = false;
+                        break;
+                    }
+                    if (!wave_step_finish(item, 0, scores, attn.alignment_scores != nullptr)) {
+                        group_ok = false;
+                    }
+                }
+                if (!group_ok) {
+                    return cancel_worker();
+                }
+                for (int step = 1; step < max_decoder_positions; ++step) {
+                    bool all_done = true;
+                    for (size_t k = 0; k < width; ++k) {
+                        if (!plan[base + k]->done) {
+                            all_done = false;
+                            break;
+                        }
+                    }
+                    if (all_done) {
+                        break;
+                    }
+                    if (codec_worker.is_failed()) {
+                        codec_worker.join();
+                        return false;
+                    }
+                    const int frames_remaining =
+                        h.max_decoder_steps - step * h.frame_stacking_factor;
+                    if (frames_remaining <= 0) {
+                        break;
+                    }
+
+                    // A finished item keeps stepping so the wave stays in
+                    // lockstep; its output is dropped.
+                    std::vector<std::vector<float>> scores(width);
+                    std::vector<char> collect(width, 0);
+                    std::vector<MagpieWaveDecodeItem> slots(width);
+                    for (size_t k = 0; k < width; ++k) {
+                        WaveItem& item = *plan[base + k];
+                        MagpieWaveDecodeItem& slot = slots[k];
+                        slot.audio_codes = &item.audio_codes;
+                        slot.cross_kv = &item.cross_kv;
+                        slot.cond_kv = &item.cond_kv;
+                        slot.uncond_kv = &item.uncond_kv;
+                        slot.prior = item.prior.priorForStep(h, item.text_len);
+                        if (!item.done && item.prior.shouldCollect(h, step, item.text_len)) {
+                            collect[k] = 1;
+                            slot.alignment_scores = &scores[k];
+                        }
+                        slot.cond_hidden = &item.cond_hidden;
+                        slot.uncond_hidden = &item.uncond_hidden;
+                    }
+                    const ggml_nvtx::range nvtx_step("magpietts_stream_wave_step");
+                    if (!decoder.evalWave(
+                            slots, params.speaker, params.threads, max_decoder_positions)) {
+                        fprintf(stderr, "%s wave decode step %d failed\n", label, step);
+                        return cancel_worker();
+                    }
+                    for (size_t k = 0; k < width; ++k) {
+                        if (!wave_step_finish(
+                                *plan[base + k], step, scores[k], collect[k] != 0)) {
+                            return cancel_worker();
+                        }
+                    }
+                }
+
+                for (size_t k = 0; k < width; ++k) {
+                    WaveItem& item = *plan[base + k];
+                    const bool last_chunk = base + k + 1 == plan.size();
+                    if (!flush_item(item, last_chunk)) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        for (size_t chunk_index = 0; !use_wave && chunk_index < token_chunks.size();
+             ++chunk_index) {
             const std::vector<int32_t>& current_tokens = token_chunks[chunk_index];
             if (current_tokens.empty()) {
                 continue;
@@ -1372,6 +1803,11 @@ stream_magpie_to_audio(
                             magpie, text_context_staging, text_cond_device.tensor, text_cond.data(),
                             0, text_cond.size() * sizeof(float));
                     }
+                }
+                if (params.verbose) {
+                    fprintf(
+                        stderr, "%s seq cond chunk %zu: len=%d checksum=%.6f\n", label,
+                        chunk_index, text_len, text_cond_checksum(text_cond));
                 }
                 history_text_context = text_cond;
                 history_text_context_len = text_len;
@@ -1585,7 +2021,7 @@ stream_magpie_to_audio(
                 bool reached_chunk_end = final_text_chunk;
                 bool can_catch_up_nonfinal = false;
                 if (decoder_attention.alignment_scores && !alignment_scores.empty()) {
-                    attention_prior.update(h, step, text_len, alignment_scores);
+                                        attention_prior.update(h, step, text_len, alignment_scores);
                     if (params.verbose) {
                         log_longform_attention_prior_trace(
                             label, (int)chunk_index, step, h, attention_prior);

@@ -62,6 +62,20 @@ class DecoderCrossKvCache {
     bool valid = false;
 };
 
+// One chunk's slot in a wave. Everything here is that chunk's own; the decoder
+// reads its codes and history and writes back its hidden state and alignment.
+struct MagpieWaveDecodeItem {
+    const std::vector<std::vector<int32_t>>* audio_codes = nullptr;
+    DecoderCrossKvCache* cross_kv = nullptr;
+    DecoderKvCache* cond_kv = nullptr;
+    DecoderKvCache* uncond_kv = nullptr;
+    // Length is this chunk's own text_len, not the wave's widest.
+    const std::vector<float>* prior = nullptr;
+    std::vector<float>* alignment_scores = nullptr;
+    magpietts_backend_tensor* cond_hidden = nullptr;
+    magpietts_backend_tensor* uncond_hidden = nullptr;
+};
+
 struct decoder_result {
     bool logits_required = true;
     std::vector<float> logits_last;
@@ -130,12 +144,29 @@ class MagpieDecoder {
         DecoderCrossKvCache* cond_cross_kv = nullptr,
         const magpietts_decoder_attention* attention = nullptr) const;
 
+    // Decode a wave: several long-form chunks advanced one step in lockstep
+    // through one graph. Every item carries its own text, its own cross-K/V and
+    // its own history; what they share is the step index, which is what lets a
+    // single ring head and a single mask serve them all.
+    //
+    // Each item must already have been stepped once through the single-item
+    // path: that is the only path that can prefill a chunk's baked context, and
+    // its K/V caches are what seed this one's columns.
+    bool evalWave(
+        std::vector<MagpieWaveDecodeItem>& items, int speaker, int threads,
+        int stacked_position_budget) const;
+
+    // Drop a wave runtime so the next call rebuilds it. A wave's width and its
+    // items' cross-K/V addresses are baked into the graph.
+    void resetWave() const;
+
    private:
     class PersistentDecoderRuntime;
 
     const magpietts_model& model_;
     mutable MagpiePinnedHostScratch output_staging_;
     mutable std::unique_ptr<PersistentDecoderRuntime> persistent_runtime_;
+    mutable std::unique_ptr<PersistentDecoderRuntime> wave_runtime_;
 };
 
 class MagpieCodebookSampler {
