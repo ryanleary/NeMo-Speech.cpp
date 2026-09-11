@@ -1430,7 +1430,15 @@ class MagpieDecoder::PersistentDecoderRuntime {
             model_.backend, model_.backend, cond_device.tensor, cond_hidden_out->tensor);
         ggml_backend_tensor_copy_async(
             model_.backend, model_.backend, uncond_device.tensor, uncond_hidden_out->tensor);
-
+        // Deliberately no synchronize: these copies are async, and whether that is safe
+        // depends on how the caller consumes the result. An on-device consumer -- the
+        // CUDA sampler, which enqueues its own work on this same backend -- is already
+        // correct through queue ordering, and waiting here would block the host on
+        // exactly the path the async copy exists to keep clear. A host-side reader
+        // (ggml_backend_tensor_get, or a plain memcpy on Metal's shared buffers, which
+        // carries no implicit wait) races the copy and can see the previous step's
+        // bytes; such a caller must call ggml_backend_synchronize itself first. Every
+        // caller today reads on-device.
         if (attention && attention->alignment_scores) {
             // Item 0's row. A wave reads every row through the batched entry point.
             attention->alignment_scores->assign(alignment.begin(), alignment.begin() + text_len_);
@@ -1549,7 +1557,15 @@ class MagpieDecoder::PersistentDecoderRuntime {
             model_.backend, model_.backend, cond_device.tensor, cond_hidden_out->tensor);
         ggml_backend_tensor_copy_async(
             model_.backend, model_.backend, uncond_device.tensor, uncond_hidden_out->tensor);
-
+        // Deliberately no synchronize: these copies are async, and whether that is safe
+        // depends on how the caller consumes the result. An on-device consumer -- the
+        // CUDA sampler, which enqueues its own work on this same backend -- is already
+        // correct through queue ordering, and waiting here would block the host on
+        // exactly the path the async copy exists to keep clear. A host-side reader
+        // (ggml_backend_tensor_get, or a plain memcpy on Metal's shared buffers, which
+        // carries no implicit wait) races the copy and can see the previous step's
+        // bytes; such a caller must call ggml_backend_synchronize itself first. Every
+        // caller today reads on-device.
         for (int item = 0; item < items; ++item) {
             MagpieWaveDecodeItem& slot = wave[static_cast<size_t>(item)];
             if (slot.alignment_scores) {

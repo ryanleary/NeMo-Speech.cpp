@@ -1777,6 +1777,7 @@ stream_magpie_to_audio(
                 {
                     std::vector<int32_t> codes;
                     std::vector<int32_t> argmax;
+#if defined(MAGPIETTS_CUDA_SAMPLING)
                     if (!local_sampler->sampleCuda(
                             wave_cond, wave_uncond, params.use_cfg, h.cfg_scale, h.temperature,
                             h.top_k, 0 < h.min_generated_frames, workspace.cudaSampler(),
@@ -1784,6 +1785,13 @@ stream_magpie_to_audio(
                             (int)width)) {
                         return cancel_worker();
                     }
+#else
+                    fprintf(
+                        stderr,
+                        "wave decoding requires CUDA sampling, which was not compiled into this "
+                        "build\n");
+                    return cancel_worker();
+#endif
                     ++wave_frame_index;
                     for (size_t k = 0; k < width; ++k) {
                         if (!wave_step_finish(
@@ -1854,6 +1862,7 @@ stream_magpie_to_audio(
                     // runs its 8 rounds once, with width items per round.
                     std::vector<int32_t> codes;
                     std::vector<int32_t> argmax;
+#if defined(MAGPIETTS_CUDA_SAMPLING)
                     if (!local_sampler->sampleCuda(
                             wave_cond, wave_uncond, params.use_cfg, h.cfg_scale, h.temperature,
                             h.top_k, step * h.frame_stacking_factor < h.min_generated_frames,
@@ -1861,6 +1870,13 @@ stream_magpie_to_audio(
                             wave_frame_index, codes, argmax, (int)width)) {
                         return cancel_worker();
                     }
+#else
+                    fprintf(
+                        stderr,
+                        "wave decoding requires CUDA sampling, which was not compiled into this "
+                        "build\n");
+                    return cancel_worker();
+#endif
                     ++wave_frame_index;
                     for (size_t k = 0; k < width; ++k) {
                         if (!wave_step_finish(
