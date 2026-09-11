@@ -66,12 +66,17 @@ def text_for(n):
 
 
 def gpu_util():
+    # The busiest GPU on the box, not the first row. synthesize does not take a CUDA
+    # index -- it initializes the first available device -- and CUDA_VISIBLE_DEVICES can
+    # map that onto any physical GPU, so reading row 0 can approve an idle card while
+    # the one running the synthesis is saturated.
     out = subprocess.run(
         ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
         capture_output=True,
         text=True,
     ).stdout
-    return int(re.sub(r"\D", "", out.splitlines()[0] or "100"))
+    vals = [int(re.sub(r"\D", "", line)) for line in out.splitlines() if re.search(r"\d", line)]
+    return max(vals) if vals else 100
 
 
 def wait_idle(threshold=3, consecutive=4, timeout=600):
@@ -108,7 +113,10 @@ def run_once(a, text, out_path):
     ]
     if a.greedy:
         cmd += ["--top-k", "1"]
-    cmd += a.extra
+    # --extra goes first: command_synthesize applies options in argument order, so
+    # anything the benchmark owns has to be appended after it. A duplicated --output
+    # would otherwise make the run hash a different file than the one it wrote.
+    cmd = cmd[:3] + a.extra + cmd[3:]
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
         sys.exit(f"synthesize failed:\n{p.stderr[-2000:]}")
@@ -139,7 +147,7 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--voice", default="John")
     ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--reps", type=int, default=5)
+    ap.add_argument("--reps", type=int, default=5, help="runs per case; must be at least 1")
     ap.add_argument("--out", default="/tmp/bench_magpietts.wav")
     ap.add_argument("--label", default="run")
     ap.add_argument("--json", help="write raw per-run metrics here")
@@ -165,6 +173,10 @@ def main():
         help="everything after this is passed to synthesize",
     )
     a = ap.parse_args()
+    # Zero or fewer leaves every metric list empty, and the median map then has no
+    # e2e_rtf for the report to read.
+    if a.reps < 1:
+        ap.error("--reps must be at least 1")
 
     if not a.allow_busy_gpu and a.device.startswith("cuda") and not wait_idle():
         sys.exit("GPU never went idle; refusing to benchmark under load")

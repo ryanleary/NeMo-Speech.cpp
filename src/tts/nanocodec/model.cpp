@@ -247,14 +247,33 @@ nc_prepare_deconv_weights(nc_model& model, bool verbose) {
     }
 
     std::vector<ggml_tensor*> converted(model.up_convs.size(), nullptr);
+    size_t pending = 0;
     for (size_t i = 0; i < model.up_convs.size(); ++i) {
         const ggml_tensor* src = model.up_convs[i].w;
         if (src->type == GGML_TYPE_F32) {
             continue;
         }
+        // Reject an unsupported type before reserving anything for it.
+        if (src->type != GGML_TYPE_F16) {
+            fprintf(stderr, "unsupported upsampler kernel type %s\n", ggml_type_name(src->type));
+            return false;
+        }
         converted[i] =
             ggml_new_tensor_3d(model.aux_ctx, GGML_TYPE_F32, src->ne[0], src->ne[1], src->ne[2]);
         ggml_set_name(converted[i], (std::string(ggml_get_name(src)) + ".f32").c_str());
+        ++pending;
+    }
+
+    // A backend that will not take F16 kernels but whose model already stores them as F32
+    // leaves nothing to convert. ggml_backend_alloc_ctx_tensors returns NULL for an empty
+    // context, which is success here, not a failure to allocate.
+    if (pending == 0) {
+        ggml_free(model.aux_ctx);
+        model.aux_ctx = nullptr;
+        if (verbose) {
+            fprintf(stderr, "NanoCodec upsampler kernels already stored as F32\n");
+        }
+        return true;
     }
 
     model.aux_buffer = ggml_backend_alloc_ctx_tensors(model.aux_ctx, model.backend);
@@ -270,10 +289,6 @@ nc_prepare_deconv_weights(nc_model& model, bool verbose) {
             continue;
         }
         ggml_tensor* src = model.up_convs[i].w;
-        if (src->type != GGML_TYPE_F16) {
-            fprintf(stderr, "unsupported upsampler kernel type %s\n", ggml_type_name(src->type));
-            return false;
-        }
         const size_t n = (size_t)ggml_nelements(src);
         src_half.resize(n);
         dst_full.resize(n);
@@ -614,6 +629,9 @@ struct nc_stream_graph_io {
     std::vector<nc_stream_cache_write> cache_writes;
 };
 
+// Defined below; the graph only records which state owns its cache tensors.
+struct nc_stream_state;
+
 struct nc_stream_decode_graph {
     ggml_context* ctx = nullptr;
     ggml_cgraph* gf = nullptr;
@@ -621,6 +639,9 @@ struct nc_stream_decode_graph {
     ggml_tensor* latent = nullptr;
     ggml_tensor* audio = nullptr;
     nc_stream_graph_io io;
+    // The state whose cache tensors these nodes point at. A different state with the same
+    // cache count would otherwise pass the check below and read freed tensors.
+    const nc_stream_state* owner = nullptr;
     int chunk_frames = 0;
     size_t output_samples = 0;
     size_t samples_per_frame = 0;
@@ -692,6 +713,7 @@ nc_stream_decode_graph_free(nc_stream_decode_graph& graph) {
     graph.latent = nullptr;
     graph.audio = nullptr;
     graph.io = {};
+    graph.owner = nullptr;
     graph.chunk_frames = 0;
     graph.output_samples = 0;
     graph.samples_per_frame = 0;
@@ -987,7 +1009,9 @@ nc_stream_decode_graph_init(
     state.free_tensors();
     {
         ggml_init_params cache_params = {
-            /*.mem_size   =*/ggml_tensor_overhead() * NANO_CODEC_MAX_CACHES,
+            // One over the limit: nc_stream_cache_tensor can create the cache that trips
+            // the post-build check, and an exhausted pool aborts rather than reporting.
+            /*.mem_size   =*/ggml_tensor_overhead() * (NANO_CODEC_MAX_CACHES + 1),
             /*.mem_buffer =*/nullptr,
             /*.no_alloc   =*/true,
         };
@@ -1075,6 +1099,9 @@ nc_stream_decode_graph_init(
         return false;
     }
 
+    // Every node above points at this state's cache tensors; record it so a later decode
+    // cannot pair the graph with a different state that happens to hold as many caches.
+    graph.owner = &state;
     graph.samples_per_frame = graph.output_samples / (size_t)chunk_frames;
     graph.latent_data.assign((size_t)chunk_frames * h.latent_dim, 0.0f);
     graph.audio_data.resize(graph.output_samples);
@@ -1098,7 +1125,8 @@ decode_eval_stream(
     }
     // The graph nodes point at this state's cache tensors; a state that was reset or paired
     // with a different graph would leave those reads dangling.
-    if (!state.buffer || state.caches.size() != graph.io.cache_writes.size()) {
+    if (!state.buffer || graph.owner != &state ||
+        state.caches.size() != graph.io.cache_writes.size()) {
         fprintf(stderr, "stream state does not back the persistent stream graph\n");
         return false;
     }
