@@ -470,6 +470,7 @@ magpietts_cuda_sampler_sequence_finish_build_and_launch(
         cudaGraphDestroy(graph);
         sampler->sequence_graph = nullptr;
         set_error(error, error_size, "failed to instantiate CUDA local sequence graph", err);
+        (void)cudaGetLastError();
         return false;
     }
     err = cudaGraphLaunch(exec, sampler->stream);
@@ -547,6 +548,12 @@ magpietts_cuda_sampler_sequence_add_ggml_graph(
         reinterpret_cast<cudaGraph_t>(graph_template));
     if (err != cudaSuccess) {
         set_error(error, error_size, "failed to add GGML child graph to CUDA local sequence", err);
+        // Composing the chain is an optimisation and the caller falls back to
+        // launching it eagerly. Clear the error so the fallback is testing
+        // itself rather than inheriting this one: a failed graph call leaves a
+        // sticky error that makes the next launch fail too, which turns a
+        // missing optimisation into a dead run.
+        (void)cudaGetLastError();
         return false;
     }
     sampler->sequence_tail = node;
