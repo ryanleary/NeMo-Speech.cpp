@@ -24,7 +24,13 @@ struct alignas(16) magpietts_cuda_sampling_config {
     int frame_index = 0;
     uint64_t seed = 0;
     int use_cfg = 0;
-    int forbid_audio_eos = 0;
+    // One flag per slot in the launch, not one for the launch. A batched round
+    // is one slot per item, and under continuous batching a freshly admitted
+    // chunk is inside its opening frames while its neighbours are hundreds of
+    // steps in -- so whether EOS is forbidden is the item's own answer.
+    // Uploaded with the rest of the config, by the same memcpy node the
+    // composed graph already replays.
+    int forbid_audio_eos[MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS] = {0};
 };
 
 struct magpietts_cuda_sampler {
@@ -161,7 +167,8 @@ magpietts_sample_codebooks_kernel(
             id < vocab_size
                 ? sampled_logit(
                       logits_cond, logits_uncond, off, id, audio_codebook_size, audio_eos_id,
-                      config.use_cfg != 0, config.cfg_scale, config.forbid_audio_eos != 0)
+                      config.use_cfg != 0, config.cfg_scale,
+                      config.forbid_audio_eos[c < MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS ? c : 0] != 0)
                 : -INFINITY;
         thread_ids[item] = id;
     }
@@ -364,7 +371,28 @@ magpietts_cuda_sampler_configure(
     sampler->h_config->frame_index = frame_index;
     sampler->h_config->seed = seed;
     sampler->h_config->use_cfg = use_cfg ? 1 : 0;
-    sampler->h_config->forbid_audio_eos = forbid_audio_eos ? 1 : 0;
+    // The scalar form says the same thing about every slot, which is what every
+    // caller outside a continuous-batching wave means.
+    for (int slot = 0; slot < MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS; ++slot) {
+        sampler->h_config->forbid_audio_eos[slot] = forbid_audio_eos ? 1 : 0;
+    }
+    if (error && error_size > 0)
+        error[0] = '\0';
+    return true;
+}
+
+bool
+magpietts_cuda_sampler_configure_forbid_eos(
+    magpietts_cuda_sampler* sampler, const uint8_t* forbid, int count, char* error,
+    size_t error_size) {
+    if (!sampler || !sampler->h_config || !forbid || count <= 0 ||
+        count > MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS) {
+        set_error(error, error_size, "invalid CUDA sampler per-item EOS mask");
+        return false;
+    }
+    for (int slot = 0; slot < count; ++slot) {
+        sampler->h_config->forbid_audio_eos[slot] = forbid[slot] ? 1 : 0;
+    }
     if (error && error_size > 0)
         error[0] = '\0';
     return true;

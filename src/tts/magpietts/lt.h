@@ -50,7 +50,11 @@ class LocalCodebookSampler {
         const magpietts_backend_tensor& cond_hidden, const magpietts_backend_tensor& uncond_hidden,
         bool use_cfg, float cfg_scale, float temperature, int top_k, bool forbid_audio_eos,
         magpietts_cuda_sampler* cuda_sampler, uint64_t seed, int frame_index,
-        std::vector<int32_t>& codes, std::vector<int32_t>& argmax_codes, int batch = 1);
+        std::vector<int32_t>& codes, std::vector<int32_t>& argmax_codes, int batch = 1,
+        // One flag per item, overriding forbid_audio_eos. A wave under
+        // continuous batching holds chunks at different steps, so the opening
+        // frames EOS is forbidden in are a different set of steps for each.
+        const uint8_t* forbid_audio_eos_per_item = nullptr);
 #endif
 
    private:

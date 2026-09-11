@@ -1457,10 +1457,13 @@ stream_magpie_to_audio(
         // only the patched attention cache provides; without this the run would
         // form group 0 (width 1) and then fail on group 1.
         const bool wave_attention_ok = magpietts_fused_cached_attention_available(magpie.backend);
+        // The batched sampler carries one EOS floor per lane in its config, which
+        // is a fixed-size array, so that bounds the wave.
+        const bool wave_width_ok = wave_width <= MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS;
         const bool use_wave = (wave_width > 1) && token_chunks.size() > 1 && use_cuda_sampling &&
                               params.use_local_transformer && params.use_cfg &&
                               params.use_kv_cache && params.longform_history_tokens >= 0 &&
-                              wave_attention_ok && h.dec_kernel == 1;
+                              wave_attention_ok && wave_width_ok && h.dec_kernel == 1;
         // Asking for a wave and silently getting sequential decode is the worst
         // outcome, so say which requirement was not met. A single chunk is not
         // a failure: there is no wave to form.
@@ -1470,6 +1473,7 @@ stream_magpie_to_audio(
                               : !params.use_cfg               ? "classifier-free guidance is off"
                               : !params.use_kv_cache          ? "the decoder K/V cache is off"
                               : !wave_attention_ok ? "this build lacks the patched cached attention"
+                              : !wave_width_ok     ? "the batched sampler tops out at 256 lanes"
                               : h.dec_kernel != 1
                                   ? "this model's decoder feed-forward is a convolution"
                                   : "the long-form history is adaptive";

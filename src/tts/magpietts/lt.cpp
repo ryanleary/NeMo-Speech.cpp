@@ -1361,7 +1361,8 @@ sample_local_codebooks_cuda_impl(
     const magpietts_backend_tensor& uncond_hidden, bool use_cfg, float cfg_scale, float temperature,
     int top_k, bool forbid_audio_eos, int threads, local_transformer_graph_bank& local_graphs,
     magpietts_cuda_sampler* cuda_sampler, uint64_t seed, int frame_index,
-    std::vector<int32_t>& codes, std::vector<int32_t>& argmax_codes, int batch) {
+    std::vector<int32_t>& codes, std::vector<int32_t>& argmax_codes, int batch,
+    const uint8_t* forbid_audio_eos_per_item) {
     const ggml_nvtx::range nvtx_range("magpietts_sample_local_codebooks_cuda");
     const auto& h = model.hparams;
     batch = batch > 0 ? batch : 1;
@@ -1395,6 +1396,16 @@ sample_local_codebooks_cuda_impl(
             frame_index, error, sizeof(error))) {
         fprintf(
             stderr, "CUDA local-transformer sampler config failed: %s\n",
+            error[0] ? error : "unknown error");
+        return false;
+    }
+    // A batched round is one slot per item, so an item's own floor lands in its
+    // own slot. Without a mask every slot keeps the scalar answer above.
+    if (forbid_audio_eos_per_item && !magpietts_cuda_sampler_configure_forbid_eos(
+                                         cuda_sampler, forbid_audio_eos_per_item, batch, error,
+                                         sizeof(error))) {
+        fprintf(
+            stderr, "CUDA local-transformer per-item EOS floor failed: %s\n",
             error[0] ? error : "unknown error");
         return false;
     }
@@ -1536,11 +1547,12 @@ LocalCodebookSampler::sampleCuda(
     const magpietts_backend_tensor& cond_hidden, const magpietts_backend_tensor& uncond_hidden,
     bool use_cfg, float cfg_scale, float temperature, int top_k, bool forbid_audio_eos,
     magpietts_cuda_sampler* cuda_sampler, uint64_t seed, int frame_index,
-    std::vector<int32_t>& codes, std::vector<int32_t>& argmax_codes, int batch) {
+    std::vector<int32_t>& codes, std::vector<int32_t>& argmax_codes, int batch,
+    const uint8_t* forbid_audio_eos_per_item) {
     return sample_local_codebooks_cuda_impl(
         model_, cond_hidden, uncond_hidden, use_cfg, cfg_scale, temperature, top_k,
         forbid_audio_eos, threads_, *graph_bank_, cuda_sampler, seed, frame_index, codes,
-        argmax_codes, batch);
+        argmax_codes, batch, forbid_audio_eos_per_item);
 }
 #endif
 

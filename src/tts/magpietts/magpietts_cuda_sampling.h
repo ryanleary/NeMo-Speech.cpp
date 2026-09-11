@@ -7,6 +7,10 @@
 
 struct magpietts_cuda_sampler;
 
+// Widest batch the per-item EOS floor can describe; also the widest wave the
+// batched sampler will take.
+#define MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS 256
+
 magpietts_cuda_sampler* magpietts_cuda_sampler_create(int codebooks);
 void magpietts_cuda_sampler_free(magpietts_cuda_sampler* sampler);
 bool magpietts_cuda_device_is_uma(void);
@@ -19,6 +23,12 @@ bool magpietts_cuda_sampler_bind_stream(
 bool magpietts_cuda_sampler_configure(
     magpietts_cuda_sampler* sampler, bool use_cfg, float cfg_scale, float temperature, int top_k,
     bool forbid_audio_eos, uint64_t seed, int frame_index, char* error, size_t error_size);
+// Give each slot in the launch its own EOS floor. A batched round is one slot
+// per item, so slot i is item i. Call after configure, which sets every slot to
+// the scalar value.
+bool magpietts_cuda_sampler_configure_forbid_eos(
+    magpietts_cuda_sampler* sampler, const uint8_t* forbid, int count, char* error,
+    size_t error_size);
 bool magpietts_cuda_sampler_upload_config(
     magpietts_cuda_sampler* sampler, char* error, size_t error_size);
 
