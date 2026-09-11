@@ -86,15 +86,25 @@ def wait_idle(threshold=3, consecutive=4, timeout=600):
 
 def run_once(a, text, out_path):
     cmd = [
-        a.bin, "synthesize", text,
-        "--device", a.device,
-        "--voice", a.voice,
-        "--seed", str(a.seed),
-        "--output", out_path,
-        "--force", "--verbose",
-        "--tts.magpie-model", a.magpie,
-        "--tts.codec-model", a.codec,
-        "--tts.tokenizer-model-dir", a.tokenizer,
+        a.bin,
+        "synthesize",
+        text,
+        "--device",
+        a.device,
+        "--voice",
+        a.voice,
+        "--seed",
+        str(a.seed),
+        "--output",
+        out_path,
+        "--force",
+        "--verbose",
+        "--tts.magpie-model",
+        a.magpie,
+        "--tts.codec-model",
+        a.codec,
+        "--tts.tokenizer-model-dir",
+        a.tokenizer,
     ]
     if a.greedy:
         cmd += ["--top-k", "1"]
@@ -134,15 +144,26 @@ def main():
     ap.add_argument("--label", default="run")
     ap.add_argument("--json", help="write raw per-run metrics here")
     ap.add_argument(
-        "--greedy", action="store_true",
-        help="--top-k 1: holds the code sequence fixed and makes output reproducible")
+        "--greedy",
+        action="store_true",
+        help="--top-k 1: holds the code sequence fixed and makes output reproducible",
+    )
     ap.add_argument(
-        "--check", action="store_true",
-        help="report the sha256 of each run's WAV instead of timing it")
-    ap.add_argument("--allow-busy-gpu", action="store_true",
-                    help="skip the idle check (results will not be comparable)")
-    ap.add_argument("--extra", nargs=argparse.REMAINDER, default=[],
-                    help="everything after this is passed to synthesize")
+        "--check",
+        action="store_true",
+        help="report the sha256 of each run's WAV instead of timing it",
+    )
+    ap.add_argument(
+        "--allow-busy-gpu",
+        action="store_true",
+        help="skip the idle check (results will not be comparable)",
+    )
+    ap.add_argument(
+        "--extra",
+        nargs=argparse.REMAINDER,
+        default=[],
+        help="everything after this is passed to synthesize",
+    )
     a = ap.parse_args()
 
     if not a.allow_busy_gpu and a.device.startswith("cuda") and not wait_idle():
@@ -150,8 +171,9 @@ def main():
 
     if a.check:
         if not a.greedy:
-            print("warning: --check without --greedy; sampled output need not repeat",
-                  file=sys.stderr)
+            print(
+                "warning: --check without --greedy; sampled output need not repeat", file=sys.stderr
+            )
         print(f"{a.label}: {a.reps} runs per case, checking reproducibility")
         failures = 0
         for name, n in CASES:
@@ -162,8 +184,10 @@ def main():
             unique = sorted(set(digests))
             ok = len(unique) == 1
             failures += not ok
-            print(f"  {name:10s} {'OK  ' if ok else 'FAIL'} "
-                  f"{len(unique)} distinct output(s) over {a.reps} runs")
+            print(
+                f"  {name:10s} {'OK  ' if ok else 'FAIL'} "
+                f"{len(unique)} distinct output(s) over {a.reps} runs"
+            )
             for d in unique:
                 print(f"      {d[:16]}  x{digests.count(d)}")
         if failures:
@@ -171,24 +195,31 @@ def main():
         return 1 if failures else 0
 
     raw = {}
-    print(f"{a.label}: {a.reps} reps per case, seed {a.seed}"
-          f"{', greedy' if a.greedy else ''}")
+    print(f"{a.label}: {a.reps} reps per case, seed {a.seed}" f"{', greedy' if a.greedy else ''}")
     for name, n in CASES:
         if not a.allow_busy_gpu and a.device.startswith("cuda"):
             wait_idle()
         runs = [run_once(a, text_for(n), a.out) for _ in range(a.reps)]
         raw[name] = runs
-        med = {m: statistics.median([r[m] for r in runs if m in r])
-               for m in METRICS if any(m in r for r in runs)}
-        print(f"  {name:10s} rtf {med['e2e_rtf']:.4f}"
-              f"   itl {med.get('decoder_itl_avg_ms', float('nan')):.2f} ms"
-              f"   codec_rtfx {med.get('codec_rtfx', float('nan')):.1f}"
-              f"   codec_ttfa {med.get('codec_ttfa_ms', float('nan')):.2f} ms"
-              f"   audio {med.get('e2e_audio_s', float('nan')):.1f} s")
+        med = {
+            m: statistics.median([r[m] for r in runs if m in r])
+            for m in METRICS
+            if any(m in r for r in runs)
+        }
+        print(
+            f"  {name:10s} rtf {med['e2e_rtf']:.4f}"
+            f"   itl {med.get('decoder_itl_avg_ms', float('nan')):.2f} ms"
+            f"   codec_rtfx {med.get('codec_rtfx', float('nan')):.1f}"
+            f"   codec_ttfa {med.get('codec_ttfa_ms', float('nan')):.2f} ms"
+            f"   audio {med.get('e2e_audio_s', float('nan')):.1f} s"
+        )
     if a.json:
         with open(a.json, "w") as f:
-            json.dump({"label": a.label, "reps": a.reps, "seed": a.seed,
-                       "greedy": a.greedy, "runs": raw}, f, indent=1)
+            json.dump(
+                {"label": a.label, "reps": a.reps, "seed": a.seed, "greedy": a.greedy, "runs": raw},
+                f,
+                indent=1,
+            )
         print(f"  wrote {a.json}")
     return 0
 

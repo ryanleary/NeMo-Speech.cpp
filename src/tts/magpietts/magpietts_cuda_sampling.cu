@@ -719,8 +719,8 @@ magpietts_cuda_copy_sampled_code_to_device(
     // the next round is a single copy rather than one per item.
     if (sampler->sequence_build_active) {
         return magpietts_cuda_sampler_sequence_add_device_copy(
-            sampler, sampler->d_codes + first_codebook, dst_device,
-            (size_t)count * sizeof(int32_t), error, error_size);
+            sampler, sampler->d_codes + first_codebook, dst_device, (size_t)count * sizeof(int32_t),
+            error, error_size);
     }
 
     cudaError_t err = cudaSuccess;

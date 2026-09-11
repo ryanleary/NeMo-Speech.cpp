@@ -834,8 +834,7 @@ local_transformer_graph_init(
         ggml_tensor* input_uncond = nullptr;
         const int batch_columns = graph.batch;
         if (codebook_idx == 0) {
-            graph.dec_cond =
-                ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, h.n_embd, batch_columns);
+            graph.dec_cond = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, h.n_embd, batch_columns);
             ggml_set_name(
                 graph.dec_cond, pair ? "magpietts_local_transformer_dec_cond"
                                      : "magpietts_local_transformer_dec_last");
@@ -1155,8 +1154,8 @@ local_transformer_graph_eval_cuda(
     const bool ok = magpietts_cuda_sample_codebooks_device_configured(
         cuda_sample.sampler, logits_cond, logits_uncond, sample_batch,
         model.hparams.audio_vocab_size, model.hparams.audio_codebook_size,
-        model.hparams.audio_eos_id, codebook_idx * sample_batch, codebook_idx * sample_batch,
-        error, sizeof(error));
+        model.hparams.audio_eos_id, codebook_idx * sample_batch, codebook_idx * sample_batch, error,
+        sizeof(error));
     if (!ok) {
         fprintf(
             stderr, "CUDA local-transformer sampling failed: %s\n",
@@ -1197,8 +1196,8 @@ static bool
 local_transformer_graph_bank_eval_cuda(
     const magpietts_model& model, local_transformer_graph_bank& bank, bool use_cfg,
     const magpietts_backend_tensor& cond_hidden, const magpietts_backend_tensor& uncond_hidden,
-    int prev_code_count, int codebook_idx, int threads,
-    magpietts_cuda_sample_request& cuda_sample, int batch) {
+    int prev_code_count, int codebook_idx, int threads, magpietts_cuda_sample_request& cuda_sample,
+    int batch) {
     std::vector<local_transformer_graph>& graphs = use_cfg ? bank.pair_graphs : bank.single_graphs;
     if ((int)graphs.size() <= codebook_idx) {
         graphs.resize((size_t)codebook_idx + 1);
@@ -1459,8 +1458,7 @@ sample_local_codebooks_cuda_impl(
     argmax_codes.assign((size_t)sampled_slots, 0);
     error[0] = '\0';
     if (!magpietts_cuda_copy_sampled_codebooks(
-            cuda_sampler, sampled_slots, codes.data(), argmax_codes.data(), error,
-            sizeof(error))) {
+            cuda_sampler, sampled_slots, codes.data(), argmax_codes.data(), error, sizeof(error))) {
         fprintf(
             stderr, "CUDA local-transformer sampled-code host copy failed: %s\n",
             error[0] ? error : "unknown error");
