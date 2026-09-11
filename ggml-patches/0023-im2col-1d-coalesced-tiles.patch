@@ -80,13 +80,17 @@ diff --git a/src/ggml-cuda/im2col.cu b/src/ggml-cuda/im2col.cu
  // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
  template <typename T>
  static void im2col_cuda(const float * x, T* dst,
-@@ -50,6 +122,18 @@
+@@ -50,6 +122,22 @@
      int64_t N, int64_t IC_IH_IW, int64_t IH_IW,
      int s0,int s1,int p0,int p1,int d0,int d1, cudaStream_t stream) {
      const int64_t IC_KH_KW = IC * KH * KW;
 +
 +    // 1D convolutions take the tiled path; everything else keeps the generic kernel.
-+    if (KH == 1 && IH == 1 && OH == 1 && N <= 65535) {
++    // The tiled kernel has no height axis, so a degenerate 2D call must not reach it:
++    // ggml_conv_1d passes s1 = p1 = d1 = 0, but a 2D call can have IH == KH == OH == 1
++    // with a nonzero p1, where the generic kernel emits padded zeroes and this one would
++    // read input samples instead.
++    if (KH == 1 && IH == 1 && OH == 1 && s1 == 0 && p1 == 0 && d1 == 0 && N <= 65535) {
 +        dim3 blocks(
 +            (OW       + IM2COL_1D_TILE_OW - 1) / IM2COL_1D_TILE_OW,
 +            (IC_KH_KW + IM2COL_1D_TILE_I  - 1) / IM2COL_1D_TILE_I,
@@ -103,7 +107,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
 index f54ab41c..62977e67 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -7749,6 +7749,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -7749,6 +7749,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -118,6 +122,11 @@ index f54ab41c..62977e67 100644
 +    test_cases.emplace_back(new test_im2col(
 +        GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {300, 34, 3, 1}, {5, 34, 8, 1},
 +        2, 0, 2, 0, 2, 0, false));
++    // Degenerate 2D: IH == KH == 1 and OH == 1, but p1 != 0, so the generic kernel pads
++    // with zeroes. Guards the tiled dispatch against claiming this as a 1D convolution.
++    test_cases.emplace_back(new test_im2col(
++        GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {300, 1, 34, 1}, {5, 1, 34, 8},
++        2, 3, 2, 1, 2, 1, true));
 +    //   OW=255, IC*KW=192: OW one short of a 64-multiple, IC*KW an exact multiple
 +    test_cases.emplace_back(new test_im2col(
 +        GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {257, 64, 2, 1}, {3, 64, 8, 1},
