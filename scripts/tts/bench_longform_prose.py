@@ -44,14 +44,26 @@ import time
 import urllib.request
 
 SOURCES = [
-    ("pg64317.txt", "https://www.gutenberg.org/cache/epub/64317/pg64317.txt",
-     "ce760ec377accd352b41bb8f64504a72d7aa18ab3afb42ded2b56cecacf29e35"),
-    ("pg1661.txt", "https://www.gutenberg.org/cache/epub/1661/pg1661.txt",
-     "922e2a12ccb43a4c9544c260b2166c6ad2097aeb5957faeee113f173bb857cd0"),
-    ("1342-0.txt", "https://www.gutenberg.org/files/1342/1342-0.txt",
-     "81300b79e8a8d65ac530a97578417d06137e3bbc90622a10a65e5036183d2500"),
-    ("pg11.txt", "https://www.gutenberg.org/cache/epub/11/pg11.txt",
-     "01b38ea4c710a84bc18d0bd41271a5a1a92b94e97b2812f4dece97d4a694725e"),
+    (
+        "pg64317.txt",
+        "https://www.gutenberg.org/cache/epub/64317/pg64317.txt",
+        "ce760ec377accd352b41bb8f64504a72d7aa18ab3afb42ded2b56cecacf29e35",
+    ),
+    (
+        "pg1661.txt",
+        "https://www.gutenberg.org/cache/epub/1661/pg1661.txt",
+        "922e2a12ccb43a4c9544c260b2166c6ad2097aeb5957faeee113f173bb857cd0",
+    ),
+    (
+        "1342-0.txt",
+        "https://www.gutenberg.org/files/1342/1342-0.txt",
+        "81300b79e8a8d65ac530a97578417d06137e3bbc90622a10a65e5036183d2500",
+    ),
+    (
+        "pg11.txt",
+        "https://www.gutenberg.org/cache/epub/11/pg11.txt",
+        "01b38ea4c710a84bc18d0bd41271a5a1a92b94e97b2812f4dece97d4a694725e",
+    ),
 ]
 ABBREV = re.compile(r"(\b(Mr|Mrs|Ms|Dr|St|Prof|Rev|Hon|Jr|Sr|vs|etc|Co|Inc)|\b[A-Z])\.$")
 
@@ -75,12 +87,11 @@ def sentences(path):
     raw = open(path, encoding="utf-8", errors="ignore").read()
     m = re.search(r"\*\*\* ?START OF (THE|THIS) PROJECT GUTENBERG.*?\*\*\*", raw, re.S)
     if m:
-        raw = raw[m.end():]
+        raw = raw[m.end() :]
     m = re.search(r"\*\*\* ?END OF (THE|THIS) PROJECT GUTENBERG", raw)
     if m:
         raw = raw[: m.start()]
-    for a, b in (("“", '"'), ("”", '"'), ("‘", "'"), ("’", "'"),
-                 ("—", " "), ("–", " ")):
+    for a, b in (("“", '"'), ("”", '"'), ("‘", "'"), ("’", "'"), ("—", " "), ("–", " ")):
         raw = raw.replace(a, b)
     out = []
     for para in re.sub(r"\n{2,}", "\n\n", raw).split("\n\n"):
@@ -90,7 +101,7 @@ def sentences(path):
         buf = ""
         for part in re.split(r"(?<=[.!?])\s+", para):
             buf = (buf + " " + part).strip() if buf else part
-            if ABBREV.search(buf):   # an abbreviation's period is not a sentence end
+            if ABBREV.search(buf):  # an abbreviation's period is not a sentence end
                 continue
             out.append(buf)
             buf = ""
@@ -123,7 +134,9 @@ def gpu_busy():
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True).stdout
+            capture_output=True,
+            text=True,
+        ).stdout
         vals = [int(re.sub(r"\D", "", l)) for l in out.splitlines() if re.search(r"\d", l)]
         return max(vals) if vals else 100
     except Exception:
@@ -142,10 +155,30 @@ def wait_idle(threshold=3, timeout=600):
 def run(a, binary, text, extra):
     if a.device.startswith("cuda") and not a.allow_busy_gpu:
         wait_idle()
-    cmd = [binary, "synthesize", text, *extra, "--device", a.device, "--voice", a.voice,
-           "--seed", str(a.seed), "--output", a.out, "--force", "--verbose", "--top-k", "1",
-           "--tts.magpie-model", a.magpie, "--tts.codec-model", a.codec,
-           "--tts.tokenizer-model-dir", a.tokenizer]
+    cmd = [
+        binary,
+        "synthesize",
+        text,
+        *extra,
+        "--device",
+        a.device,
+        "--voice",
+        a.voice,
+        "--seed",
+        str(a.seed),
+        "--output",
+        a.out,
+        "--force",
+        "--verbose",
+        "--top-k",
+        "1",
+        "--tts.magpie-model",
+        a.magpie,
+        "--tts.codec-model",
+        a.codec,
+        "--tts.tokenizer-model-dir",
+        a.tokenizer,
+    ]
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
         tail = p.stderr.strip().splitlines()[-1] if p.stderr.strip() else "no output"
@@ -188,14 +221,23 @@ def main():
     lens = sorted(len(s.split()) for s in p)
     sys.stderr.write(
         f"pool {len(p)} sentences, mean {statistics.mean(lens):.1f} words, "
-        f"median {statistics.median(lens):.0f}, p90 {lens[9 * len(lens) // 10]}\n")
+        f"median {statistics.median(lens):.0f}, p90 {lens[9 * len(lens) // 10]}\n"
+    )
 
-    ours = ["--tts.batch-size", str(a.width), "--tts.longform-history-tokens", str(a.history),
-            "--tts.chunk-frames", str(a.chunk_frames)]
+    ours = [
+        "--tts.batch-size",
+        str(a.width),
+        "--tts.longform-history-tokens",
+        str(a.history),
+        "--tts.chunk-frames",
+        str(a.chunk_frames),
+    ]
     base = ["--tts.chunk-frames", str(a.chunk_frames)]
 
-    print(f"{'sent':>5} {'tokens':>7} {'chunks':>7} {'audio':>8} {'RTF':>8} {'xRT':>7} {'TTFA':>7}"
-          + (f" {'base RTF':>9} {'speed-up':>9}" if a.baseline else ""))
+    print(
+        f"{'sent':>5} {'tokens':>7} {'chunks':>7} {'audio':>8} {'RTF':>8} {'xRT':>7} {'TTFA':>7}"
+        + (f" {'base RTF':>9} {'speed-up':>9}" if a.baseline else "")
+    )
     raw = []
     for n in [int(x) for x in a.sizes.split(",")]:
         text = " ".join(random.Random(a.seed).sample(p, n))
@@ -210,12 +252,17 @@ def main():
         if not o:
             print(f"{n:5d} {'--':>7} {'--':>7}   FAILED: {runs[-1].get('failed', '')[:60]}")
             continue
-        line = (f"{n:5d} {int(o['tokens']):7d} {int(o['chunks']):7d} {o['e2e_audio_s']:7.1f}s "
-                f"{o['e2e_rtf']:8.4f} {1 / o['e2e_rtf']:6.0f}x {o['e2e_ttfa_ms']:6.0f}ms")
+        line = (
+            f"{n:5d} {int(o['tokens']):7d} {int(o['chunks']):7d} {o['e2e_audio_s']:7.1f}s "
+            f"{o['e2e_rtf']:8.4f} {1 / o['e2e_rtf']:6.0f}x {o['e2e_ttfa_ms']:6.0f}ms"
+        )
         if a.baseline:
             b = med.get("base")
-            line += (f" {b['e2e_rtf']:9.4f} {b['e2e_rtf'] / o['e2e_rtf']:8.2f}x" if b
-                     else f" {'CRASH':>9} {'--':>9}")
+            line += (
+                f" {b['e2e_rtf']:9.4f} {b['e2e_rtf'] / o['e2e_rtf']:8.2f}x"
+                if b
+                else f" {'CRASH':>9} {'--':>9}"
+            )
         print(line)
     if a.json:
         json.dump(raw, open(a.json, "w"), indent=1)
