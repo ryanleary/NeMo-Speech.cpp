@@ -251,6 +251,30 @@ advance_chunk_state(
 // adaptive path (longform_history_tokens < 0). A wave must not use that path --
 // there chunk N's text really does depend on chunk N-1's decode -- so it passes
 // required_history = 0 and keeps longform_history_tokens >= 0.
+std::vector<int>
+plan_wave_admission(const std::vector<char>& lane_idle, size_t pending, int threshold) {
+    std::vector<int> lanes;
+    if (pending == 0) {
+        return lanes;
+    }
+    int live = 0;
+    for (size_t lane = 0; lane < lane_idle.size(); ++lane) {
+        if (lane_idle[lane]) {
+            lanes.push_back((int)lane);
+        } else {
+            ++live;
+        }
+    }
+    if (lanes.empty() || ((int)lanes.size() < std::max(1, threshold) && live > 0)) {
+        lanes.clear();
+        return lanes;
+    }
+    if (lanes.size() > pending) {
+        lanes.resize(pending);
+    }
+    return lanes;
+}
+
 MagpieChunkPlan
 plan_text_chunk(
     const magpietts_hparams& h, const magpie_stream_params& params,
@@ -2031,33 +2055,35 @@ stream_magpie_to_audio(
                     // A lane whose chunk has finished is idle: the chunk keeps
                     // the lane, and its frames keep their place in the drain
                     // order, but it is decoding nothing anyone will hear.
-                    std::vector<int> idle;
+                    std::vector<char> lane_idle((size_t)wave_lanes, 0);
                     int live = 0;
+                    int idle_now = 0;
                     for (int l = 0; l < wave_lanes; ++l) {
                         retire_if_exhausted(lane_of[(size_t)l]);
                         if (lane_of[(size_t)l]->done) {
-                            idle.push_back(l);
+                            lane_idle[(size_t)l] = 1;
+                            ++idle_now;
                         } else {
                             ++live;
                         }
                     }
-                    const bool more_chunks = next_chunk < chunk_ids.size();
-                    // Refill on the burst threshold, or as soon as the wave would
-                    // otherwise stall with work left.
-                    if (more_chunks && ((int)idle.size() >= admit_threshold || live == 0)) {
-                        if (!admit_into(idle)) {
+                    const size_t pending = chunk_ids.size() - next_chunk;
+                    const std::vector<int> admit =
+                        plan_wave_admission(lane_idle, pending, admit_threshold);
+                    if (!admit.empty()) {
+                        if (!admit_into(admit)) {
                             return cancel_worker();
                         }
                         continue;
                     }
-                    if (live == 0 && !more_chunks) {
+                    if (live == 0 && pending == 0) {
                         break;
                     }
                     if (codec_worker.is_failed()) {
                         codec_worker.join();
                         return false;
                     }
-                    idle_lane_steps += (int64_t)idle.size();
+                    idle_lane_steps += idle_now;
                     if (!wave_step(wave_lanes) || !drain_in_order()) {
                         return cancel_worker();
                     }

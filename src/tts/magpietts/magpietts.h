@@ -156,6 +156,21 @@ MagpieChunkPlan plan_text_chunk(
     const std::vector<int32_t>& prior_text_tokens, const std::vector<int32_t>& current_tokens,
     int absolute_token_offset, int required_history, int available_history);
 
+// Which lanes of a wave should take the next chunks, and whether to admit at
+// all yet. Pure: no model state, no device work.
+//
+// `lane_idle` is one entry per lane, true where the lane's chunk has finished.
+// An idle lane is refilled in bursts rather than as soon as it frees, because a
+// prefill costs about the same whether it opens one lane or all of them --
+// admitting singly would spend more on prefills than the refill saves. The
+// exception is a wave that would otherwise stall: if nothing is live, waiting
+// for the threshold buys nothing, so whatever is idle is filled now.
+//
+// Returns the lanes to fill, ascending, at most `pending` of them; empty means
+// keep decoding.
+std::vector<int> plan_wave_admission(
+    const std::vector<char>& lane_idle, size_t pending, int threshold);
+
 class MagpieStreamingRuntime {
    public:
     MagpieStreamingRuntime();
