@@ -200,13 +200,59 @@ So a node draining a backlog wants its wave sized to the concurrency it intends
 to hold, and should let the rest queue: widening past that trades first audio
 for nothing, and narrowing below it gives up throughput as well as latency.
 
+### How many streams it holds
+
+The question for TTS is not how fast a request finishes but how many streams
+stay ahead of playback, and the ceiling on that is aggregate throughput: 216x
+means ~216 streams each consuming one audio-second per second.
+`--stream-realtime` measures it -- each stream is consumed at playback rate,
+accepting no more than `--jitter-ms` ahead, and a chunk arriving after the
+moment it was needed counts as an underrun.
+
+64-lane wave, 25 s streams, all arriving at once:
+
+| streams | underruns | first audio p50 |
+|---|---|---|
+| 128 | 0 | 3660 ms |
+| **192** | **0** | 5258 ms |
+| 256 | 66 of 256 | 7751 ms |
+
+192 concurrent realtime streams, against the one-at-a-time the branch started
+from. The first-audio figures there are a 3x oversubscribed herd -- 192 arrivals
+into 64 lanes -- so most of that number is queueing. Let them arrive at a rate
+instead, still 192 streams:
+
+| arrivals | underruns | first audio p50/p95/p99 |
+|---|---|---|
+| all at once | 0 | 5077/9361/9465 ms |
+| Poisson, 30 ms mean | 9 of 192 | 1807/2919/3035 ms |
+| Poisson, 100 ms mean | 0 | **410/661/733 ms** |
+
+So the operating point is ~192 concurrent streams at 410 ms to first audio,
+with 30 ms arrivals marking the edge where the queue stops absorbing bursts.
+
+Three things had to be true together to get there, and none of them worked
+alone -- the middle one made things worse by itself:
+
+1. **The codec worker has to wake up.** It skips a channel whose caller is
+   behind, but nothing signals it when that caller catches up: the delivery
+   thread belongs to the request and knows nothing about the codec. Once every
+   channel was backlogged it slept until some unrelated event.
+2. **A session already several seconds ahead must not hold a lane.**
+   `lane_demand` returns zero while its caller is backlogged. Alone this traded
+   underruns for latency, because a session that yields has to win a lane back
+   inside its buffer and under contention could not.
+3. **Lanes go out least-buffered first.** A session with nothing queued is about
+   to fall silent; one five seconds ahead can wait. A brand-new request is
+   buffered at zero and so sorts to the front, which is the same rule that used
+   to be spelled "unoccupied sessions first".
+
 ### A slow client stalls every stream
 
 The right question for TTS is not how fast a request finishes but how many
 streams can be held at 1x. `--stream-realtime` asks it: each stream is consumed
 at playback rate, accepting no more than `--jitter-ms` ahead, and underruns are
-counted. It has not produced a capacity number yet, because the first run found
-something else.
+counted. The first run found something else before it could produce a capacity number.
 
 64 streams into a 64-lane wave, consumed at 1x: **25.5x aggregate, 63 of 64
 streams underran, first audio p50 32 s** -- against 216x and 659 ms for the same
@@ -218,14 +264,15 @@ every real client does, through TCP flow control, a blocking `stream->Write`, or
 a jitter buffer -- blocks audio for every other session while it waits. The
 benchmark's sleep is only the most obvious version of it.
 
-This has to be fixed before any streaming-capacity number means anything, and it
-is a serving bug in its own right: one slow client currently degrades everyone.
-The fix is to decouple delivery from decoding -- the codec writes into the
-session's own buffer and a per-session consumer drains it -- which is the same
-inversion the engine thread already needed for `drain_item`.
+Fixed by decoupling delivery from decoding: each request has a buffer and a
+thread of its own, the codec hands audio over and moves on, and a slow caller
+becomes an idle lane -- a scheduling decision the engine can act on -- rather
+than a stopped thread, which it cannot. That inversion is what made the capacity
+numbers above measurable at all.
 
-Until then, the concurrency numbers above describe a client that reads as fast
-as the engine can produce, which flatters the engine.
+Note the concurrency tables earlier in this document still describe a client
+that reads as fast as the engine can produce. They are not wrong, but they
+answer "how fast do requests finish", not "how many streams can it hold".
 
 ### The admission window
 
