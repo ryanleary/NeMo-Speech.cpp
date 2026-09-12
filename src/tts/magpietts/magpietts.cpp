@@ -1761,6 +1761,9 @@ struct WaveSession {
     // `completed` or beyond is terminal, which is what a submitter waits on.
     enum run_state { building = 0, queued = 1, running = 2, completed = 3, failed = 4 };
     run_state status = building;
+    // Why it failed, in the session rather than on stderr: the engine thread is
+    // shared, so the thread that hit the error is never the one that reports it.
+    std::string fail_reason;
 
     // Collect the non-empty chunks and the widest window they can need. Cheap:
     // no encoding, just enough to size the run.
@@ -2571,10 +2574,12 @@ struct MagpieWaveService {
         }
 
         std::vector<WaveSession*> done;
+        std::vector<WaveSession*> broken;
         for (WaveSession* s : active) {
             const size_t before = s->next_drain;
             if (!s->drain_in_order()) {
-                done.push_back(s);
+                s->fail_reason = "could not hand a decoded frame to the codec";
+                broken.push_back(s);
                 continue;
             }
             progressed = progressed || s->next_drain != before;
@@ -2582,16 +2587,9 @@ struct MagpieWaveService {
                 done.push_back(s);
             }
         }
-        // A session that failed to drain is finished either way; its caller
-        // sees the failure through its own channel.
-        std::vector<WaveSession*> completed;
-        std::vector<WaveSession*> broken;
-        for (WaveSession* s : done) {
-            (s->finished() ? completed : broken).push_back(s);
-        }
-        settle(completed, WaveSession::completed);
+        progressed = progressed || !done.empty() || !broken.empty();
+        settle(done, WaveSession::completed);
         settle(broken, WaveSession::failed);
-        progressed = progressed || !done.empty();
         return true;
     }
 
@@ -2605,8 +2603,12 @@ struct MagpieWaveService {
                 }
             }
             bool progressed = false;
-            if (!take_queued() || !drive_once(progressed)) {
-                fail_all("wave decode failed");
+            if (!take_queued()) {
+                fail_all("the wave could not be sized for the requests waiting on it");
+                break;
+            }
+            if (!drive_once(progressed)) {
+                fail_all("the wave decode step failed");
                 break;
             }
             if (!progressed) {
@@ -2621,22 +2623,20 @@ struct MagpieWaveService {
 
     // Release everyone still waiting. Nothing will decode for them now.
     void fail_all(const char* why) {
-        std::vector<WaveSession*> orphans;
         {
             std::lock_guard<std::mutex> lock(mu);
-            if (why && (!active.empty() || !queued.empty())) {
-                fprintf(stderr, "serve: %s\n", why);
-            }
             for (WaveSession* s : active) {
+                s->fail_reason = why ? why : "the wave engine stopped";
+                clear_lanes_of(s);
                 s->status = WaveSession::failed;
             }
             for (WaveSession* s : queued) {
+                s->fail_reason = why ? why : "the wave engine stopped";
                 s->status = WaveSession::failed;
             }
             active.clear();
             queued.clear();
         }
-        (void)orphans;
         settled.notify_all();
     }
 };
@@ -3148,6 +3148,9 @@ stream_magpie_to_audio(
             const int64_t idle_before = service->engine.idle_lane_steps;
             const int bursts_before = service->engine.bursts;
             if (!service->submit(session)) {
+                fprintf(
+                    stderr, "%s wave session failed: %s\n", label,
+                    session.fail_reason.empty() ? "no reason recorded" : session.fail_reason.c_str());
                 return cancel_worker();
             }
             if (params.verbose) {
