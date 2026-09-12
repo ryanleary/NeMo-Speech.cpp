@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -91,6 +92,8 @@ print_synthesize_help(const char* program) {
         "  --arrival-ms N            Stagger those requests N ms apart instead\n"
         "  --cancel-after-ms N       Stop reading audio after N ms, as a client hanging up\n"
         "  --rounds N                Repeat the concurrent burst N times in one process\n"
+        "  --size-mix A,B,C          Sample each request's length from these sentence counts\n"
+        "  --poisson                 Exponential inter-arrival times with mean --arrival-ms\n"
         "  --no-warmup               Skip warmup\n"
         "  --force                   Replace an existing WAV\n",
         program);
@@ -124,6 +127,8 @@ command_synthesize(int argc, char** argv) {
         int arrival_ms = 0;
         int cancel_after_ms = 0;
         int rounds = 1;
+        std::string size_mix;
+        bool poisson = false;
         bool force = false;
         bool warmup = true;
         int output_rate = 0;
@@ -148,6 +153,10 @@ command_synthesize(int argc, char** argv) {
                 cancel_after_ms = std::stoi(value(i, arg));
             else if (arg == "--rounds")
                 rounds = std::stoi(value(i, arg));
+            else if (arg == "--size-mix")
+                size_mix = value(i, arg);
+            else if (arg == "--poisson")
+                poisson = true;
             else if (arg == "--magpie-model")
                 parsed.runtime.magpie_model = value(i, arg);
             else if (arg == "--codec-model")
@@ -270,6 +279,48 @@ command_synthesize(int argc, char** argv) {
             // measures is whether they share the wave: aggregate realtime
             // factor against a single request's, at the same time to first
             // audio.
+            // Identical requests arriving together is the one distribution that
+            // cannot show what either the admission window or the wave width is
+            // for: every session retires in lockstep, so lanes never free up
+            // continuously, and every arrival lands inside any window at all.
+            std::vector<std::string> texts((size_t)concurrency, request.text);
+            std::vector<double> offsets_ms((size_t)concurrency, 0.0);
+            {
+                std::mt19937 mix_rng(12345);
+                if (!size_mix.empty()) {
+                    std::vector<std::string> sentences;
+                    for (size_t at = 0, next; at < request.text.size(); at = next) {
+                        next = request.text.find(". ", at);
+                        next = next == std::string::npos ? request.text.size() : next + 2;
+                        sentences.push_back(request.text.substr(at, next - at));
+                    }
+                    std::vector<int> sizes;
+                    for (size_t at = 0, next; at <= size_mix.size(); at = next + 1) {
+                        next = size_mix.find(',', at);
+                        next = next == std::string::npos ? size_mix.size() : next;
+                        sizes.push_back(std::stoi(size_mix.substr(at, next - at)));
+                        if (next == size_mix.size())
+                            break;
+                    }
+                    std::uniform_int_distribution<size_t> pick(0, sizes.size() - 1);
+                    for (int i = 0; i < concurrency; ++i) {
+                        const int want = std::max(1, sizes[pick(mix_rng)]);
+                        std::string built;
+                        for (int k = 0; k < want; ++k)
+                            built += sentences[(size_t)k % sentences.size()];
+                        texts[(size_t)i] = built;
+                    }
+                }
+                if (arrival_ms > 0) {
+                    double clock = 0.0;
+                    std::exponential_distribution<double> gap(1.0 / arrival_ms);
+                    for (int i = 0; i < concurrency; ++i) {
+                        offsets_ms[(size_t)i] = clock;
+                        clock += poisson ? gap(mix_rng) : arrival_ms;
+                    }
+                }
+            }
+
             struct load_result {
                 std::string pcm;
                 double ttfa_ms = 0.0;
@@ -292,16 +343,19 @@ command_synthesize(int argc, char** argv) {
                     // Requests arriving at a rate, rather than all at once.
                     // Time to first audio is measured from this request's own
                     // arrival, not from the start of the run.
-                    if (arrival_ms > 0)
-                        std::this_thread::sleep_for(std::chrono::milliseconds(arrival_ms * i));
+                    if (offsets_ms[(size_t)i] > 0.0)
+                        std::this_thread::sleep_for(std::chrono::microseconds(
+                            (long long)(offsets_ms[(size_t)i] * 1000.0)));
                     const auto started = std::chrono::steady_clock::now();
                     // With --cancel-after-ms, every fourth request hangs up
                     // mid-stream. The rest must be unaffected, which is what
                     // says a cancelled session releases its lanes cleanly.
                     const bool hangs_up = cancel_after_ms > 0 && (i % 4) == 1;
                     try {
+                        nemo_speech::tts::SynthesisRequest mine = request;
+                        mine.text = texts[(size_t)i];
                         run.result = synthesizer->synthesize(
-                            request, [&](const auto&, const std::string& chunk) {
+                            mine, [&](const auto&, const std::string& chunk) {
                                 if (hangs_up &&
                                     std::chrono::duration<double, std::milli>(
                                         std::chrono::steady_clock::now() - started)

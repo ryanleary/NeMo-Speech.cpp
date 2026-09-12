@@ -3049,14 +3049,20 @@ stream_magpie_to_audio(
     // The batched sampler carries one EOS floor per lane in its config, which
     // is a fixed-size array, so that bounds the wave.
     const bool wave_width_ok = wave_width <= MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS;
-    const bool use_wave = (wave_width > 1) && token_chunks.size() > 1 && use_cuda_sampling &&
+    // Note there is no "more than one chunk" requirement. A single-chunk request
+    // is a whole wave's worth of nothing on its own, but in a shared engine it
+    // is simply one lane -- and sending it down the sequential path instead has
+    // it take the workspace exclusively, which parks the engine and everything
+    // already in it until it is done. Short texts are the common case in
+    // serving, so that is the difference between a tail and a stall.
+    const bool use_wave = (wave_width > 1) && use_cuda_sampling &&
                           params.use_local_transformer && params.use_cfg &&
                           params.use_kv_cache && params.longform_history_tokens >= 0 &&
                           wave_attention_ok && wave_width_ok && h.dec_kernel == 1;
     // Asking for a wave and silently getting sequential decode is the worst
     // outcome, so say which requirement was not met. A single chunk is not
     // a failure: there is no wave to form.
-    if (wave_width > 1 && token_chunks.size() > 1 && !use_wave) {
+    if (wave_width > 1 && !use_wave) {
         const char* why = !use_cuda_sampling              ? "CUDA sampling is not active"
                           : !params.use_local_transformer ? "the local transformer is disabled"
                           : !params.use_cfg               ? "classifier-free guidance is off"
