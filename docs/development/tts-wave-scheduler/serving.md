@@ -24,6 +24,12 @@ request has always run at.
 | `MagpieWaveService` | the wave, the thread driving it, the queue of sessions waiting for lanes |
 | `MagpieStreamingWorkspace::gate` | shared for requests that can share the wave, exclusive for anything that drives the decoder from its own thread |
 
+The HTTP server's `TtsPreemptionCoordinator` is gone with it. It admitted one
+request at a time and cancelled the older one to let a newer start, for the
+reason its own comment gave -- that the runtime serialized synthesis. `tts.preempt`
+is still accepted so existing configurations load, and says once that it is
+ignored.
+
 The gate is what replaces `runtime.cpp`'s lock. Holding it exclusively also
 parks the engine, because a session only exists while its request holds the
 shared side — so the sequential path and the one-time setup are safe without
@@ -80,35 +86,47 @@ that and 207x is everything else in the end-to-end path.
 
 ## What is left
 
-1. **The frontends.** Only `--concurrency` exercises any of this. The HTTP
-   server's `TtsPreemptionCoordinator` (`server/http/http_server.cpp:327`) still
-   serializes synthesis and cancels older requests, on the stated premise that
-   "Magpie owns one mutable streaming workspace, so synthesis is serialized by
-   the runtime" -- which is no longer true. It is opt-in, so the default path is
-   already concurrent, but the coordinator and its reason should both go.
-2. **Shrinking the wave.** It only grows. It is sized from everything queued and
+1. **Shrinking the wave.** It only grows. It is sized from everything queued and
    running when it opens, and growing means rebuilding the captured graph, which
    needs the wave empty — so a burst that arrives while a narrow wave is busy
    waits for it to drain, once. A wave that has widened for load never narrows
    again, which costs a later lone request the wide steps it does not need.
    This is the other half of "size the wave to demand".
-3. **TTFA under load.** 71 ms alone against 243 ms at a sustained rate.
+2. **TTFA under load.** 71 ms alone against 243 ms at a sustained rate.
    Two causes, both structural: a step costs time proportional to lane count, so
    the `chunk_frames` steps before first audio cost more in a wide wave; and 32
    requests are ~160 chunks queueing for 32 lanes. Admission already serves
    sessions with nothing in flight first (`plan_session_admission`), which is
    what keeps the minimum at ~340 ms rather than the median.
-4. **Cancellation.** Still pre-existing and load-critical.
-   `SynthesisResult::cancelled` is dead code — `synthesizer.cpp:218` sets it but
-   `runtime.cpp:214` throws first, so `speech_translator.cpp:108`'s branch is
-   unreachable. gRPC maps a client cancel to `INTERNAL` because `map_exception`
-   fires before the `IsCancelled()` checks. A session now carries a
-   `fail_reason`, which is the seam to hang a proper terminal state on; model
-   the fan-out on `MicroBatcher`'s `promise.set_exception` in
-   `src/asr/batching.h`.
-5. **Deterministic concurrency tests.** `MagpieWaveService::drive_once` is
+3. **Cancellation beyond the callback.** A client hanging up is handled: the
+   run returns its audio so far with `cancelled` set, gRPC answers CANCELLED
+   and HTTP 499, and the session releases its lanes without disturbing its
+   neighbours. What is not handled is a request that wants to stop while it is
+   still *queued*, or a server shutting down with sessions in flight -- both go
+   through `MagpieWaveService::fail_all`, which reports them as failures.
+4. **Deterministic concurrency tests.** `MagpieWaveService::drive_once` is
    already the single-threaded drive mode this needs; what is missing is a test
    that can run it without a model.
+
+## Cancellation
+
+The PCM callback returning false used to travel down exactly the path a decode
+error does, so the runtime threw before `SynthesisResult::cancelled` could be
+returned. That one throw was why gRPC answered a client cancel with `INTERNAL`,
+why the speech translator's cancelled branch was unreachable, and why the C
+API's two checks were dead code -- four apparently separate bugs with one cause.
+
+It is recorded now where it happens, in `stream_audio_outputs::write_audio`,
+which is the only place that knows the callback said stop. Gate:
+
+```bash
+# a quarter of 32 concurrent requests hang up mid-stream
+nemo-speech synthesize "<paragraph>" --concurrency 32 --cancel-after-ms 300 ...
+```
+
+8 cancelled, 0 failed, and the 24 survivors produce 24.7-26.1 s of audio each
+against the 25.2 s they produce alone. A cancelled session releases its lanes
+and its neighbours do not notice.
 
 ## The failure that was silent
 
