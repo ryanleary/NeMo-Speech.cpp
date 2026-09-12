@@ -147,10 +147,49 @@ not more. `--rounds` runs a discarded warm-up burst first, so the per-channel
 codec graph builds (~145 ms on the first burst's median, once per process
 because channels are pooled) do not land on a measured round.
 
-What remains at 128 lanes is the floor, not a queue: a step costs time
-proportional to lane count, so the `chunk_frames` steps before first audio cost
-more in a wide wave. 718 ms is the minimum any request sees there, and the
-median is within 2x of it.
+### Picking a width
+
+Width is not a throughput dial; it is a capacity dial with a latency price. A
+step costs time proportional to lane count, so the `chunk_frames` steps before
+first audio cost more in a wide wave -- and a wave narrower than the offered
+concurrency makes requests queue for lanes, which costs far more than either.
+Paragraph requests, one burst, first audio in ms:
+
+| width | 32 requests | 64 requests | 128 requests |
+|---|---|---|---|
+| 32 | **188.8x**, 354/439/453 | 188.6x, 4530/4713/4726 | 191.7x, 8736/12980/13011 |
+| 64 | 193.2x, 522/624/639 | **201.4x**, 639/779/791 | 213.3x, 7814/8200/8225 |
+| 128 | 184.3x, 871/1007/1028 | 198.6x, 1051/1216/1226 | **206.7x**, 1218/1519/1542 |
+
+(p50/p95/p99.) Read down a column, not across a row. At every offered load the
+best width is the smallest one that still holds the concurrency: 64 requests get
+201x at 639 ms from a 64-lane wave against 199x at 1051 ms from a 128-lane one
+-- more throughput *and* 40% less latency. Go under, and latency collapses
+entirely: 64 requests into 32 lanes is 4.5 s to first audio for the same 189x,
+because half of them are waiting for a lane rather than decoding.
+
+So 128 lanes is the right answer only when 128 requests are actually in flight.
+For a realtime operating point, size the wave to the concurrency the service is
+provisioned for and no wider.
+
+### The admission window
+
+`tts.admission-window-ms` (default 2) and `tts.admission-window-max-ms`
+(default 20) are how long the engine waits, from idle, for a burst to finish
+arriving. 64 requests into a 64-lane wave:
+
+| window | aggregate | p50/p95/p99 |
+|---|---|---|
+| 0 ms | 203.4x | 664/1371/2249 ms |
+| 2 ms | 201.0x | 645/786/799 ms |
+| 10 ms | 200.3x | 662/804/815 ms |
+| 40 ms | 199.1x | 717/858/869 ms |
+
+It is a tail knob, not a throughput knob: it takes p99 from 2249 ms to 799 ms
+and costs ~1% throughput, and past 2 ms it buys nothing and starts adding to the
+median. Turning it off does not buy throughput back in any useful amount. The
+knob is there because the right value depends on how requests arrive, not
+because there is a latency/throughput curve worth riding.
 
 Smaller codec chunks cut the minimum but not the median, which is consistent
 with the tail being elsewhere:

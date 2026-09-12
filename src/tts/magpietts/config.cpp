@@ -148,6 +148,13 @@ register_runtime_config(common::ParameterParser& p, MagpieRuntimeConfig& c) {
         "longform-history-tokens", &c.longform_history_tokens,
         "Fixed long-form history tokens; -1 adapts to the previous chunk's alignment "
         "and is only valid at batch-size 1");
+    p.Register(
+        "admission-window-ms", &c.admission_window_ms,
+        "How long the wave waits, from idle, for a burst of requests to finish arriving "
+        "before it admits any of them; 0 admits the first arrival immediately");
+    p.Register(
+        "admission-window-max-ms", &c.admission_window_max_ms,
+        "Cap on extending that wait while requests are still arriving");
     p.Register("codec-queue-depth", &c.codec_queue_depth, "Codec worker queue depth");
     p.Register("codec-history-frames", &c.codec_history_frames, "Rolling codec history frames");
     p.Register("codec-future-frames", &c.codec_future_frames, "Rolling codec future frames");
@@ -253,6 +260,13 @@ register_stream_params(common::ParameterParser& p, magpie_stream_params& c) {
         "longform-history-tokens", &c.longform_history_tokens,
         "Fixed long-form history tokens; -1 adapts to the previous chunk's alignment "
         "and is only valid at batch-size 1");
+    p.Register(
+        "admission-window-ms", &c.admission_window_ms,
+        "How long the wave waits, from idle, for a burst of requests to finish arriving "
+        "before it admits any of them; 0 admits the first arrival immediately");
+    p.Register(
+        "admission-window-max-ms", &c.admission_window_max_ms,
+        "Cap on extending that wait while requests are still arriving");
     p.Register("codec-queue-depth", &c.codec_queue_depth, "Codec worker queue depth");
     p.Register("codec-history-frames", &c.codec_history_frames, "Rolling codec history frames");
     p.Register("codec-future-frames", &c.codec_future_frames, "Rolling codec future frames");

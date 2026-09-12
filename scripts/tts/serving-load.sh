@@ -17,7 +17,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WT="${1:?usage: serving-load.sh <worktree> [width]}"; WIDTH="${2:-32}"
 bench_resolve "$WT"
 TEXT="$(bench_text_for "${SENTENCES:-5}")"
-printf '%-8s %-10s %-12s %s\n' requests aggregate "ttfa median" "ttfa min/max"
+printf '%-8s %-10s %-10s %-10s %s\n' requests aggregate 'ttfa p50' 'ttfa p95' 'ttfa p99'
 for c in ${CONCURRENCY:-1 4 16 32}; do
     log="/tmp/serving-load-w$WIDTH-c$c.log"
     "$BENCH_BIN" synthesize "$TEXT" --device cuda --voice John --seed 7 --top-k 1 \
@@ -27,12 +27,13 @@ for c in ${CONCURRENCY:-1 4 16 32}; do
     if [ "$c" = 1 ]; then
         # A lone request reports itself rather than an aggregate.
         rtfx=$(grep -oE '[0-9.]+x realtime' "$log" | tail -1 | cut -d' ' -f1)
-        printf '%-8s %-10s %-12s %s\n' "$c" "$rtfx" "-" "-"
+        printf '%-8s %-10s %-10s %-10s %s\n' "$c" "$rtfx" "-" "-" "-"
     else
         line=$(grep 'concurrent requests' "$log")
         rtfx=$(echo "$line" | grep -oE '= [0-9.]+x' | tr -d '= ')
         spread=$(echo "$line" | grep -oE '[0-9]+/[0-9]+/[0-9]+ ms')
-        printf '%-8s %-10s %-12s %s\n' "$c" "$rtfx" \
-            "$(echo "$spread" | cut -d/ -f2) ms" "$(echo "$spread" | cut -d/ -f1)/$(echo "$spread" | cut -d/ -f3)"
+        printf '%-8s %-10s %-10s %-10s %s\n' "$c" "$rtfx" \
+            "$(echo "$spread" | cut -d/ -f1) ms" "$(echo "$spread" | cut -d/ -f2) ms" \
+            "$(echo "$spread" | cut -d/ -f3)"
     fi
 done

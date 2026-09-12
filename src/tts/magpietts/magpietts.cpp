@@ -522,7 +522,7 @@ class MagpieStreamingWorkspace {
         const nc::NanoCodecModel& codec, const magpie_stream_params& params, int window_samples);
     MagpieWaveService* waveService(
         int max_lanes, int threads, const magpietts_hparams& h, LocalCodebookSampler* sampler,
-        bool verbose);
+        const magpie_stream_params& params, bool verbose);
 
     // What one request needs the workspace to have been set up for. Every field
     // comes from engine configuration rather than request options, so in a
@@ -2880,7 +2880,7 @@ MagpieStreamingWorkspace::codecWorker(
 MagpieWaveService*
 MagpieStreamingWorkspace::waveService(
     int max_lanes, int threads, const magpietts_hparams& h, LocalCodebookSampler* sampler,
-    bool verbose) {
+    const magpie_stream_params& params, bool verbose) {
     std::lock_guard<std::mutex> lock(services_mutex);
     if (wave_service && (wave_service->max_lanes != max_lanes ||
                          wave_service->engine.local_sampler != sampler ||
@@ -2906,6 +2906,12 @@ MagpieStreamingWorkspace::waveService(
             h.frame_stacking_factor, h.audio_bos_id, verbose);
         wave_service->start();
     }
+    // Tunable between requests: the window is read by the engine thread each
+    // time it parks, not baked into the graph like the width is.
+    wave_service->admission_window =
+        std::chrono::microseconds(std::max(0, params.admission_window_ms) * 1000);
+    wave_service->admission_window_max = std::chrono::microseconds(
+        std::max(params.admission_window_ms, params.admission_window_max_ms) * 1000);
     return wave_service.get();
 }
 
@@ -3331,7 +3337,7 @@ stream_magpie_to_audio(
             // the call, and while this session decodes, other requests' chunks
             // may be sharing its lanes.
             MagpieWaveService* service = workspace.waveService(
-                wave_width, params.threads, h, local_sampler, params.verbose);
+                wave_width, params.threads, h, local_sampler, params, params.verbose);
             if (!service) {
                 return end_run();
             }

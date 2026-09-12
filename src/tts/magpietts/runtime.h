@@ -44,6 +44,12 @@ struct MagpieRuntimeConfig {
     // (attention_prior.lastAttendedAbsolute), so batching pins the history
     // instead. -1 keeps the adaptive behaviour and is only legal at batch 1.
     int longform_history_tokens = -1;
+    // Requests arriving together have to be admitted together: taking the first
+    // one alone lets its own later chunks fill every lane, and its neighbours
+    // then wait a whole chunk for one. Longer trades first-audio latency for a
+    // fuller wave; 0 disables the wait.
+    int admission_window_ms = 2;
+    int admission_window_max_ms = 20;
     int codec_queue_depth = 4;
     int codec_history_frames = -1;
     int codec_future_frames = 1;

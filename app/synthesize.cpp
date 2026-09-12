@@ -357,6 +357,16 @@ command_synthesize(int argc, char** argv) {
                 }
             }
             std::sort(ttfa.begin(), ttfa.end());
+            // Percentiles, not extremes: the max is one request and says
+            // nothing about what a caller should expect.
+            const auto pct = [&](double p) {
+                if (ttfa.empty())
+                    return 0.0;
+                const size_t i = std::min(
+                    ttfa.size() - 1,
+                    static_cast<size_t>(p * static_cast<double>(ttfa.size() - 1) + 0.5));
+                return ttfa[i];
+            };
             if (!cli_quiet()) {
                 if (cancelled > 0) {
                     // Every request that ran to completion must still produce
@@ -370,13 +380,11 @@ command_synthesize(int argc, char** argv) {
                 std::fprintf(
                     stderr,
                     "%s: %d concurrent requests, %d failed: %.1f s of audio in %.2f s = "
-                    "%.1fx realtime; first audio min/median/max %.0f/%.0f/%.0f ms\n",
+                    "%.1fx realtime; first audio p50/p95/p99 %.0f/%.0f/%.0f ms\n",
                     round < 0 ? "warmup" : ("round " + std::to_string(round + 1)).c_str(),
                     concurrency, failures, audio_s, load_wall_s,
-                    load_wall_s > 0.0 ? audio_s / load_wall_s : 0.0,
-                    ttfa.empty() ? 0.0 : ttfa.front(),
-                    ttfa.empty() ? 0.0 : ttfa[ttfa.size() / 2],
-                    ttfa.empty() ? 0.0 : ttfa.back());
+                    load_wall_s > 0.0 ? audio_s / load_wall_s : 0.0, pct(0.50), pct(0.95),
+                    pct(0.99));
             }
             if (failures > 0)
                 throw std::runtime_error("one or more concurrent requests failed");
