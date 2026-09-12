@@ -432,6 +432,12 @@ wave_cross_name(bool value) {
                  : std::string("magpietts.decoder.runtime.wave_cross_k");
 }
 
+static const char*
+wave_cross_scratch_name(bool value) {
+    return value ? "magpietts.decoder.runtime.wave_cross_v_scratch"
+                 : "magpietts.decoder.runtime.wave_cross_k_scratch";
+}
+
 static std::string
 runtime_kv_name(int layer) {
     return "magpietts.decoder.runtime.kv." + std::to_string(layer);
@@ -657,6 +663,17 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
                 wave_cross_name(true), GGML_TYPE_F32, per_item, items);
             session->model_tensor_container->create_tensor_2d(
                 "magpietts.decoder.runtime.cross_mask", GGML_TYPE_F32, text_len_, items);
+            // The same three, packed in admission order rather than lane order.
+            // A prefill that opens a scattered set of lanes runs at that set's
+            // width, not the runtime's, and a scatter has no view -- so the
+            // chunks it opens are gathered here first. Lanes that happen to be
+            // contiguous skip it and read the arena above through an offset.
+            session->model_tensor_container->create_tensor_2d(
+                wave_cross_scratch_name(false), GGML_TYPE_F32, per_item, items);
+            session->model_tensor_container->create_tensor_2d(
+                wave_cross_scratch_name(true), GGML_TYPE_F32, per_item, items);
+            session->model_tensor_container->create_tensor_2d(
+                "magpietts.decoder.runtime.cross_mask_scratch", GGML_TYPE_F32, text_len_, items);
         }
         // One mask per lane. ggml_flash_attn_ext requires only that q->ne[2] and
         // q->ne[3] be divisible by the mask's, and q is [d_head, n_q, n_head,
@@ -994,6 +1011,21 @@ class MagpieDecoder::PersistentDecoderRuntime {
         auto wv = session_.model_tensor_container->get_tensor_by_name(wave_cross_name(true));
         auto mk = session_.model_tensor_container->get_tensor_by_name(
             "magpietts.decoder.runtime.cross_mask");
+        auto sk = session_.model_tensor_container->get_tensor_by_name(
+            wave_cross_scratch_name(false));
+        auto sv = session_.model_tensor_container->get_tensor_by_name(
+            wave_cross_scratch_name(true));
+        auto sm = session_.model_tensor_container->get_tensor_by_name(
+            "magpietts.decoder.runtime.cross_mask_scratch");
+        // A contiguous run reads the lane-ordered arena through an offset, so it
+        // needs no packed copy. Anything else does.
+        bool packed_needed = false;
+        for (size_t at = 1; at < items.size(); ++at) {
+            if (items[at] != items[0] + static_cast<int>(at)) {
+                packed_needed = true;
+                break;
+            }
+        }
         const size_t dst_es = ggml_element_size(wk.tensor);
         const size_t item_stride =
             static_cast<size_t>(n_layers) * static_cast<size_t>(text_len_) * cross_dim;
@@ -1014,7 +1046,8 @@ class MagpieDecoder::PersistentDecoderRuntime {
 
         // Two copies per item per layer, and a copy is three objects -- the two
         // views and the copy itself -- so budget four.
-        const size_t fill_nodes = static_cast<size_t>(8 * items.size() * n_layers) + 1024;
+        const size_t fill_nodes =
+            static_cast<size_t>((packed_needed ? 16 : 8) * items.size() * n_layers) + 1024;
         ggml_context* ctx = sized_graph_context(fill_nodes);
         ggml_cgraph* gf = ggml_new_graph_custom(ctx, fill_nodes, false);
         for (size_t at = 0; at < items.size(); ++at) {
@@ -1042,6 +1075,29 @@ class MagpieDecoder::PersistentDecoderRuntime {
                                 ctx, const_cast<ggml_tensor*>(cache.memory_v), n_kv * cross_dim,
                                 src_off),
                             ggml_view_1d(ctx, wv.tensor, n_kv * cross_dim, dst_off)));
+                if (!packed_needed) {
+                    continue;
+                }
+                // Same source, second destination: the admission-ordered copy the
+                // narrowed prefill reads.
+                const size_t packed_off =
+                    (at * item_stride +
+                     static_cast<size_t>(layer) * static_cast<size_t>(text_len_) * cross_dim) *
+                    dst_es;
+                ggml_build_forward_expand(
+                    gf, ggml_cpy(
+                            ctx,
+                            ggml_view_1d(
+                                ctx, const_cast<ggml_tensor*>(cache.memory_k), n_kv * cross_dim,
+                                src_off),
+                            ggml_view_1d(ctx, sk.tensor, n_kv * cross_dim, packed_off)));
+                ggml_build_forward_expand(
+                    gf, ggml_cpy(
+                            ctx,
+                            ggml_view_1d(
+                                ctx, const_cast<ggml_tensor*>(cache.memory_v), n_kv * cross_dim,
+                                src_off),
+                            ggml_view_1d(ctx, sv.tensor, n_kv * cross_dim, packed_off)));
             }
         }
         ggml_backend_graph_compute(model_.backend, gf);
@@ -1061,8 +1117,15 @@ class MagpieDecoder::PersistentDecoderRuntime {
                 mk.tensor, column.data(),
                 static_cast<size_t>(item) * static_cast<size_t>(text_len_) * sizeof(float),
                 column.size() * sizeof(float));
+            if (packed_needed) {
+                ggml_backend_tensor_set(
+                    sm.tensor, column.data(),
+                    at * static_cast<size_t>(text_len_) * sizeof(float),
+                    column.size() * sizeof(float));
+            }
             module_.set_item_text_len(item, len);
         }
+        packed_cross_valid_ = packed_needed;
         return true;
     }
 
@@ -1229,28 +1292,31 @@ class MagpieDecoder::PersistentDecoderRuntime {
         const ggml_nvtx::range nvtx_range("magpietts_decoder_prefill_wave");
         const magpietts_hparams& h = model_.hparams;
         const magpietts_transformer& tr = model_.decoder;
-        // The graph always runs the runtime's full width. A prefill call is ~90%
-        // fixed overhead -- graph build, allocation, sync -- so computing lanes
-        // whose results are thrown away costs almost nothing, and it buys the
-        // thing a scheduler needs: the admitted set can be any scatter of lanes,
-        // because nothing in the graph is offset by where they are. Only the
-        // write-back narrows.
-        const int items = items_();
-        const int lanes = lanes_;
-        if (wave.empty() || wave.size() != admit.size() || h.dec_kernel != 1 || !cond_hidden_out ||
-            !uncond_hidden_out || !cond_hidden_out->tensor || !uncond_hidden_out->tensor ||
-            cond_hidden_out->tensor->ne[1] != items || uncond_hidden_out->tensor->ne[1] != items) {
+        // The graph runs at the width of the set being opened, not the runtime's.
+        // A prefill costs about half a millisecond per lane it computes and
+        // nothing per lane it opens, so opening sixteen lanes of a hundred and
+        // twenty-eight used to do eight times the work it needed.
+        //
+        // What the narrowing costs is a view: cross-attention indexes items along
+        // ne3 from the start of what it is handed, and a scattered set of lanes
+        // has no such view. A contiguous run does -- an offset into the
+        // lane-ordered arena -- and anything else reads the admission-ordered
+        // copy refillWaveCross gathered.
+        const int width = items_();
+        const int items = static_cast<int>(admit.size());
+        const int lanes = kMagpieCfgLanesPerItem * items;
+        if (wave.empty() || wave.size() != admit.size() || items > width || h.dec_kernel != 1 ||
+            !cond_hidden_out || !uncond_hidden_out || !cond_hidden_out->tensor ||
+            !uncond_hidden_out->tensor || cond_hidden_out->tensor->ne[1] != width ||
+            uncond_hidden_out->tensor->ne[1] != width) {
             return false;
         }
-        // run_of_item[i] is which entry of `wave` lane i is opening, or -1 for a
-        // lane this call leaves alone.
-        std::vector<int> run_of_item(static_cast<size_t>(items), -1);
-        for (size_t at = 0; at < admit.size(); ++at) {
-            const int item = admit[at];
-            if (item < 0 || item >= items || run_of_item[static_cast<size_t>(item)] >= 0) {
+        std::vector<char> seen(static_cast<size_t>(width), 0);
+        for (const int item : admit) {
+            if (item < 0 || item >= width || seen[static_cast<size_t>(item)]) {
                 return false;
             }
-            run_of_item[static_cast<size_t>(item)] = static_cast<int>(at);
+            seen[static_cast<size_t>(item)] = 1;
         }
 
         // A wave steps in lockstep, so every column has to open at the same
@@ -1282,15 +1348,11 @@ class MagpieDecoder::PersistentDecoderRuntime {
         for (int codebook = 0; codebook < h.stacked_audio_codebooks(); ++codebook) {
             // Item-major, so a reshape turns one get_rows into [n_embd, T, items].
             std::vector<int32_t> rows(static_cast<size_t>(items) * audio_len);
-            for (int item = 0; item < items; ++item) {
-                // A lane this call is not opening still has to hold in-range
-                // tokens, because the graph runs it either way. Give it an
-                // admitted column's; its output is discarded.
-                const int at = run_of_item[static_cast<size_t>(item)];
+            for (int at = 0; at < items; ++at) {
                 const std::vector<int32_t>& src =
-                    stacked[static_cast<size_t>(at < 0 ? 0 : at)][static_cast<size_t>(codebook)];
+                    stacked[static_cast<size_t>(at)][static_cast<size_t>(codebook)];
                 std::copy(
-                    src.begin(), src.end(), rows.begin() + static_cast<size_t>(item) * audio_len);
+                    src.begin(), src.end(), rows.begin() + static_cast<size_t>(at) * audio_len);
             }
             i32_inputs.push_back(
                 {"magpietts_prefill_audio_" + std::to_string(codebook), std::move(rows)});
@@ -1301,19 +1363,18 @@ class MagpieDecoder::PersistentDecoderRuntime {
         // length, so the tail past it is never sampled.
         std::vector<float> log_prior(
             static_cast<size_t>(text_len_) * static_cast<size_t>(items), 0.0f);
-        for (int item = 0; item < items; ++item) {
-            const int at = run_of_item[static_cast<size_t>(item)];
-            const std::vector<float>* prior = at < 0 ? nullptr : wave[static_cast<size_t>(at)].prior;
+        for (int at = 0; at < items; ++at) {
+            const std::vector<float>* prior = wave[static_cast<size_t>(at)].prior;
             if (!prior) {
                 continue;
             }
-            const int len = module_.item_text_len(item);
+            const int len = module_.item_text_len(admit[static_cast<size_t>(at)]);
             if (static_cast<int>(prior->size()) != len) {
                 return false;
             }
             for (int i = 0; i < len; ++i) {
                 log_prior
-                    [static_cast<size_t>(item) * static_cast<size_t>(text_len_) +
+                    [static_cast<size_t>(at) * static_cast<size_t>(text_len_) +
                      static_cast<size_t>(i)] =
                         std::log(std::max((*prior)[static_cast<size_t>(i)], 1.0e-20f));
             }
@@ -1369,13 +1430,45 @@ class MagpieDecoder::PersistentDecoderRuntime {
         ggml_set_name(prior, "magpietts_prefill_prior");
         ggml_set_input(prior);
 
-        ggml_tensor* wave_k =
-            session_.model_tensor_container->get_tensor_by_name(wave_cross_name(false)).tensor;
-        ggml_tensor* wave_v =
-            session_.model_tensor_container->get_tensor_by_name(wave_cross_name(true)).tensor;
-        ggml_tensor* cross_mask = session_.model_tensor_container
-                                      ->get_tensor_by_name("magpietts.decoder.runtime.cross_mask")
-                                      .tensor;
+        // Where this run's chunks are to be found, in admission order. A
+        // contiguous run is an offset into the lane-ordered arena; a scatter was
+        // packed for us. Either way the view handed to cross-attention is items
+        // wide and starts at the first chunk of the run.
+        bool admit_contiguous = true;
+        for (int at = 1; at < items; ++at) {
+            if (admit[static_cast<size_t>(at)] != admit[0] + at) {
+                admit_contiguous = false;
+                break;
+            }
+        }
+        if (!admit_contiguous && !packed_cross_valid_) {
+            return false;
+        }
+        ggml_tensor* cross_k_src =
+            session_.model_tensor_container
+                ->get_tensor_by_name(
+                    admit_contiguous ? wave_cross_name(false) : wave_cross_scratch_name(false))
+                .tensor;
+        ggml_tensor* cross_v_src =
+            session_.model_tensor_container
+                ->get_tensor_by_name(
+                    admit_contiguous ? wave_cross_name(true) : wave_cross_scratch_name(true))
+                .tensor;
+        ggml_tensor* cross_mask_src =
+            session_.model_tensor_container
+                ->get_tensor_by_name(
+                    admit_contiguous ? "magpietts.decoder.runtime.cross_mask"
+                                     : "magpietts.decoder.runtime.cross_mask_scratch")
+                .tensor;
+        const int cross_first = admit_contiguous ? admit[0] : 0;
+        auto cross_view = [&](ggml_tensor* src) {
+            return ggml_view_2d(
+                ctx, src, src->ne[0], items, src->nb[1],
+                static_cast<size_t>(cross_first) * src->nb[1]);
+        };
+        ggml_tensor* wave_k = cross_view(cross_k_src);
+        ggml_tensor* wave_v = cross_view(cross_v_src);
+        ggml_tensor* cross_mask = cross_view(cross_mask_src);
 
         // The whole prefill is causal over its own tokens, so one triangular
         // mask serves every head and every lane.
@@ -1408,16 +1501,6 @@ class MagpieDecoder::PersistentDecoderRuntime {
         // The run crosses the end of the ring whenever a chunk is admitted early
         // in one, which a burst part way through a step budget routinely is.
         const int head_span = std::min(total_len, cache_len_ - ring_start);
-        const int admit_first = admit.front();
-        const int admit_count = static_cast<int>(admit.size());
-        bool admit_contiguous = true;
-        for (int at = 0; at < admit_count; ++at) {
-            if (admit[static_cast<size_t>(at)] != admit_first + at) {
-                admit_contiguous = false;
-                break;
-            }
-        }
-
         const int64_t d_head = tr.n_embd / tr.n_head;
         std::vector<ggml_tensor*> alignment_rows;
         for (int layer_index = 0; layer_index < static_cast<int>(tr.layers.size()); ++layer_index) {
@@ -1451,43 +1534,25 @@ class MagpieDecoder::PersistentDecoderRuntime {
                         }
                         const int src_row = part == 0 ? 0 : head_span;
                         const int dst_row = part == 0 ? ring_start : 0;
-                        if (admit_contiguous) {
-                            // The common case, and the only one the opening
-                            // prefill takes: one copy covers the whole run.
-                            ggml_build_forward_expand(
-                                gf, ggml_cpy(
-                                        ctx,
-                                        ggml_view_3d(
-                                            ctx, qkv, tr.n_embd, rows, admit_count, qkv->nb[1],
-                                            qkv->nb[2],
-                                            static_cast<size_t>(plane + 1) * tr.n_embd * element +
-                                                static_cast<size_t>(half * items + admit_first) *
-                                                    qkv->nb[2] +
-                                                static_cast<size_t>(src_row) * qkv->nb[1]),
-                                        ggml_view_3d(
-                                            ctx, arena.tensor, tr.n_embd, rows, admit_count,
-                                            row_bytes, arena.tensor->nb[1],
-                                            static_cast<size_t>(plane) * arena.tensor->nb[2] +
-                                                static_cast<size_t>(half * items + admit_first) *
-                                                    arena.tensor->nb[1] +
-                                                static_cast<size_t>(dst_row) * row_bytes)));
-                            continue;
-                        }
-                        for (const int item : admit) {
-                            const size_t lane =
-                                static_cast<size_t>(half) * items + static_cast<size_t>(item);
+                        for (int at = 0; at < items; ++at) {
+                            // The run is items wide; the runtime is width wide.
+                            const size_t src_lane =
+                                static_cast<size_t>(half) * items + static_cast<size_t>(at);
+                            const size_t dst_lane =
+                                static_cast<size_t>(half) * width +
+                                static_cast<size_t>(admit[static_cast<size_t>(at)]);
                             ggml_build_forward_expand(
                                 gf, ggml_cpy(
                                         ctx,
                                         ggml_view_2d(
                                             ctx, qkv, tr.n_embd, rows, qkv->nb[1],
                                             static_cast<size_t>(plane + 1) * tr.n_embd * element +
-                                                lane * qkv->nb[2] +
+                                                src_lane * qkv->nb[2] +
                                                 static_cast<size_t>(src_row) * qkv->nb[1]),
                                         ggml_view_2d(
                                             ctx, arena.tensor, tr.n_embd, rows, row_bytes,
                                             static_cast<size_t>(plane) * arena.tensor->nb[2] +
-                                                lane * arena.tensor->nb[1] +
+                                                dst_lane * arena.tensor->nb[1] +
                                                 static_cast<size_t>(dst_row) * row_bytes)));
                         }
                     }
@@ -1502,12 +1567,12 @@ class MagpieDecoder::PersistentDecoderRuntime {
             ggml_tensor* kq_soft =
                 causal ? ggml_soft_max_ext(ctx, kq, causal, 1.0f, 0.0f) : ggml_soft_max(ctx, kq);
             ggml_tensor* v_trans = ggml_cont_4d(
-                ctx, ggml_permute(ctx, heads(2), 1, 2, 0, 3), total_len, d_head, tr.n_head, lanes_);
+                ctx, ggml_permute(ctx, heads(2), 1, 2, 0, 3), total_len, d_head, tr.n_head, lanes);
             ggml_tensor* merged =
                 ggml_permute(ctx, ggml_mul_mat(ctx, v_trans, kq_soft), 0, 2, 1, 3);
             x = ggml_add(
                 ctx, residual,
-                linear(ctx, layer.self_o, ggml_cont_3d(ctx, merged, tr.n_embd, total_len, lanes_)));
+                linear(ctx, layer.self_o, ggml_cont_3d(ctx, merged, tr.n_embd, total_len, lanes)));
 
             // Text cross-attention applies only to the conditional lanes.
             if (tr.has_cross && layer.has_cross) {
@@ -1583,10 +1648,10 @@ class MagpieDecoder::PersistentDecoderRuntime {
         std::vector<float> hidden_staging(static_cast<size_t>(items) * tr.n_embd);
         auto write_columns = [&](ggml_tensor* from, magpietts_backend_tensor* into) {
             ggml_backend_tensor_get(from, hidden_staging.data(), 0, all_bytes);
-            for (const int item : admit) {
-                const size_t at = static_cast<size_t>(item) * hidden_column_bytes;
+            for (int at = 0; at < items; ++at) {
                 ggml_backend_tensor_set(
-                    into->tensor, hidden_staging.data() + static_cast<size_t>(item) * tr.n_embd, at,
+                    into->tensor, hidden_staging.data() + static_cast<size_t>(at) * tr.n_embd,
+                    static_cast<size_t>(admit[static_cast<size_t>(at)]) * hidden_column_bytes,
                     hidden_column_bytes);
             }
         };
@@ -1602,17 +1667,16 @@ class MagpieDecoder::PersistentDecoderRuntime {
                 if (!scores) {
                     continue;
                 }
-                const int item = admit[at];
-                const float* row = alignment.data() + static_cast<size_t>(item) * text_len_;
-                scores->assign(row, row + module_.item_text_len(item));
+                const float* row = alignment.data() + at * static_cast<size_t>(text_len_);
+                scores->assign(row, row + module_.item_text_len(admit[at]));
             }
         }
         ggml_gallocr_free(allocr);
         ggml_free(ctx);
 
-        n_tokens_.resize(static_cast<size_t>(items));
-        valid_tokens_.resize(static_cast<size_t>(items));
-        ring_heads_.resize(static_cast<size_t>(items));
+        n_tokens_.resize(static_cast<size_t>(width));
+        valid_tokens_.resize(static_cast<size_t>(width));
+        ring_heads_.resize(static_cast<size_t>(width));
         for (const int item : admit) {
             const size_t at = static_cast<size_t>(item);
             n_tokens_[at] = total_len;
@@ -1981,6 +2045,9 @@ class MagpieDecoder::PersistentDecoderRuntime {
     // times still share it: a chunk is opened so that its head lands here, and
     // every lane then advances one slot a step together.
     int ring_next_ = 0;
+    // Whether the last refill packed its chunks into the scratch arena, which it
+    // does only when the lanes it opened are not one contiguous run.
+    bool packed_cross_valid_ = false;
     // Per item. A fixed group holds them equal; once lanes are re-formed with
     // survivors alongside freshly admitted chunks they differ, and the position
     // each item feeds the graph is its own.
