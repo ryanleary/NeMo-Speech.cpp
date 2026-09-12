@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <ctime>
 #include <exception>
 #include <fstream>
@@ -954,6 +955,97 @@ struct stream_audio_outputs {
     stream_run_metrics* metrics = nullptr;
     std::function<bool(const std::vector<uint8_t>&)> pcm_callback;
 
+    // Hand finished audio to the caller from a thread of this request's own.
+    //
+    // The callback used to run on the codec worker, which serves every session.
+    // A client that paces its reads -- through TCP flow control, a blocking
+    // write, or a jitter buffer -- would then hold that one thread and stall
+    // audio for every other session. Delivery is buffered here instead, and
+    // when the buffer fills the codec simply stops choosing this channel, so
+    // the backpressure reaches the engine as an idle lane rather than as a
+    // stopped thread.
+    void start_delivery(size_t max_bytes) {
+        max_queued_bytes = max_bytes;
+        delivering = true;
+        deliverer = std::thread([this] {
+            for (;;) {
+                std::vector<uint8_t> next;
+                {
+                    std::unique_lock<std::mutex> lock(deliver_mutex);
+                    deliver_cv.wait(lock, [&] { return closed || !queue.empty(); });
+                    if (queue.empty()) {
+                        return;
+                    }
+                    next = std::move(queue.front());
+                    queue.pop_front();
+                    queued_bytes -= next.size();
+                }
+                deliver_room.notify_all();
+                if (pcm_callback && !pcm_callback(next)) {
+                    std::lock_guard<std::mutex> lock(deliver_mutex);
+                    refused = true;
+                    closed = true;
+                    deliver_room.notify_all();
+                    return;
+                }
+            }
+        });
+    }
+
+    // Wait for everything queued to reach the caller, then stop the thread.
+    bool finish_delivery() {
+        if (!delivering) {
+            return true;
+        }
+        {
+            std::lock_guard<std::mutex> lock(deliver_mutex);
+            closed = true;
+        }
+        deliver_cv.notify_all();
+        if (deliverer.joinable()) {
+            deliverer.join();
+        }
+        delivering = false;
+        std::lock_guard<std::mutex> lock(deliver_mutex);
+        return !refused;
+    }
+
+    // The caller is behind. Decoding more for this session would only pile up
+    // audio nobody is listening to yet.
+    bool backlogged() {
+        if (!delivering) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(deliver_mutex);
+        return queued_bytes >= max_queued_bytes;
+    }
+
+    bool deliver(const std::vector<uint8_t>& bytes) {
+        if (!delivering) {
+            return !pcm_callback || pcm_callback(bytes);
+        }
+        std::unique_lock<std::mutex> lock(deliver_mutex);
+        if (refused) {
+            return false;
+        }
+        queued_bytes += bytes.size();
+        queue.push_back(bytes);
+        lock.unlock();
+        deliver_cv.notify_one();
+        return true;
+    }
+
+    std::mutex deliver_mutex;
+    std::condition_variable deliver_cv;
+    std::condition_variable deliver_room;
+    std::thread deliverer;
+    std::deque<std::vector<uint8_t>> queue;
+    size_t queued_bytes = 0;
+    size_t max_queued_bytes = 0;
+    bool delivering = false;
+    bool closed = false;
+    bool refused = false;
+
     bool write_audio(const std::vector<float>& audio) {
         const ggml_nvtx::range nvtx_range("magpietts_stream_audio_write");
         std::vector<uint8_t> bytes;
@@ -966,7 +1058,7 @@ struct stream_audio_outputs {
             bytes.push_back((uint8_t)(((uint16_t)s >> 8) & 0xff));
         }
 
-        if (pcm_callback && !pcm_callback(bytes)) {
+        if (!deliver(bytes)) {
             // A caller that stops reading has not failed. Record it, and let
             // every layer above tell the two apart by asking.
             if (metrics) {
@@ -1515,6 +1607,12 @@ struct codec_stream_worker {
             const size_t idx = (cursor + k) % n;
             codec_channel& ch = *pool.channels[idx];
             if (!ch.in_use || ch.failed || ch.abort_requested) {
+                continue;
+            }
+            // Its caller has not caught up. Decoding more would pile up audio
+            // nobody is listening to and take the worker from a session whose
+            // caller is waiting.
+            if (ch.outputs && ch.outputs->backlogged()) {
                 continue;
             }
             codec_work::kind what = codec_work::none;
@@ -3079,6 +3177,13 @@ stream_magpie_to_audio(
 
     metrics.begin();
     outputs.metrics = &metrics;
+    // Five seconds of audio: enough that an ordinary consumer never stalls the
+    // codec, small enough that a slow one stops being decoded for promptly.
+    struct delivery_guard {
+        stream_audio_outputs& outputs;
+        ~delivery_guard() { outputs.finish_delivery(); }
+    } delivery{outputs};
+    outputs.start_delivery((size_t)codec.sampleRate() * 2 * 5);
 
     // Setup allocates the sampler and captures the local transformer's graphs,
     // which is device work and cannot run beside the engine. So take the gate
