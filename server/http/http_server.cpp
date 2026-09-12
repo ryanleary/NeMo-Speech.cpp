@@ -323,69 +323,18 @@ transcript_response(
 
 }  // namespace
 
-// Magpie owns one mutable streaming workspace, so synthesis is serialized by the
-// runtime.  This coordinator sits in front of it when preemption is requested:
-// a newer request makes every older request ineligible to start (or continue)
-// and waits for the active request to release the runtime.
-class TtsPreemptionCoordinator {
-   public:
-    uint64_t claim() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        const uint64_t generation = ++newest_generation_;
-        ready_.notify_all();
-        ready_.wait(lock, [&] { return !active_ || generation != newest_generation_; });
-        if (generation != newest_generation_)
-            return 0;
-        active_ = true;
-        return generation;
-    }
-
-    bool superseded(uint64_t generation) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return generation != newest_generation_;
-    }
-
-    void release() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        active_ = false;
-        ready_.notify_all();
-    }
-
-   private:
-    mutable std::mutex mutex_;
-    std::condition_variable ready_;
-    uint64_t newest_generation_ = 0;
-    bool active_ = false;
-};
-
-class TtsPreemptionLease {
-   public:
-    explicit TtsPreemptionLease(TtsPreemptionCoordinator* coordinator)
-        : coordinator_(coordinator) {}
-    ~TtsPreemptionLease() {
-        if (coordinator_)
-            coordinator_->release();
-    }
-
-    TtsPreemptionLease(const TtsPreemptionLease&) = delete;
-    TtsPreemptionLease& operator=(const TtsPreemptionLease&) = delete;
-
-   private:
-    TtsPreemptionCoordinator* coordinator_;
-};
-
 struct Server::Impl {
     EngineRegistry& models;
     ServerConfig config;
     std::unique_ptr<httplib::Server> server;
     std::atomic<uint64_t> request_id{1};
-    TtsPreemptionCoordinator tts_preemption;
 
     Impl(EngineRegistry& engines, ServerConfig config)
         : models(engines), config(std::move(config)) {
-        if (this->config.preempt_tts && this->config.threads < 2) {
-            throw std::invalid_argument(
-                "tts.preempt requires at least two HTTP workers (http.threads >= 2)");
+        if (this->config.preempt_tts) {
+            std::cerr << "[nemo_http] tts.preempt is ignored: TTS synthesis is no longer "
+                         "serialized, so concurrent requests share one wave rather than "
+                         "cancelling each other\n";
         }
         const bool has_cert = !this->config.tls_certificate.empty();
         const bool has_key = !this->config.tls_private_key.empty();
@@ -734,38 +683,15 @@ struct Server::Impl {
                 if (format != "wav" && format != "pcm")
                     throw std::invalid_argument("response_format must be wav or pcm");
 
-                uint64_t generation = 0;
-                if (this->config.preempt_tts) {
-                    generation = this->tts_preemption.claim();
-                    if (generation == 0) {
-                        fail(response, 409, "TTS synthesis was canceled by a newer request");
-                        return;
-                    }
-                }
-                TtsPreemptionLease lease(
-                    this->config.preempt_tts ? &this->tts_preemption : nullptr);
                 std::string pcm;
-                tts::SynthesisResult result;
-                try {
-                    result = synthesizer->synthesize(
-                        synthesis, [&](const auto&, const std::string& chunk) {
-                            if (this->config.preempt_tts &&
-                                this->tts_preemption.superseded(generation)) {
-                                return false;
-                            }
-                            pcm += chunk;
-                            return true;
-                        });
-                }
-                catch (const std::exception&) {
-                    if (this->config.preempt_tts && this->tts_preemption.superseded(generation)) {
-                        fail(response, 409, "TTS synthesis was canceled by a newer request");
-                        return;
-                    }
-                    throw;
-                }
-                if (this->config.preempt_tts && this->tts_preemption.superseded(generation)) {
-                    fail(response, 409, "TTS synthesis was canceled by a newer request");
+                // Concurrent requests share one wave, so this one simply runs.
+                const tts::SynthesisResult result = synthesizer->synthesize(
+                    synthesis, [&](const auto&, const std::string& chunk) {
+                        pcm += chunk;
+                        return true;
+                    });
+                if (result.cancelled) {
+                    fail(response, 499, "TTS synthesis was cancelled");
                     return;
                 }
                 if (this->config.tts_benchmark) {

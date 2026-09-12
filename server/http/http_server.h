@@ -22,6 +22,9 @@ struct ServerConfig {
     // Emit per-request TTS runtime timings to stderr.
     bool tts_benchmark = false;
     // Keep only the latest HTTP TTS request; newer requests cancel older synthesis.
+    // Ignored. It existed because synthesis was serialized and a newer request
+    // could only start by cancelling the one in flight; they now share a wave.
+    // Kept so configurations that set it still load.
     bool preempt_tts = false;
     std::string tls_certificate;
     std::string tls_private_key;
