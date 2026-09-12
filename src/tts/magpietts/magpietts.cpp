@@ -252,6 +252,56 @@ advance_chunk_state(
 // there chunk N's text really does depend on chunk N-1's decode -- so it passes
 // required_history = 0 and keeps longform_history_tokens >= 0.
 std::vector<int>
+plan_session_admission(
+    const std::vector<MagpieSessionDemand>& sessions, const std::vector<int>& lanes,
+    size_t& turn) {
+    std::vector<int> owner(lanes.size(), -1);
+    if (sessions.empty() || lanes.empty()) {
+        return owner;
+    }
+    std::vector<size_t> left(sessions.size());
+    for (size_t i = 0; i < sessions.size(); ++i) {
+        left[i] = sessions[i].pending;
+    }
+    size_t filled = 0;
+
+    // Anything with nothing in flight, in index order, one chunk each: enough to
+    // get a lane, not enough to take the wave.
+    for (size_t i = 0; i < sessions.size() && filled < lanes.size(); ++i) {
+        if (sessions[i].occupied || left[i] == 0) {
+            continue;
+        }
+        owner[filled++] = (int)i;
+        --left[i];
+    }
+
+    // The rest round robin from wherever the cursor left off: one lane per
+    // session per pass, so a session with a long queue cannot outrun a short one
+    // until the short one is exhausted.
+    size_t last = turn;
+    while (filled < lanes.size()) {
+        bool any = false;
+        for (size_t step = 0; step < sessions.size() && filled < lanes.size(); ++step) {
+            const size_t i = (turn + step) % sessions.size();
+            if (left[i] == 0) {
+                continue;
+            }
+            owner[filled++] = (int)i;
+            --left[i];
+            last = i;
+            any = true;
+        }
+        if (!any) {
+            break;
+        }
+    }
+    // Resume after whoever was served last, so the next burst does not start
+    // with the same session every time.
+    turn = (last + 1) % sessions.size();
+    return owner;
+}
+
+std::vector<int>
 plan_wave_admission(const std::vector<char>& lane_idle, size_t pending, int threshold) {
     std::vector<int> lanes;
     if (pending == 0) {
@@ -2136,28 +2186,39 @@ stream_magpie_to_audio(
             }
             const int admit_threshold = std::max(2, probe_lanes / 8);
 
-            // Round robin, so no session can hold every lane.
+            // Who gets each idle lane: sessions with nothing in flight first, so
+            // a new request reaches first audio without waiting out the ones
+            // already decoding, then round robin so none can hold the wave.
             size_t turn = 0;
             auto fill = [&](const std::vector<int>& free_lanes) -> bool {
+                std::vector<MagpieSessionDemand> demand(sessions.size());
+                for (size_t i = 0; i < sessions.size(); ++i) {
+                    demand[i].pending = sessions[i]->chunk_ids.size() - sessions[i]->next_chunk;
+                }
+                for (int l = 0; l < probe_lanes; ++l) {
+                    const WaveLane& held = engine.lane[(size_t)l];
+                    if (!held.live()) {
+                        continue;
+                    }
+                    for (size_t i = 0; i < sessions.size(); ++i) {
+                        if (held.session == sessions[i].get()) {
+                            demand[i].occupied = true;
+                        }
+                    }
+                }
+                const std::vector<int> owner =
+                    plan_session_admission(demand, free_lanes, turn);
                 std::vector<WaveAdmission> admissions;
-                for (int l : free_lanes) {
-                    bool placed = false;
-                    for (size_t tried = 0; tried < sessions.size() && !placed; ++tried) {
-                        WaveSession& who = *sessions[(turn + tried) % sessions.size()];
-                        if (who.next_chunk >= who.chunk_ids.size()) {
-                            continue;
-                        }
-                        if (!who.prepare_chunk(who.next_chunk)) {
-                            return false;
-                        }
-                        admissions.push_back(WaveAdmission{&who, who.next_chunk, l});
-                        ++who.next_chunk;
-                        turn = (turn + tried + 1) % sessions.size();
-                        placed = true;
+                for (size_t j = 0; j < free_lanes.size(); ++j) {
+                    if (owner[j] < 0) {
+                        continue;
                     }
-                    if (!placed) {
-                        break;
+                    WaveSession& who = *sessions[(size_t)owner[j]];
+                    if (!who.prepare_chunk(who.next_chunk)) {
+                        return false;
                     }
+                    admissions.push_back(WaveAdmission{&who, who.next_chunk, free_lanes[j]});
+                    ++who.next_chunk;
                 }
                 if (admissions.empty()) {
                     return true;

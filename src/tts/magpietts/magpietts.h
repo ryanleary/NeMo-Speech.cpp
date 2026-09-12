@@ -171,6 +171,30 @@ MagpieChunkPlan plan_text_chunk(
 std::vector<int> plan_wave_admission(
     const std::vector<char>& lane_idle, size_t pending, int threshold);
 
+// What one request wants from the engine right now.
+struct MagpieSessionDemand {
+    // Chunks it has ready to admit but has not placed in a lane.
+    size_t pending = 0;
+    // Whether any lane is currently carrying one of its chunks. A session with
+    // none is either brand new or has gone quiet waiting for a lane, and in
+    // either case has nothing in flight to hide the wait behind.
+    bool occupied = false;
+};
+
+// Which session fills each idle lane. Pure: no model state, no device work.
+//
+// Returns one session index per entry of `lanes`, or -1 where nothing wants it.
+// `turn` carries the round-robin cursor between calls so no session can hold
+// every lane -- it is read and updated.
+//
+// Sessions with nothing in flight are served first. Time to first audio is a
+// property of a request's FIRST chunk only; once it has a lane, its later
+// chunks are pipelined behind audio already playing and can wait for a burst.
+// So letting an unoccupied session jump the queue buys latency where it is
+// visible and costs throughput only where it is not.
+std::vector<int> plan_session_admission(
+    const std::vector<MagpieSessionDemand>& sessions, const std::vector<int>& lanes, size_t& turn);
+
 class MagpieStreamingRuntime {
    public:
     MagpieStreamingRuntime();
