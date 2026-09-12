@@ -172,6 +172,34 @@ So 128 lanes is the right answer only when 128 requests are actually in flight.
 For a realtime operating point, size the wave to the concurrency the service is
 provisioned for and no wider.
 
+### Herds and backlogs
+
+A node coming online against a full queue sees a herd, and keeps seeing one
+until the backlog drains. Mixed-size requests (1-40 sentences), all submitted at
+once, first audio p50/p95/p99:
+
+| lanes | 64 requests | 128 requests |
+|---|---|---|
+| 32 | 181.0x, 788/9073/9130 | 177.7x, 9705/39380/41066 |
+| 48 | 205.9x, 549/2438/2452 | 202.1x, 2691/26304/27513 |
+| 64 | **216.5x**, 659/814/824 | 210.1x, 1356/17767/23434 |
+
+Throughput holds up under a herd -- 210-216x, at or above what a matched,
+non-backlogged load gets. What does not hold up is first audio for requests
+beyond the wave's width, and that is arithmetic rather than scheduling: 128
+requests averaging ~74 s of audio is 9540 s of work, which at 210x is 45 s no
+matter how it is ordered, so the back of the queue waits ~23 s to be heard. The
+scheduler's job there is to not make it worse, and the p50 says it does not.
+
+The one real choice is width. 32 lanes is undersized for a backlog -- it loses
+both ways, 177.7x with a 9.7 s p50, because it cannot hold enough work to
+amortise a step. 48 and 64 both hold; 64 is better on every measure at these
+sizes. Above the width, extra concurrency costs queue wait and nothing else.
+
+So a node draining a backlog wants its wave sized to the concurrency it intends
+to hold, and should let the rest queue: widening past that trades first audio
+for nothing, and narrowing below it gives up throughput as well as latency.
+
 ### The admission window
 
 `tts.admission-window-ms` (default 2) and `tts.admission-window-max-ms`
