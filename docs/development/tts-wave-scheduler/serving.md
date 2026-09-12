@@ -1,171 +1,123 @@
 # Serving many requests through one wave
 
-Status as of 2026-09-12, branch `perf/continuous-batching`. The decode engine
-serves concurrent requests and the throughput claim is measured; what is missing
-is audio output for more than one of them at a time. This is a handoff: what is
-done, what the numbers are, and the one decision that gates the rest.
+Status as of 2026-09-12, branch `perf/continuous-batching`. Concurrent requests
+share one wave and one codec thread, and the serialization they used to queue on
+is gone. This is where that stands, what it measures, and what is left.
 
 Read [continuous-batching.md](continuous-batching.md) first — this builds
 directly on the lane model it describes.
 
-## The problem
+## What the shape is now
 
-Every request from every frontend serializes on `std::lock_guard(mutex_)` at
-`runtime.cpp:162`. One `Synthesizer` is shared by gRPC, HTTP and the speech
-translator (`engine_registry.cpp:93`); there is no pool. A paragraph request is
-5 chunks / 25 s of audio at **55x realtime**, because 5 chunks means 4 lanes and
-the fixed cost is amortised over 25 s. Under load the Nth request waits N x
-0.45 s.
+A request thread tokenizes, builds a `WaveSession`, submits it, and waits. It
+touches no device state. Everything the session needs — encoding its chunks,
+prefilling them into lanes, stepping, handing frames to the codec — happens on
+the engine thread, and the codec decodes for every session from one more. So
+the MagpieTTS backend sees one caller and NanoCodec sees one caller, regardless
+of how many requests are in flight, which is the same concurrency a single
+request has always run at.
 
-The decode path was never the obstacle. Lanes are independent and chunks are
-admitted mid-run; the scheduler simply sat inside a per-request function.
-
-## What is done
-
-| commit | |
+| | |
 |---|---|
-| `aeed9d3` | every item of a batched round gets its own voice, cfg, temperature, top-k, seed, frame index |
-| `a8bfe52` | `WaveSession` — one request's chunks, conditioning, cursors, sinks |
-| `d1115bd` | `WaveEngine` — lanes, runtime, guidance pair, RNG position |
-| `d5c11c7` | multi-session decode probe (`MAGPIE_MULTI_SESSION=N`) |
-| `2c7a6e4` | `plan_session_admission` — which request fills each idle lane |
+| `codec_channel` | one session's convolution state, the graph around it, its queue and its audio sink. Pooled in the workspace, because a graph costs a backend capture |
+| `codec_stream_worker` | one thread, round-robin over the channels with a chunk ready |
+| `MagpieWaveService` | the wave, the thread driving it, the queue of sessions waiting for lanes |
+| `MagpieStreamingWorkspace::gate` | shared for requests that can share the wave, exclusive for anything that drives the decoder from its own thread |
 
-A lane holds a `(session, item)` pair and the engine reads **no** request
-parameters directly: it asks the lane's owner which voice to open with, which
-settings to sample with, and who gets the frame. That is the whole multi-tenant
-contract. `grep -c "params\."` inside `struct WaveEngine` returns only
-`hparams` hits.
+The gate is what replaces `runtime.cpp`'s lock. Holding it exclusively also
+parks the engine, because a session only exists while its request holds the
+shared side — so the sequential path and the one-time setup are safe without
+either of them knowing the engine exists.
 
-## The measurement that matters
+## What it measures
 
-`MAGPIE_MULTI_SESSION=N` runs N independent sessions through one engine, round
-robin, counting frames and dropping audio. Each session gets the whole input, so
-N is N identical requests arriving at once. Paragraph-sized sessions (5 chunks),
-decode only, GB300:
+Identical paragraph requests (5 chunks, 25 s of audio), submitted at the same
+moment through one synthesizer, end to end on a GB300:
 
-| sessions | 32 lanes | occ | 128 lanes | occ |
+| requests | 32 lanes | TTFA median | 128 lanes | TTFA median |
 |---|---|---|---|---|
-| 1 | 42.9x | 13% | | |
-| 4 | 149.2x | 49% | | |
-| 8 | 176.9x | 60% | | |
-| 16 | 222.5x | 79% | | |
-| 32 | **260.8x** | 98% | 300.3x | 60% |
-| 64 | 253.7x | 94% | 348.4x | 74% |
-| 128 | | | **376.5x** | 83% |
+| 1 | 60.9x | 71 ms | | |
+| 4 | 108.0x | 261 ms | | |
+| 16 | 169.5x | 388 ms | | |
+| 32 | **180.8x** | 862 ms | 176.8x | 1105 ms |
+| 64 | | | 197.0x | 1346 ms |
+| 128 | | | **207.4x** | 1826 ms |
 
-**Throughput tracks occupancy almost exactly.** That is what says the engine is
-indifferent to whose chunks it carries: one session leaves 87% of the lanes idle
-and gets 43x; filling the same lanes with 32 sessions gets 261x. Against the 55x
-a paragraph gets through the serialized path today, that is the payoff.
+Against **55x** through the serialized path, where the Nth caller also waited
+N × 0.45 s to start at all.
 
 ```bash
-MAGPIE_MULTI_SESSION=32 nemo-speech synthesize "<paragraph>" --device cuda \
-  --tts.batch-size 32 --tts.longform-history-tokens 20 --tts.chunk-frames 32 --verbose
+scripts/tts/serving-load.sh . 32
+CONCURRENCY="32 64 128" scripts/tts/serving-load.sh . 128
 ```
 
-## The decision that gates the rest
+Each request still produces its own audio, not a share of someone else's: mean
+duration per session is 25.05-25.19 s against the 25.17 s a solo run produces,
+across every row above. The spread is the lane-dependent arithmetic continuous
+batching already documents -- greedy sampling moves a code, and a chunk ends a
+frame earlier or later.
 
-**How the codec serves more than one session.** `codec_stream_state` and
-`codec_stream_graph` are borrowed by reference from the workspace
-(`magpietts.cpp`, the `codec_stream_worker` constructor), so two sessions would
-corrupt each other's convolution state immediately. Nothing can stream audio for
-two requests until this is settled.
+Chunk size barely moves it at 128 requests — 167x at 16 frames, 207x at 32,
+219x at 64, 203x at 128 — so the codec is no longer what bounds this. The
+decode-only probe reaches 376x at 128 sessions, so roughly half the gap between
+that and 207x is everything else in the end-to-end path.
 
-Spiked 2026-09-12 — codec throughput against chunk size, 150 chunks:
+## What is left
 
-| chunk_frames | codec | e2e | TTFA |
-|---|---|---|---|
-| 16 | 245.7x | 122.1x | 189 ms |
-| 32 | 338.3x | 139.9x | 262 ms |
-| 64 | 419.2x | 152.4x | 400 ms |
-| 128 | 474.6x | 159.1x | 707 ms |
-| 256 | 494.7x | 160.4x | 823 ms |
-
-The codec is **per-call-overhead bound**, saturating ~495x — the same shape the
-decoder's prefill had. So:
-
-1. One codec thread can outrun the decoder (495x vs 376x) *if* chunks are large.
-2. Large chunks destroy latency (823 ms TTFA at 256), so that ceiling is only
-   reachable in a configuration nobody serving interactively would pick.
-3. Batching B sessions into one call amortises the same overhead **without**
-   enlarging any session's chunk: cf=16 latency at cf=256 efficiency, worth
-   about **2x**.
-
-Three ways out, in increasing cost:
-
-- **One worker, N stream states.** Safe — keeps today's GPU concurrency of one
-  codec thread beside the decode thread. Caps the engine near 345x with the
-  small chunks a latency-sensitive server wants.
-- **N worker threads.** Needs the ggml backend's thread-safety for concurrent
-  graph compute actually established, not assumed. Note one request already runs
-  two threads against the device (request thread on magpie, worker on NanoCodec)
-  — that is the current bound, and this raises it to N+1.
-- **Batched codec.** `decodeStream(state, graph, frames, threads, audio)` is one
-  state, one graph, one stream, and there is no batch axis anywhere in the
-  NanoCodec model. Adding one means threading a lane dimension through the conv
-  stack with per-lane conv caches — the same shape of work the wave decoder's
-  lane axis took, which was many commits. Worth ~2x.
-
-## What remains
-
-1. **Engine thread and submission queue.** The policy exists
-   (`plan_session_admission`); what is missing is the thread and sessions
-   arriving asynchronously. The engine thread must never block on a session:
-   today `drain_item` calls `codec_worker.write_frame`, which waits on a
-   condition variable, from inside the step loop — one backpressured session
-   would stall every lane. Invert it so the codec pulls.
-2. **Delete the serialization.** `runtime.cpp:162`'s `lock_guard`, and the
-   per-request reset in `MagpieStreamingWorkspace::beginRequest`, which clears
-   KV caches, codec stream state and resizes the CUDA sampler.
-3. **Cancellation and errors.** Pre-existing and load-critical.
+1. **Shrinking the wave.** It only grows. It is sized from everything queued and
+   running when it opens, and growing means rebuilding the captured graph, which
+   needs the wave empty — so a burst that arrives while a narrow wave is busy
+   waits for it to drain, once. A wave that has widened for load never narrows
+   again, which costs a later lone request the wide steps it does not need.
+   This is the other half of "size the wave to demand".
+2. **TTFA under load.** 71 ms alone against 862 ms at 32 concurrent requests.
+   Two causes, both structural: a step costs time proportional to lane count, so
+   the `chunk_frames` steps before first audio cost more in a wide wave; and 32
+   requests are ~160 chunks queueing for 32 lanes. Admission already serves
+   sessions with nothing in flight first (`plan_session_admission`), which is
+   what keeps the minimum at ~340 ms rather than the median.
+3. **Cancellation.** Still pre-existing and load-critical.
    `SynthesisResult::cancelled` is dead code — `synthesizer.cpp:218` sets it but
    `runtime.cpp:214` throws first, so `speech_translator.cpp:108`'s branch is
    unreachable. gRPC maps a client cancel to `INTERNAL` because `map_exception`
-   fires before the `IsCancelled()` checks. The codec worker's real failure
-   reason goes to stderr and only a bool survives `join()`. Model the fix on
-   `MicroBatcher`'s `promise.set_exception` fan-out in `src/asr/batching.h`.
-4. **Sizing the wave to demand.** See the TTFA note below.
-5. **Concurrency tests.** A deterministic single-threaded drive mode — `step()`
-   called by the test, no engine thread — is what makes multi-session behaviour
-   testable without timing flakiness.
+   fires before the `IsCancelled()` checks. A session now carries a
+   `fail_reason`, which is the seam to hang a proper terminal state on; model
+   the fan-out on `MicroBatcher`'s `promise.set_exception` in
+   `src/asr/batching.h`.
+4. **`TtsPreemptionCoordinator`** (`http_server.cpp:326`) exists only because
+   synthesis was serialized — its own comment says so. It should be
+   reconsidered now that it is not.
+5. **Deterministic concurrency tests.** `MagpieWaveService::drive_once` is
+   already the single-threaded drive mode this needs; what is missing is a test
+   that can run it without a model.
 
-Follow `src/asr/batching.h` for config style (`BatchingConfig::Register`,
-`asr.batching.*` → a `tts.batching.*` block) and for exception fan-out. Do **not**
-reuse `MicroBatcher` itself: it is request-to-single-result and synthesis is a
-long-lived generator. It is the right shape for one decode step, which is how
-ASR uses it.
+## An intermittent failure, now reportable
 
-## Open regression: TTFA
-
-Dropping the solo chunk-0 pass in `d1115bd` cost first-audio latency:
-
-| | before | after |
-|---|---|---|
-| paragraph, 32 lanes | 71 ms | 118 ms |
-| 150 chunks, 128 lanes | 63 ms | 452 ms |
-
-It had to go — an engine outliving a request cannot tear its runtime down — and
-its original rationale had already expired, since the reorder buffer streams the
-head chunk's frames as they are produced. But the cost is structural: first audio
-needs `chunk_frames` decode steps and a step costs time proportional to lane
-count.
-
-`chunk_frames` trades one for the other and is already per-session (a paragraph
-at 32 lanes gives 118 ms / 60x at 32 frames, 52 ms / 44x at 4) but does not close
-the gap at 128 lanes, where the wide prefill and wide steps dominate. **Sizing
-the wave to demand** — start narrow, widen as load arrives — is the real answer
-and belongs with the engine thread. Note the lane cap already refuses to make a
-wave wider than half the pending chunks, for a related reason.
+8 of 128 concurrent requests failed once at `chunk-frames 16`, with no
+diagnostic beyond "MagpieTTS synthesis failed": the engine thread is shared, so
+the thread that hits an error is never the one that reports it. A session now
+carries the reason and the request prints it. Not reproduced in five runs since.
+If it returns it will say which of the two ways a session can leave the engine
+it took.
 
 ## Gotchas
 
 - `scripts/tts/greedy-hashes.sh` runs the **sequential** path and passes no
   `--tts.batch-size`, so it cannot see a wave regression. Use
-  `scripts/tts/wave-hashes.sh` for that.
+  `scripts/tts/wave-hashes.sh` for that. Both still hold exactly: the whole of
+  this work is gated on producing the same bits from a lane table that outlives
+  the request.
 - Byte-identity is not available for anything that reassigns lanes: the batched
-  arithmetic depends on which lane a chunk occupies. Gate on reproducibility,
-  duration, per-chunk step counts and the sequential hashes.
-- `nemo-speech` is a thin CLI over `libnemo_speech_tts.so.1`. Prove the built arm
-  by symbol, not by which directory you are in.
-- The engine's `idle_codes` exists so a lane no chunk has reached yet still has
-  in-range tokens; the graph decodes every lane either way.
+  arithmetic depends on which lane a chunk occupies. Two requests sharing a wave
+  is exactly that. Gate concurrent behaviour on reproducibility, per-session
+  duration and chunk counts, and the sequential hashes.
+- Sizing the wave one session at a time looks right and is not: it fits the
+  first arrival and then never grows, because every later session finds the wave
+  busy and waits. It measures identically to the lock it replaced — flat
+  throughput at every concurrency, with first-audio latency climbing linearly.
+  Size it from the whole queue.
+- `nemo-speech` is a thin CLI over `libnemo_speech_tts.so.1`. Prove the built
+  arm by symbol, not by which directory you are in.
+- The PCM callback runs on the codec thread, not the request thread. With N
+  sessions that is N callbacks from one thread, one per channel, and each
+  request's `Pcm16Resampler` state stays its own.
