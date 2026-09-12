@@ -2346,6 +2346,10 @@ struct MagpieWaveService {
     int capacity = 0;
     int budget = 0;
     bool opened = false;
+    // Set when the wave has to be rebuilt to fit what is waiting. Nothing new
+    // is admitted while it is, so the chunks already in lanes run out and the
+    // wave empties -- a wait of one chunk, not of one request.
+    bool growing = false;
     int admit_threshold = 2;
     size_t turn = 0;
 
@@ -2358,6 +2362,10 @@ struct MagpieWaveService {
     std::vector<WaveSession*> active;
     std::thread thread;
     bool stopping = false;
+    // Taking no new work but still finishing what it has. Shutting an engine
+    // down under the requests inside it would fail audio that was about to be
+    // delivered.
+    bool draining = false;
     bool running = false;
 
     void start() {
@@ -2370,11 +2378,22 @@ struct MagpieWaveService {
         thread = std::thread(&MagpieWaveService::run, this);
     }
 
-    void stop() {
+    // Refuse new sessions, let the ones in flight finish, then stop the thread.
+    // `grace` bounds the wait: past it, whatever is left is failed rather than
+    // hanging a shutdown forever on a wedged session.
+    void stop(std::chrono::seconds grace = std::chrono::seconds(60)) {
         {
-            std::lock_guard<std::mutex> lock(mu);
+            std::unique_lock<std::mutex> lock(mu);
             if (!running) {
                 return;
+            }
+            draining = true;
+            const bool drained = settled.wait_for(
+                lock, grace, [&] { return active.empty() && queued.empty(); });
+            if (!drained) {
+                fprintf(
+                    stderr, "serve: %zu sessions did not finish within the shutdown grace period\n",
+                    active.size() + queued.size());
             }
             stopping = true;
         }
@@ -2384,6 +2403,7 @@ struct MagpieWaveService {
         }
         std::lock_guard<std::mutex> lock(mu);
         running = false;
+        draining = false;
         if (opened) {
             engine.close();
             opened = false;
@@ -2396,7 +2416,9 @@ struct MagpieWaveService {
     bool submit(WaveSession& session) {
         {
             std::lock_guard<std::mutex> lock(mu);
-            if (stopping || !running) {
+            if (stopping || draining || !running) {
+                session.fail_reason = "the engine is shutting down";
+                session.status = WaveSession::failed;
                 return false;
             }
             session.status = WaveSession::queued;
@@ -2466,16 +2488,19 @@ struct MagpieWaveService {
             std::max(lanes, lanes_for(pending, active.size() + queued.size()));
 
         if (opened && (want_lanes > lanes || want_capacity > capacity || want_budget > budget)) {
-            if (!active.empty() || engine.live_lanes() > 0) {
-                // Let the wave drain so it can be rebuilt to fit. What is
-                // running finishes normally; nothing new is taken meanwhile.
-                // This happens once, when load first arrives -- the wave only
-                // ever grows, so afterwards the engine stays at its serving
-                // width.
+            if (engine.live_lanes() > 0) {
+                // Wait only for the chunks already in lanes, not for the
+                // requests that own them. Waiting for a whole request would
+                // hold every later arrival for a full synthesis; waiting for
+                // its current chunk holds them for a fraction of one. Sessions
+                // already admitted keep their place and carry on afterwards
+                // with whatever chunks they have left.
+                growing = true;
                 return true;
             }
             engine.close();
             opened = false;
+            growing = false;
         }
         if (!opened) {
             lanes = std::max(1, want_lanes);
@@ -2573,6 +2598,8 @@ struct MagpieWaveService {
             }
         }
         done.clear();
+        // Wakes both the submitters and a shutdown waiting for the last
+        // session to leave.
         settled.notify_all();
     }
 
@@ -2592,8 +2619,11 @@ struct MagpieWaveService {
         for (WaveSession* s : active) {
             pending += s->chunk_ids.size() - s->next_chunk;
         }
+        // While the wave is being rebuilt it admits nothing: emptying it is the
+        // whole point of the wait.
         const std::vector<int> free_lanes =
-            plan_wave_admission(engine.idle_mask(), pending, admit_threshold);
+            growing ? std::vector<int>()
+                    : plan_wave_admission(engine.idle_mask(), pending, admit_threshold);
         if (!free_lanes.empty()) {
             if (!fill(free_lanes)) {
                 return false;
@@ -2653,7 +2683,7 @@ struct MagpieWaveService {
                 wake.wait_for(lock, std::chrono::milliseconds(1), [&] { return stopping; });
             }
         }
-        fail_all(nullptr);
+        fail_all("the engine stopped with work still in it");
     }
 
     // Release everyone still waiting. Nothing will decode for them now.

@@ -90,6 +90,7 @@ print_synthesize_help(const char* program) {
         "                            aggregate realtime factor and first-audio spread\n"
         "  --arrival-ms N            Stagger those requests N ms apart instead\n"
         "  --cancel-after-ms N       Stop reading audio after N ms, as a client hanging up\n"
+        "  --rounds N                Repeat the concurrent burst N times in one process\n"
         "  --no-warmup               Skip warmup\n"
         "  --force                   Replace an existing WAV\n",
         program);
@@ -122,6 +123,7 @@ command_synthesize(int argc, char** argv) {
         int concurrency = 1;
         int arrival_ms = 0;
         int cancel_after_ms = 0;
+        int rounds = 1;
         bool force = false;
         bool warmup = true;
         int output_rate = 0;
@@ -144,6 +146,8 @@ command_synthesize(int argc, char** argv) {
                 arrival_ms = std::stoi(value(i, arg));
             else if (arg == "--cancel-after-ms")
                 cancel_after_ms = std::stoi(value(i, arg));
+            else if (arg == "--rounds")
+                rounds = std::stoi(value(i, arg));
             else if (arg == "--magpie-model")
                 parsed.runtime.magpie_model = value(i, arg);
             else if (arg == "--codec-model")
@@ -273,6 +277,7 @@ command_synthesize(int argc, char** argv) {
                 nemo_speech::tts::SynthesisResult result;
                 std::string error;
             };
+          for (int round = 0; round < std::max(1, rounds); ++round) {
             std::vector<load_result> runs((size_t)concurrency);
             std::vector<std::thread> threads;
             const auto load_start = std::chrono::steady_clock::now();
@@ -359,9 +364,9 @@ command_synthesize(int argc, char** argv) {
                 }
                 std::fprintf(
                     stderr,
-                    "%d concurrent requests, %d failed: %.1f s of audio in %.2f s = %.1fx "
-                    "realtime; first audio min/median/max %.0f/%.0f/%.0f ms\n",
-                    concurrency, failures, audio_s, load_wall_s,
+                    "round %d: %d concurrent requests, %d failed: %.1f s of audio in %.2f s = "
+                    "%.1fx realtime; first audio min/median/max %.0f/%.0f/%.0f ms\n",
+                    round + 1, concurrency, failures, audio_s, load_wall_s,
                     load_wall_s > 0.0 ? audio_s / load_wall_s : 0.0,
                     ttfa.empty() ? 0.0 : ttfa.front(),
                     ttfa.empty() ? 0.0 : ttfa[ttfa.size() / 2],
@@ -371,6 +376,7 @@ command_synthesize(int argc, char** argv) {
                 throw std::runtime_error("one or more concurrent requests failed");
             pcm = std::move(runs.front().pcm);
             result = runs.front().result;
+          }
         } else {
             const auto started = std::chrono::steady_clock::now();
             result = synthesizer->synthesize(request, [&](const auto&, const std::string& chunk) {
