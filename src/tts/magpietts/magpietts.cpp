@@ -1744,8 +1744,32 @@ stream_magpie_to_audio(
             // the local transformer's composed chain are built once rather than
             // once per group, and a lane whose chunk has finished can be refilled
             // in place -- which is what continuous batching needs.
+            // Lanes are capped below the chunk count, not at it. A wave with a lane
+            // per chunk admits everything at once and never refills, which is
+            // exactly the single-cohort behaviour continuous batching exists to
+            // remove -- it pays max(steps) over the whole run. Measured at 37
+            // chunks: 32 lanes gives 122x realtime and 37 lanes gives 86x.
+            //
+            // Above the floor, half the chunks is the cap: more lanes always win
+            // on throughput -- the per-step cost is mostly fixed, so widening
+            // amortises it -- until so few chunks are left over that the last
+            // arrivals have nothing to hide behind. At 149 chunks that is 74
+            // lanes rather than 128. Below the floor the cap does not apply,
+            // because at small chunk counts the parallelism is worth more than
+            // the refill: 37 chunks prefer 32 lanes to 18.
+            constexpr int kWaveLaneFloor = 32;
+            const size_t wave_pending = chunk_ids.size() > 1 ? chunk_ids.size() - 1 : 0;
+            // Never more lanes than chunks to put in them: the opening admission
+            // fills every lane, and a lane that never receives a chunk has no
+            // state for a step to read.
             const int wave_lanes =
-                chunk_ids.size() > 1 ? (int)std::min((size_t)wave_width, chunk_ids.size() - 1) : 0;
+                wave_pending > 0
+                    ? (int)std::min(
+                          (size_t)wave_width,
+                          std::min(
+                              wave_pending,
+                              std::max((size_t)kWaveLaneFloor, wave_pending / 2)))
+                    : 0;
 
             // The CUDA sampler seeds every draw with (seed, frame_index,
             // round*width + item). A group-local step index would make each
