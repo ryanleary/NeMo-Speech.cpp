@@ -1347,6 +1347,11 @@ struct WaveSession {
     // Cursors: the next chunk to admit, and the next to hand the codec.
     size_t next_chunk = 0;
     size_t next_drain = 0;
+    // Count frames and drop them instead of streaming them. Lets several
+    // sessions share one engine before per-session codec state exists, which is
+    // what the decode-throughput measurement needs.
+    bool discard_audio = false;
+    int64_t discarded_frames = 0;
 
     // Collect the non-empty chunks and the widest window they can need. Cheap:
     // no encoding, just enough to size the run.
@@ -1490,6 +1495,11 @@ struct WaveSession {
     // single in-order stream stays in order while the chunk is still being
     // decoded -- that is what keeps first audio early.
     bool drain_item(WaveItem& item) {
+        if (discard_audio) {
+            discarded_frames += (int64_t)item.frames.size();
+            item.frames.clear();
+            return true;
+        }
         for (const std::vector<int32_t>& frame : item.frames) {
             if (!code_writer.write_frame(frame) || !codec_worker.write_frame(frame)) {
                 fprintf(stderr, "failed to write streamed codec frame\n");
@@ -1510,6 +1520,9 @@ struct WaveSession {
         }
         if (!drain_item(item)) {
             return false;
+        }
+        if (discard_audio) {
+            return true;
         }
         if (!last_chunk) {
             const int silence_frames = boundary_silence_dist(boundary_silence_rng);
@@ -2083,6 +2096,140 @@ stream_magpie_to_audio(
         // graph. This needs a pinned history (gated at entry): the adaptive rule
         // derives chunk N's text window from chunk N-1's alignment, and a wave
         // has not decoded chunk N-1 when it plans chunk N.
+        // Decode-throughput probe: run N independent sessions through ONE engine,
+        // counting frames and dropping audio. It exists to answer the question
+        // serving turns on -- does a wave shared between unrelated requests
+        // sustain its aggregate rate -- before per-session codec state makes
+        // real concurrent output possible. Each session gets the whole input, so
+        // N sessions is N identical requests arriving at once.
+        if (use_wave && getenv("MAGPIE_MULTI_SESSION")) {
+            const int n_sessions = std::max(1, atoi(getenv("MAGPIE_MULTI_SESSION")));
+            const int probe_lanes = std::max(1, wave_width);
+            std::vector<std::unique_ptr<WaveSession>> sessions;
+            std::vector<std::unique_ptr<stream_run_metrics>> session_metrics;
+            std::vector<std::unique_ptr<MagpiePinnedHostScratch>> session_staging;
+            std::vector<int> session_frames(n_sessions, 0);
+            int capacity = 0;
+            for (int i = 0; i < n_sessions; ++i) {
+                session_metrics.push_back(std::make_unique<stream_run_metrics>());
+                session_staging.push_back(std::make_unique<MagpiePinnedHostScratch>());
+                sessions.push_back(std::make_unique<WaveSession>(WaveSession{
+                    magpie, workspace.encoder, h, params, token_chunks, label,
+                    *session_metrics.back(), code_writer, codec_worker, *session_staging.back(),
+                    session_frames[(size_t)i], session_frames[(size_t)i], boundary_silence_rng,
+                    boundary_silence_dist}));
+                sessions.back()->discard_audio = true;
+                if (!sessions.back()->plan_chunks()) {
+                    return cancel_worker();
+                }
+                capacity = std::max(capacity, sessions.back()->text_capacity);
+            }
+
+            WaveEngine engine{magpie, workspace, decoder, local_sampler, label, params.verbose};
+            engine.threads = params.threads;
+            engine.idle_codes.assign(h.audio_codebooks, {});
+            for (int c = 0; c < h.audio_codebooks; ++c) {
+                engine.idle_codes[c].assign((size_t)h.frame_stacking_factor, h.audio_bos_id);
+            }
+            if (!engine.open(magpie, probe_lanes, capacity, max_decoder_positions + 1)) {
+                return cancel_worker();
+            }
+            const int admit_threshold = std::max(2, probe_lanes / 8);
+
+            // Round robin, so no session can hold every lane.
+            size_t turn = 0;
+            auto fill = [&](const std::vector<int>& free_lanes) -> bool {
+                std::vector<WaveAdmission> admissions;
+                for (int l : free_lanes) {
+                    bool placed = false;
+                    for (size_t tried = 0; tried < sessions.size() && !placed; ++tried) {
+                        WaveSession& who = *sessions[(turn + tried) % sessions.size()];
+                        if (who.next_chunk >= who.chunk_ids.size()) {
+                            continue;
+                        }
+                        if (!who.prepare_chunk(who.next_chunk)) {
+                            return false;
+                        }
+                        admissions.push_back(WaveAdmission{&who, who.next_chunk, l});
+                        ++who.next_chunk;
+                        turn = (turn + tried + 1) % sessions.size();
+                        placed = true;
+                    }
+                    if (!placed) {
+                        break;
+                    }
+                }
+                if (admissions.empty()) {
+                    return true;
+                }
+                if (!engine.admit(admissions)) {
+                    return false;
+                }
+                for (auto& who : sessions) {
+                    if (!who->drain_in_order()) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            const int64_t probe_start = ggml_time_us();
+            std::vector<int> all_lanes(probe_lanes);
+            for (int l = 0; l < probe_lanes; ++l) {
+                all_lanes[(size_t)l] = l;
+            }
+            if (!fill(all_lanes)) {
+                return cancel_worker();
+            }
+            for (;;) {
+                for (int l = 0; l < probe_lanes; ++l) {
+                    engine.retire_if_exhausted(engine.lane[(size_t)l]);
+                }
+                size_t pending = 0;
+                for (auto& who : sessions) {
+                    pending += who->chunk_ids.size() - who->next_chunk;
+                }
+                const std::vector<int> admit =
+                    plan_wave_admission(engine.idle_mask(), pending, admit_threshold);
+                if (!admit.empty()) {
+                    if (!fill(admit)) {
+                        return cancel_worker();
+                    }
+                    continue;
+                }
+                if (engine.live_lanes() == 0 && pending == 0) {
+                    break;
+                }
+                if (!engine.step()) {
+                    return cancel_worker();
+                }
+                for (auto& who : sessions) {
+                    if (!who->drain_in_order()) {
+                        return cancel_worker();
+                    }
+                }
+            }
+            const double elapsed_s = (double)(ggml_time_us() - probe_start) / 1.0e6;
+            int64_t total_frames = 0;
+            for (auto& who : sessions) {
+                total_frames += who->discarded_frames;
+            }
+            const double audio_s = (double)total_frames / codec_fps;
+            fprintf(
+                stderr,
+                "%s multi-session probe: %d sessions, %d lanes, %lld frames, audio %.1f s in "
+                "%.2f s = %.1fx realtime (occupancy %.1f%%, %d bursts)\n",
+                label, n_sessions, probe_lanes, (long long)total_frames, audio_s, elapsed_s,
+                audio_s / elapsed_s,
+                engine.steps > 0 ? 100.0 * (1.0 - (double)engine.idle_lane_steps /
+                                                      ((double)engine.steps * probe_lanes))
+                                 : 0.0,
+                engine.bursts);
+            engine.close();
+            codec_worker.cancel();
+            return true;
+        }
+
         if (use_wave) {
             WaveSession session{magpie,
                                 workspace.encoder,
