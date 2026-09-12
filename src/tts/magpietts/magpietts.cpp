@@ -1548,6 +1548,313 @@ struct WaveSession {
     }
 
     bool finished() const { return next_drain >= chunk_ids.size(); }
+
+    // What the engine has to ask a session rather than decide for itself. Once a
+    // wave carries chunks from several requests these differ lane by lane, so
+    // the engine reads them through the lane's owner.
+    int speaker() const { return params.speaker; }
+    int position_budget() const {
+        return (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
+    }
+    magpietts_cuda_sample_item sampling(const WaveItem& item, int frame_index) const {
+        magpietts_cuda_sample_item slot;
+        slot.seed = (uint64_t)(uint32_t)params.seed;
+        slot.cfg_scale = h.cfg_scale;
+        slot.temperature = h.temperature;
+        slot.top_k = h.top_k;
+        slot.frame_index = frame_index;
+        // The chunk's opening frames are its own, so the floor that stops it
+        // ending before it has said anything is its own too.
+        slot.forbid_audio_eos = item.step * h.frame_stacking_factor < h.min_generated_frames;
+        return slot;
+    }
+};
+
+// A lane's occupant. The engine knows a chunk only through this pair, which is
+// what lets lanes of one wave belong to unrelated requests.
+struct WaveLane {
+    WaveSession* session = nullptr;
+    WaveItem* item = nullptr;
+
+    bool live() const { return item && !item->done; }
+    bool idle() const { return !item || item->done; }
+};
+
+// One chunk a session wants admitted.
+struct WaveAdmission {
+    WaveSession* session = nullptr;
+    size_t slot = 0;  // index into that session's plan
+    int lane = -1;
+};
+
+// The decode engine: one wave of fixed-width lanes, and the machinery to keep
+// them full. It owns the decoder runtime, the guidance pair the batched local
+// transformer reads, the lane table and the RNG stream position -- everything
+// that is one instance regardless of how many requests are in flight.
+//
+// It knows nothing about requests beyond what a lane's session answers when
+// asked: the voice to open a chunk with, the sampling settings to draw it with,
+// and what to do with a finished frame. That is the whole of the multi-tenant
+// contract.
+struct WaveEngine {
+    magpietts_model& magpie;
+    MagpieStreamingWorkspace& workspace;
+    const MagpieDecoder& decoder;
+    LocalCodebookSampler* local_sampler;
+    const char* label;
+    bool verbose = false;
+    int threads = 1;
+
+    // Fixed for the life of the engine: the decoder's captured graph, the cross
+    // arena it is built around, and the local transformer's composed chain all
+    // bake these in.
+    int lanes = 0;
+    int text_capacity = 0;
+    int position_budget = 0;
+
+    std::vector<WaveLane> lane;
+    // One [n_embd, lanes] pair carries the whole wave's guidance states.
+    // Allocated once: the composed chain bakes in both the width and these
+    // addresses, so reallocating would recompose it.
+    magpietts_backend_tensor cond;
+    magpietts_backend_tensor uncond;
+    // The RNG stream position, counted across everything this engine decodes.
+    int frame_index = 0;
+
+    int64_t idle_lane_steps = 0;
+    int64_t steps = 0;
+    int bursts = 0;
+
+    bool open(magpietts_model& model, int lane_count, int capacity, int budget) {
+        lanes = lane_count;
+        text_capacity = capacity;
+        position_budget = budget;
+        lane.assign((size_t)lanes, WaveLane{});
+        return cond.alloc2d(model, GGML_TYPE_F32, model.hparams.n_embd, lanes, "wave_hidden_cond") &&
+               uncond.alloc2d(
+                   model, GGML_TYPE_F32, model.hparams.n_embd, lanes, "wave_hidden_uncond");
+    }
+
+    void close() {
+        decoder.resetWave();
+        cond.reset();
+        uncond.reset();
+        lane.clear();
+    }
+
+    int idle_lanes(std::vector<int>* into = nullptr) const {
+        int n = 0;
+        for (int l = 0; l < lanes; ++l) {
+            if (lane[(size_t)l].idle()) {
+                ++n;
+                if (into) {
+                    into->push_back(l);
+                }
+            }
+        }
+        return n;
+    }
+
+    int live_lanes() const { return lanes - idle_lanes(); }
+
+    // One entry per lane, true where the lane has nothing live in it. This is
+    // what the admission policy reads.
+    std::vector<char> idle_mask() const {
+        std::vector<char> mask((size_t)lanes, 0);
+        for (int l = 0; l < lanes; ++l) {
+            mask[(size_t)l] = lane[(size_t)l].idle() ? 1 : 0;
+        }
+        return mask;
+    }
+
+    // The ring holds one opening plus the position budget and no more, so a
+    // chunk that has spent its budget is finished whether or not it has said so
+    // -- the decoder would refuse the next step. The budget is the session's,
+    // because a request may lower it with --steps.
+    void retire_if_exhausted(WaveLane& slot) {
+        if (!slot.live()) {
+            return;
+        }
+        const int budget = slot.session->position_budget();
+        if (slot.item->step < budget) {
+            return;
+        }
+        if (verbose) {
+            fprintf(
+                stderr, "%s wave chunk %zu hit the %d-step budget\n", label,
+                slot.item->chunk_index, budget);
+        }
+        slot.item->done = true;
+    }
+
+    // Open the given chunks into the given lanes, building the runtime if there
+    // is none. Step 0's guidance pair comes back in the same tensors every later
+    // step writes, so the chunks are sampled straight off the prefill.
+    bool admit(const std::vector<WaveAdmission>& admissions) {
+        if (admissions.empty()) {
+            return true;
+        }
+        const magpietts_hparams& mh = magpie.hparams;
+        std::vector<MagpieWavePrefillItem> opening(admissions.size());
+        std::vector<std::vector<float>> scores(admissions.size());
+        std::vector<char> collect(admissions.size(), 0);
+        std::vector<int> into(admissions.size());
+        for (size_t j = 0; j < admissions.size(); ++j) {
+            WaveSession& owner = *admissions[j].session;
+            WaveItem& item = *owner.plan[admissions[j].slot];
+            MagpieWavePrefillItem& slot = opening[j];
+            into[j] = admissions[j].lane;
+            slot.text_cond = &item.text_cond;
+            slot.text_cond_device = &item.text_cond_device;
+            slot.text_len = item.text_len;
+            slot.speaker = owner.speaker();
+            slot.audio_codes = &item.audio_codes;
+            slot.cross_kv = &item.cross_kv;
+            slot.prior = item.prior.priorForStep(mh, item.text_len);
+            if (item.prior.shouldCollect(mh, 0, item.text_len)) {
+                collect[j] = 1;
+                slot.alignment_scores = &scores[j];
+            }
+        }
+        const int64_t admit_start = ggml_time_us();
+        if (!decoder.prefillWave(
+                opening, into, lanes, threads, position_budget, text_capacity, &cond, &uncond)) {
+            fprintf(stderr, "%s wave prefill failed\n", label);
+            return false;
+        }
+        for (size_t j = 0; j < admissions.size(); ++j) {
+            WaveSession& owner = *admissions[j].session;
+            WaveItem& item = *owner.plan[admissions[j].slot];
+            // The encoder output and the chunk's own cross-K/V have done their
+            // only job: the text the wave attends over now lives in the
+            // runtime's arena.
+            item.text_cond_device.reset();
+            item.text_cond.clear();
+            item.text_cond.shrink_to_fit();
+            item.cross_kv.reset();
+            lane[(size_t)admissions[j].lane] = WaveLane{&owner, &item};
+        }
+        ++bursts;
+        if (verbose) {
+            fprintf(
+                stderr, "%s wave admit: %zu chunks into %d lanes, %.2f ms\n", label,
+                admissions.size(), lanes, (double)(ggml_time_us() - admit_start) / 1000.0);
+        }
+
+        // Step 0, sampled off the prefill's own hidden pair.
+        std::vector<int32_t> codes;
+        std::vector<int32_t> argmax;
+        if (!sample(codes, argmax)) {
+            return false;
+        }
+        for (size_t j = 0; j < admissions.size(); ++j) {
+            WaveSession& owner = *admissions[j].session;
+            WaveItem& item = *owner.plan[admissions[j].slot];
+            if (!owner.step_finish(
+                    item, scores[j], collect[j] != 0, codes, argmax, admissions[j].lane, lanes)) {
+                return false;
+            }
+            ++item.step;
+        }
+        return true;
+    }
+
+    // One batched sampler call for the whole wave: the local transformer runs
+    // its rounds once, with one slot per lane. Each lane's settings come from
+    // its own session.
+    bool sample(std::vector<int32_t>& codes, std::vector<int32_t>& argmax) {
+        const magpietts_hparams& mh = magpie.hparams;
+        std::vector<magpietts_cuda_sample_item> per_item((size_t)lanes);
+        for (int l = 0; l < lanes; ++l) {
+            const WaveLane& slot = lane[(size_t)l];
+            if (slot.item && slot.session) {
+                per_item[(size_t)l] = slot.session->sampling(*slot.item, frame_index);
+            } else {
+                per_item[(size_t)l].frame_index = frame_index;
+            }
+        }
+#if defined(MAGPIETTS_CUDA_SAMPLING)
+        if (!local_sampler->sampleCuda(
+                cond, uncond, true, mh.cfg_scale, mh.temperature, mh.top_k, false,
+                workspace.cudaSampler(), 0, frame_index, codes, argmax, lanes,
+                per_item.data())) {
+            return false;
+        }
+#else
+        (void)mh;
+        fprintf(
+            stderr, "wave decoding requires CUDA sampling, which was not compiled into this "
+                    "build\n");
+        return false;
+#endif
+        ++frame_index;
+        return true;
+    }
+
+    // One decode step over every lane, live or not: the graph is a fixed width,
+    // so a lane whose chunk has finished is decoded anyway and its result thrown
+    // away. What `live` buys is that its position stops advancing, so it cannot
+    // run past the ring.
+    bool step() {
+        const magpietts_hparams& mh = magpie.hparams;
+        std::vector<std::vector<float>> scores((size_t)lanes);
+        std::vector<char> collect((size_t)lanes, 0);
+        std::vector<MagpieWaveDecodeItem> slots((size_t)lanes);
+        for (int l = 0; l < lanes; ++l) {
+            WaveLane& held = lane[(size_t)l];
+            MagpieWaveDecodeItem& slot = slots[(size_t)l];
+            if (!held.item) {
+                // A lane no chunk has reached yet. It is decoded like any other
+                // and its result discarded; what it must not do is advance a
+                // position or be read as tokens.
+                slot.live = false;
+                slot.audio_codes = &idle_codes;
+                continue;
+            }
+            slot.audio_codes = &held.item->audio_codes;
+            slot.live = held.live();
+            if (!slot.live) {
+                continue;
+            }
+            slot.prior = held.item->prior.priorForStep(mh, held.item->text_len);
+            if (held.item->prior.shouldCollect(mh, held.item->step, held.item->text_len)) {
+                collect[(size_t)l] = 1;
+                slot.alignment_scores = &scores[(size_t)l];
+            }
+        }
+        const ggml_nvtx::range nvtx_step("magpietts_stream_wave_step");
+        // One slot more than the step budget: the prefill takes one and each
+        // step takes another, so at exactly the budget the last step finds the
+        // ring full.
+        if (!decoder.evalWave(slots, position_budget, text_capacity, &cond, &uncond)) {
+            fprintf(stderr, "%s wave decode step failed\n", label);
+            return false;
+        }
+        std::vector<int32_t> codes;
+        std::vector<int32_t> argmax;
+        if (!sample(codes, argmax)) {
+            return false;
+        }
+        ++steps;
+        for (int l = 0; l < lanes; ++l) {
+            WaveLane& held = lane[(size_t)l];
+            if (!held.live()) {
+                ++idle_lane_steps;
+                continue;
+            }
+            if (!held.session->step_finish(
+                    *held.item, scores[(size_t)l], collect[(size_t)l] != 0, codes, argmax, l,
+                    lanes)) {
+                return false;
+            }
+            ++held.item->step;
+        }
+        return true;
+    }
+
+    // Tokens for a lane no chunk has reached. Never read for meaning -- it only
+    // has to be in range, because the graph decodes every lane either way.
+    std::vector<std::vector<int32_t>> idle_codes;
 };
 
 static bool
@@ -1802,35 +2109,20 @@ stream_magpie_to_audio(
                     chunk_ids.size(), wave_width, params.longform_history_tokens);
             }
 
-            // Chunk 0 decodes alone. A wave only emits once its slowest member
-            // finishes, so waving from the start would hold the first audio back
-            // by the whole group -- 30 ms becomes 490 ms on a twenty-sentence
-            // script. The wave takes everything after it, where latency is
-            // already hidden behind the audio the codec is still playing out.
-            //
-            // Everything after chunk 0 then decodes in ONE runtime, whose width
-            // is fixed for the rest of the run. The decoder's captured graph and
-            // the local transformer's composed chain are built once rather than
-            // once per group, and a lane whose chunk has finished can be refilled
-            // in place -- which is what continuous batching needs.
-            // Lanes are capped below the chunk count, not at it. A wave with a lane
-            // per chunk admits everything at once and never refills, which is
-            // exactly the single-cohort behaviour continuous batching exists to
-            // remove -- it pays max(steps) over the whole run. Measured at 37
+            // Lanes are capped below the chunk count, not at it. A wave with a
+            // lane per chunk admits everything at once and never refills, which
+            // is exactly the single-cohort behaviour continuous batching exists
+            // to remove -- it pays max(steps) over the whole run. Measured at 37
             // chunks: 32 lanes gives 122x realtime and 37 lanes gives 86x.
             //
             // Above the floor, half the chunks is the cap: more lanes always win
             // on throughput -- the per-step cost is mostly fixed, so widening
             // amortises it -- until so few chunks are left over that the last
-            // arrivals have nothing to hide behind. At 149 chunks that is 74
-            // lanes rather than 128. Below the floor the cap does not apply,
-            // because at small chunk counts the parallelism is worth more than
-            // the refill: 37 chunks prefer 32 lanes to 18.
+            // arrivals have nothing to hide behind. Below the floor the cap does
+            // not apply, because at small chunk counts the parallelism is worth
+            // more than the refill: 37 chunks prefer 32 lanes to 18.
             constexpr int kWaveLaneFloor = 32;
-            const size_t wave_pending = chunk_ids.size() > 1 ? chunk_ids.size() - 1 : 0;
-            // Never more lanes than chunks to put in them: the opening admission
-            // fills every lane, and a lane that never receives a chunk has no
-            // state for a step to read.
+            const size_t wave_pending = chunk_ids.size();
             const int wave_lanes =
                 wave_pending > 0
                     ? (int)std::min(
@@ -1840,322 +2132,64 @@ stream_magpie_to_audio(
                               std::max((size_t)kWaveLaneFloor, wave_pending / 2)))
                     : 0;
 
-            // The CUDA sampler seeds every draw with (seed, frame_index,
-            // round*width + item). A group-local step index would make each
-            // group replay the previous group's uniforms, so this counts across
-            // the whole run.
-            int wave_frame_index = 0;
-            // Which chunk occupies each lane. A lane holds its chunk until
-            // another is admitted, so after the opening cohort no lane is ever
-            // empty -- a finished chunk is simply no longer live.
-            std::vector<WaveItem*> lane_of;
-            // One [n_embd, width] pair carries the whole wave's guidance states,
-            // which is what the batched local transformer reads. Allocated once
-            // per runtime: the composed chain bakes in both the width and these
-            // addresses, so reallocating it would recompose the chain.
-            magpietts_backend_tensor wave_cond;
-            magpietts_backend_tensor wave_uncond;
-
-            // Open the given chunks into the given lanes of a runtime `width`
-            // wide, building it if there is none. Step 0's guidance pair comes
-            // back in the same tensors every later step writes, so the chunks
-            // are sampled straight off the prefill.
-            auto admit_chunks = [&](int width, const std::vector<size_t>& chunks,
-                                    const std::vector<int>& into) -> bool {
-                std::vector<MagpieWavePrefillItem> opening(chunks.size());
-                std::vector<std::vector<float>> scores(chunks.size());
-                std::vector<char> collect(chunks.size(), 0);
-                for (size_t j = 0; j < chunks.size(); ++j) {
-                    WaveItem& item = *session.plan[chunks[j]];
-                    MagpieWavePrefillItem& slot = opening[j];
-                    slot.text_cond = &item.text_cond;
-                    slot.text_cond_device = &item.text_cond_device;
-                    slot.text_len = item.text_len;
-                    slot.speaker = params.speaker;
-                    slot.audio_codes = &item.audio_codes;
-                    slot.cross_kv = &item.cross_kv;
-                    slot.prior = item.prior.priorForStep(h, item.text_len);
-                    if (item.prior.shouldCollect(h, 0, item.text_len)) {
-                        collect[j] = 1;
-                        slot.alignment_scores = &scores[j];
-                    }
-                }
-                const int64_t admit_start = ggml_time_us();
-                if (!decoder.prefillWave(
-                        opening, into, width, params.threads, max_decoder_positions + 1,
-                        wave_text_capacity, &wave_cond, &wave_uncond)) {
-                    fprintf(stderr, "%s wave prefill failed\n", label);
-                    return false;
-                }
-                for (size_t j = 0; j < chunks.size(); ++j) {
-                    WaveItem& item = *session.plan[chunks[j]];
-                    // The encoder output and the chunk's own cross-K/V have done
-                    // their only job: the text the wave attends over now lives in
-                    // the runtime's arena.
-                    item.text_cond_device.reset();
-                    item.text_cond.clear();
-                    item.text_cond.shrink_to_fit();
-                    item.cross_kv.reset();
-                    lane_of[(size_t)into[j]] = &item;
-                }
-                if (params.verbose) {
-                    fprintf(
-                        stderr, "%s wave admit: %zu chunks into %d lanes, %.2f ms\n", label,
-                        chunks.size(), width,
-                        (double)(ggml_time_us() - admit_start) / 1000.0);
-                }
-
-                // Step 0, sampled off the prefill's own hidden pair.
-                std::vector<int32_t> codes;
-                std::vector<int32_t> argmax;
-                std::vector<magpietts_cuda_sample_item> per_item((size_t)width);
-                for (int l = 0; l < width; ++l) {
-                    const WaveItem* held = lane_of[(size_t)l];
-                    magpietts_cuda_sample_item& slot = per_item[(size_t)l];
-                    slot.seed = (uint64_t)(uint32_t)params.seed;
-                    slot.cfg_scale = h.cfg_scale;
-                    slot.temperature = h.temperature;
-                    slot.top_k = h.top_k;
-                    slot.frame_index = wave_frame_index;
-                    slot.forbid_audio_eos =
-                        held && held->step * h.frame_stacking_factor < h.min_generated_frames;
-                }
-#if defined(MAGPIETTS_CUDA_SAMPLING)
-                if (!local_sampler->sampleCuda(
-                        wave_cond, wave_uncond, params.use_cfg, h.cfg_scale, h.temperature, h.top_k,
-                        false, workspace.cudaSampler(), (uint64_t)(uint32_t)params.seed,
-                        wave_frame_index, codes, argmax, width, per_item.data())) {
-                    return false;
-                }
-#else
-                fprintf(
-                    stderr,
-                    "wave decoding requires CUDA sampling, which was not compiled into this "
-                    "build\n");
-                return false;
-#endif
-                ++wave_frame_index;
-                for (size_t j = 0; j < chunks.size(); ++j) {
-                    WaveItem& item = *session.plan[chunks[j]];
-                    if (!session.step_finish(
-                            item, scores[j], collect[j] != 0, codes, argmax, into[j], width)) {
-                        return false;
-                    }
-                    ++item.step;
-                }
-                return true;
-            };
-
-            // The ring holds one opening plus the position budget and no more, so a
-            // chunk that has spent the budget is finished whether or not it has
-            // said so -- the decoder would refuse the next step. The group loop
-            // this replaces enforced the same bound as its own `step <
-            // max_decoder_positions`, which is why it never had to be said here.
-            auto retire_if_exhausted = [&](WaveItem* item) {
-                if (item && !item->done && item->step >= max_decoder_positions) {
-                    if (params.verbose) {
-                        fprintf(
-                            stderr, "%s wave chunk %zu hit the %d-step budget\n", label,
-                            item->chunk_index, max_decoder_positions);
-                    }
-                    item->done = true;
-                }
-            };
-
-            // One decode step over every lane, live or not: the graph is a fixed
-            // width, so a lane whose chunk has finished is decoded anyway and its
-            // result thrown away. What `live` buys is that its position stops
-            // advancing, so it cannot run past the ring.
-            auto wave_step = [&](int width) -> bool {
-                std::vector<std::vector<float>> scores((size_t)width);
-                std::vector<char> collect((size_t)width, 0);
-                std::vector<MagpieWaveDecodeItem> slots((size_t)width);
-                std::vector<magpietts_cuda_sample_item> per_item((size_t)width);
-                for (int l = 0; l < width; ++l) {
-                    WaveItem* item = lane_of[(size_t)l];
-                    MagpieWaveDecodeItem& slot = slots[(size_t)l];
-                    magpietts_cuda_sample_item& sampling = per_item[(size_t)l];
-                    sampling.seed = (uint64_t)(uint32_t)params.seed;
-                    sampling.cfg_scale = h.cfg_scale;
-                    sampling.temperature = h.temperature;
-                    sampling.top_k = h.top_k;
-                    sampling.frame_index = wave_frame_index;
-                    slot.audio_codes = &item->audio_codes;
-                    slot.live = !item->done;
-                    if (!slot.live) {
-                        continue;
-                    }
-                    slot.prior = item->prior.priorForStep(h, item->text_len);
-                    if (item->prior.shouldCollect(h, item->step, item->text_len)) {
-                        collect[(size_t)l] = 1;
-                        slot.alignment_scores = &scores[(size_t)l];
-                    }
-                    // Each chunk's opening frames are its own, so the floor that
-                    // stops it ending before it has said anything is its own too.
-                    sampling.forbid_audio_eos =
-                        item->step * h.frame_stacking_factor < h.min_generated_frames;
-                }
-                const ggml_nvtx::range nvtx_step("magpietts_stream_wave_step");
-                // One slot more than the step budget: the prefill takes one
-                // and each step takes another, so at exactly the budget the
-                // last step finds the ring full. The single-item path
-                // survives that by falling back to the non-persistent
-                // decoder; a wave has no fallback and fails the run.
-                if (!decoder.evalWave(
-                        slots, max_decoder_positions + 1, wave_text_capacity, &wave_cond,
-                        &wave_uncond)) {
-                    fprintf(stderr, "%s wave decode step failed\n", label);
-                    return false;
-                }
-                // One sampler call for the whole wave: the local transformer
-                // runs its rounds once, with width items per round.
-                std::vector<int32_t> codes;
-                std::vector<int32_t> argmax;
-#if defined(MAGPIETTS_CUDA_SAMPLING)
-                if (!local_sampler->sampleCuda(
-                        wave_cond, wave_uncond, params.use_cfg, h.cfg_scale, h.temperature, h.top_k,
-                        false, workspace.cudaSampler(), (uint64_t)(uint32_t)params.seed,
-                        wave_frame_index, codes, argmax, width, per_item.data())) {
-                    return false;
-                }
-#else
-                fprintf(
-                    stderr,
-                    "wave decoding requires CUDA sampling, which was not compiled into this "
-                    "build\n");
-                return false;
-#endif
-                ++wave_frame_index;
-                for (int l = 0; l < width; ++l) {
-                    WaveItem* item = lane_of[(size_t)l];
-                    if (item->done) {
-                        continue;
-                    }
-                    if (!session.step_finish(
-                            *item, scores[(size_t)l], collect[(size_t)l] != 0, codes, argmax, l,
-                            width)) {
-                        return false;
-                    }
-                    ++item->step;
-                }
-                return true;
-            };
-
-            // Chunk 0, in a runtime of its own.
-            if (!chunk_ids.empty()) {
-                if (!session.prepare_chunk(0)) {
-                    return cancel_worker();
-                }
-                if (!wave_cond.alloc2d(magpie, GGML_TYPE_F32, h.n_embd, 1, "wave_hidden_cond") ||
-                    !wave_uncond.alloc2d(
-                        magpie, GGML_TYPE_F32, h.n_embd, 1, "wave_hidden_uncond")) {
-                    return cancel_worker();
-                }
-                lane_of.assign(1, nullptr);
-                if (!admit_chunks(1, {0}, {0}) || !session.drain_in_order()) {
-                    return cancel_worker();
-                }
-                for (retire_if_exhausted(session.plan[0].get()); !session.plan[0]->done;
-                     retire_if_exhausted(session.plan[0].get())) {
-                    if (codec_worker.is_failed()) {
-                        codec_worker.join();
-                        return false;
-                    }
-                    if (!wave_step(1) || !session.drain_in_order()) {
-                        return cancel_worker();
-                    }
-                }
-                decoder.resetWave();
-                wave_cond.reset();
-                wave_uncond.reset();
+            WaveEngine engine{magpie,     workspace, decoder, local_sampler,
+                              label,      params.verbose};
+            engine.threads = params.threads;
+            engine.idle_codes.assign(h.audio_codebooks, {});
+            for (int c = 0; c < h.audio_codebooks; ++c) {
+                engine.idle_codes[c].assign((size_t)h.frame_stacking_factor, h.audio_bos_id);
+            }
+            if (wave_lanes > 0 &&
+                !engine.open(
+                    magpie, wave_lanes, wave_text_capacity, max_decoder_positions + 1)) {
+                return cancel_worker();
             }
 
-            // Everything after it, in one runtime held for the rest of the run.
+            // Admitting one chunk at a time would be ~118 prefills on a
+            // 150-chunk script, and a prefill costs about half a millisecond per
+            // lane it computes regardless of how many it opens -- that would eat
+            // the whole saving. So idle lanes accumulate and are filled in one
+            // burst. Swept over 2377 chunks: an eighth of the lanes wins at both
+            // widths measured, and the curve is shallow. Never fewer than two,
+            // so a narrow wave does not end up admitting singly.
+            constexpr int kWaveAdmitFraction = 8;
+            const int admit_threshold = std::max(2, wave_lanes / kWaveAdmitFraction);
+
+            // Fill the given lanes with this session's next chunks.
+            auto admit_into = [&](const std::vector<int>& free_lanes) -> bool {
+                std::vector<WaveAdmission> admissions;
+                for (int l : free_lanes) {
+                    if (session.next_chunk >= chunk_ids.size()) {
+                        break;
+                    }
+                    if (!session.prepare_chunk(session.next_chunk)) {
+                        return false;
+                    }
+                    admissions.push_back(WaveAdmission{&session, session.next_chunk, l});
+                    ++session.next_chunk;
+                }
+                if (admissions.empty()) {
+                    return true;
+                }
+                return engine.admit(admissions) && session.drain_in_order();
+            };
+
             if (wave_lanes > 0) {
-                if (!wave_cond.alloc2d(
-                        magpie, GGML_TYPE_F32, h.n_embd, wave_lanes, "wave_hidden_cond") ||
-                    !wave_uncond.alloc2d(
-                        magpie, GGML_TYPE_F32, h.n_embd, wave_lanes, "wave_hidden_uncond")) {
+                std::vector<int> all_lanes(wave_lanes);
+                for (int l = 0; l < wave_lanes; ++l) {
+                    all_lanes[(size_t)l] = l;
+                }
+                if (!admit_into(all_lanes)) {
                     return cancel_worker();
                 }
-                lane_of.assign((size_t)wave_lanes, nullptr);
-                if (params.verbose) {
-                    fprintf(
-                        stderr, "%s wave scheduler: %zu chunks, %d lanes, pinned history %d\n",
-                        label, chunk_ids.size(), wave_lanes, params.longform_history_tokens);
-                }
-                // Admitting one chunk at a time would be ~118 prefills on a
-                // 150-chunk script, and a prefill is ~10 ms almost regardless of
-                // how many lanes it opens -- that would eat the whole saving. So
-                // idle lanes accumulate and are filled in one burst. The right
-                // fraction is an empirical question; a quarter of the lanes is
-                // the starting point, and the verbose trace below is what makes
-                // it measurable.
-                // Swept over 2377 chunks of prose, an eighth of the lanes wins at
-                // both widths measured: at 32 lanes, a threshold of 2 gives 162x
-                // realtime, 4 gives 165x and 8 gives 163x; at 128 lanes, 2 gives
-                // 190x, 4 and 8 give 194x, 16 gives 196x and 32 falls back to
-                // 190x. Below the optimum the prefills dominate and above it the
-                // idle lanes do, but the curve is shallow now that a prefill
-                // computes only the lanes it opens -- it spanned 117x to 183x
-                // when every prefill ran the runtime's full width. Never fewer
-                // than two, so a narrow wave does not end up admitting singly.
-                constexpr int kWaveAdmitFraction = 8;
-                const int admit_threshold = std::max(2, wave_lanes / kWaveAdmitFraction);
-                session.next_chunk = 1;
-                int64_t idle_lane_steps = 0;
-                int64_t wave_steps = 0;
-                int bursts = 0;
-
-                // Fill every lane to start with, then keep them full.
-                auto admit_into = [&](const std::vector<int>& free_lanes) -> bool {
-                    std::vector<size_t> chunks;
-                    std::vector<int> into;
-                    for (int lane : free_lanes) {
-                        if (session.next_chunk >= chunk_ids.size()) {
-                            break;
-                        }
-                        if (!session.prepare_chunk(session.next_chunk)) {
-                            return false;
-                        }
-                        chunks.push_back(session.next_chunk++);
-                        into.push_back(lane);
-                    }
-                    if (chunks.empty()) {
-                        return true;
-                    }
-                    ++bursts;
-                    return admit_chunks(wave_lanes, chunks, into) && session.drain_in_order();
-                };
-                {
-                    std::vector<int> all_lanes(wave_lanes);
-                    for (int l = 0; l < wave_lanes; ++l) {
-                        all_lanes[(size_t)l] = l;
-                    }
-                    if (!admit_into(all_lanes)) {
-                        return cancel_worker();
-                    }
-                }
-
                 for (;;) {
-                    // A lane whose chunk has finished is idle: the chunk keeps
-                    // the lane, and its frames keep their place in the drain
-                    // order, but it is decoding nothing anyone will hear.
-                    std::vector<char> lane_idle((size_t)wave_lanes, 0);
-                    int live = 0;
-                    int idle_now = 0;
                     for (int l = 0; l < wave_lanes; ++l) {
-                        retire_if_exhausted(lane_of[(size_t)l]);
-                        if (lane_of[(size_t)l]->done) {
-                            lane_idle[(size_t)l] = 1;
-                            ++idle_now;
-                        } else {
-                            ++live;
-                        }
+                        engine.retire_if_exhausted(engine.lane[(size_t)l]);
                     }
+                    const int live = engine.live_lanes();
                     const size_t pending = chunk_ids.size() - session.next_chunk;
                     const std::vector<int> admit =
-                        plan_wave_admission(lane_idle, pending, admit_threshold);
+                        plan_wave_admission(engine.idle_mask(), pending, admit_threshold);
                     if (!admit.empty()) {
                         if (!admit_into(admit)) {
                             return cancel_worker();
@@ -2169,9 +2203,7 @@ stream_magpie_to_audio(
                         codec_worker.join();
                         return false;
                     }
-                    idle_lane_steps += idle_now;
-                    ++wave_steps;
-                    if (!wave_step(wave_lanes) || !session.drain_in_order()) {
+                    if (!engine.step() || !session.drain_in_order()) {
                         return cancel_worker();
                     }
                 }
@@ -2180,13 +2212,13 @@ stream_magpie_to_audio(
                         stderr,
                         "%s wave admission: %d bursts, threshold %d/%d lanes, %lld steps, %lld "
                         "idle lane-steps, occupancy %.1f%%\n",
-                        label, bursts, admit_threshold, wave_lanes, (long long)wave_steps,
-                        (long long)idle_lane_steps,
-                        wave_steps > 0 ? 100.0 * (1.0 - (double)idle_lane_steps /
-                                                            ((double)wave_steps * wave_lanes))
-                                       : 0.0);
+                        label, engine.bursts, admit_threshold, wave_lanes,
+                        (long long)engine.steps, (long long)engine.idle_lane_steps,
+                        engine.steps > 0 ? 100.0 * (1.0 - (double)engine.idle_lane_steps /
+                                                              ((double)engine.steps * wave_lanes))
+                                         : 0.0);
                 }
-                decoder.resetWave();
+                engine.close();
             }
 
             // Anything still holding frames -- the tail of the drain order.
