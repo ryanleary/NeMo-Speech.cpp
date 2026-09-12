@@ -389,6 +389,92 @@ struct MagpieCudaSamplerDeleter {
 };
 #endif
 
+// Defined below; a channel only ever holds a pointer to one.
+struct stream_audio_outputs;
+
+// One session's codec stream: the convolution state, the graph built around
+// that state, the queue of frames waiting to be decoded, the overlap-add
+// post-processing and the audio sink. Sessions never share one. The state is
+// serial -- every chunk's output depends on the one before it -- so two
+// sessions writing into the same channel would corrupt each other's
+// convolution history on the first chunk.
+struct codec_channel {
+    // The post-processor's geometry is engine-wide, so a channel handed back to
+    // the pool can be reopened for any session without being rebuilt.
+    codec_channel(int samples_per_frame, int future_frames, int window_samples)
+        : audio_pp(samples_per_frame, future_frames, window_samples),
+          pp_samples_per_frame(samples_per_frame), pp_future_frames(future_frames),
+          pp_window_samples(window_samples) {}
+
+    AudioPostProcessor audio_pp;
+    int pp_samples_per_frame = 0;
+    int pp_future_frames = 0;
+    int pp_window_samples = 0;
+
+    // Declared in this order: the graph holds nodes pointing at the state's
+    // cache tensors, so the graph has to be destroyed first.
+    nc::NanoCodecStreamState stream_state;
+    nc::NanoCodecStreamGraph stream_graph;
+    // The graph is built and captured once and survives being handed to the
+    // next session, which is the whole reason channels are pooled.
+    bool warmed = false;
+
+    // Borrowed from whichever session currently holds the channel.
+    stream_audio_outputs* outputs = nullptr;
+    stream_run_metrics* metrics = nullptr;
+    const char* run_label = "stream";
+
+    std::vector<std::vector<int32_t>> audio_codes;
+    int read_idx = 0;
+    int write_idx = 0;
+    int last_token_id = -1;
+    int chunks_done = 0;
+    bool in_use = false;
+    bool input_closed = false;
+    bool is_last_token_in = false;
+    bool send_final_audio = false;
+    bool final_audio_sent = false;
+    bool abort_requested = false;
+    // The worker has nothing left to do for this session: everything written
+    // has been decoded and the tail flushed. What a caller waits on.
+    bool retired = false;
+    bool failed = false;
+    std::string error;
+
+    // Hand the channel to a new session. Only the stream's contents reset; the
+    // graph, and with it the backend's captured version of it, stays.
+    void reopen(
+        stream_audio_outputs& out, stream_run_metrics* m, const char* label, int chunk_size) {
+        outputs = &out;
+        metrics = m;
+        run_label = label ? label : "stream";
+        audio_pp = AudioPostProcessor(pp_samples_per_frame, pp_future_frames, pp_window_samples);
+        audio_codes.clear();
+        read_idx = 0;
+        write_idx = 0;
+        last_token_id = -1;
+        chunks_done = 0;
+        in_use = true;
+        input_closed = false;
+        is_last_token_in = false;
+        send_final_audio = false;
+        final_audio_sent = false;
+        abort_requested = false;
+        retired = false;
+        failed = false;
+        error.clear();
+        stream_state.clear();
+        warmed = stream_graph.initialized() && stream_graph.chunkFrames() == chunk_size;
+    }
+};
+
+// Channels outlive the requests that borrow them. A channel's graph costs a
+// build and a backend graph capture, so throwing it away at the end of a
+// request would put that cost back on the next request's first audio.
+struct codec_channel_pool {
+    std::vector<std::unique_ptr<codec_channel>> channels;
+};
+
 class MagpieStreamingWorkspace {
    private:
     magpietts_model& magpie_;
@@ -415,7 +501,6 @@ class MagpieStreamingWorkspace {
         cond_kv.clear();
         uncond_kv.clear();
         cond_cross_kv.clear();
-        codec_stream_state.clear();
 
 #if defined(MAGPIETTS_CUDA_SAMPLING)
         if (use_cuda_sampling && (!cuda_sampler || cuda_sampler_codebooks != audio_codebooks)) {
@@ -517,10 +602,9 @@ class MagpieStreamingWorkspace {
     DecoderKvCache cond_kv;
     DecoderKvCache uncond_kv;
     DecoderCrossKvCache cond_cross_kv;
-    // Declared after the state: the graph holds nodes pointing at the state's
-    // cache tensors, so it must be destroyed first.
-    nc::NanoCodecStreamState codec_stream_state;
-    nc::NanoCodecStreamGraph codec_stream_graph;
+    // One stream per session in flight, pooled across requests so a graph and
+    // its backend capture are built once rather than per request.
+    codec_channel_pool codec_channels;
 
    private:
     MagpieModel local_transformer_cpu_model;
@@ -997,77 +1081,137 @@ struct codec_read_result {
     bool final_read = false;
 };
 
+// What the worker decided to do next, and for whom.
+struct codec_work {
+    enum kind { none, prewarm, decode, flush_tail, retire };
+    codec_channel* ch = nullptr;
+    codec_read_result item;
+    kind what = none;
+};
+
+// One thread decoding for any number of sessions. Each session has its own
+// channel; the worker round-robins over the channels that have a chunk ready.
+//
+// One thread rather than N is deliberate. One request already runs two threads
+// against the device -- the decode thread on MagpieTTS, this one on NanoCodec
+// -- and that is the concurrency the backend is known to tolerate. The codec
+// has the headroom to serve the whole wave from one thread: it saturates near
+// 495x against the decoder's ~376x.
 struct codec_stream_worker {
     const nc::NanoCodecModel& codec;
     nc::NanoCodecDecoder& decoder;
+    codec_channel_pool& pool;
     int threads = 1;
-    stream_audio_outputs& outputs;
-    AudioPostProcessor audio_pp;
-    nc::NanoCodecStreamState& stream_state;
-    nc::NanoCodecStreamGraph& stream_graph;
-    stream_run_metrics* metrics = nullptr;
-    const char* run_label = "stream";
     int chunk_size = 3;
     int history_size = 1;
     int future_size = 1;
     bool true_stateful = true;
     bool verbose = false;
     size_t max_buffered_frames = 16;
+    int samples_per_frame = 0;
+    int window_samples = 0;
 
-    std::vector<std::vector<int32_t>> audio_codes;
     std::mutex mutex;
     std::condition_variable has_work;
     std::condition_variable has_room;
+    // Raised when a channel retires, so a session can wait for its own audio to
+    // finish without waiting for anyone else's.
+    std::condition_variable channel_retired;
     std::thread worker;
-    bool input_closed = false;
-    bool abort_requested = false;
-    bool failed = false;
-    bool is_last_token_in = false;
-    bool send_final_audio = false;
-    bool final_audio_sent = false;
-    std::string error;
-    int read_idx = 0;
-    int write_idx = 0;
-    int last_token_id = -1;
-    int chunks_done = 0;
+    bool stopping = false;
+    bool worker_failed = false;
+    size_t cursor = 0;
 
     codec_stream_worker(
-        const nc::NanoCodecModel& codec_, nc::NanoCodecDecoder& decoder_,
-        nc::NanoCodecStreamState& stream_state_, nc::NanoCodecStreamGraph& stream_graph_,
-        int threads_, stream_audio_outputs& outputs_, int samples_per_frame, int chunk_size_,
-        int history_size_, int future_frames, int window_samples, size_t queue_depth,
-        bool true_stateful_, stream_run_metrics* metrics_, const char* run_label_, bool verbose_)
-        : codec(codec_), decoder(decoder_), threads(threads_), outputs(outputs_),
-          audio_pp(samples_per_frame, future_frames, window_samples), stream_state(stream_state_),
-          stream_graph(stream_graph_), metrics(metrics_),
-          run_label(run_label_ ? run_label_ : "stream"), chunk_size(std::max(1, chunk_size_)),
-          history_size(std::max(0, history_size_)), future_size(std::max(0, future_frames)),
-          true_stateful(true_stateful_), verbose(verbose_) {
+        const nc::NanoCodecModel& codec_, nc::NanoCodecDecoder& decoder_, codec_channel_pool& pool_,
+        int threads_, int samples_per_frame_, int chunk_size_, int history_size_, int future_frames,
+        int window_samples_, size_t queue_depth, bool true_stateful_, bool verbose_)
+        : codec(codec_), decoder(decoder_), pool(pool_), threads(threads_),
+          chunk_size(std::max(1, chunk_size_)), history_size(std::max(0, history_size_)),
+          future_size(std::max(0, future_frames)), true_stateful(true_stateful_), verbose(verbose_),
+          samples_per_frame(samples_per_frame_), window_samples(window_samples_) {
         max_buffered_frames = std::max<size_t>(1, queue_depth) * (size_t)chunk_size +
                               (size_t)history_size + (size_t)future_size + 1;
     }
 
     void start() { worker = std::thread(&codec_stream_worker::run, this); }
 
-    bool write_frame(const std::vector<int32_t>& frame) {
+    // Take a channel for one session. Reuses a retired one so its graph, and
+    // the backend's capture of it, survive into the next request.
+    codec_channel* open_channel(
+        stream_audio_outputs& outputs, stream_run_metrics* metrics, const char* run_label) {
+        codec_channel* opened = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (auto& ch : pool.channels) {
+                if (!ch->in_use) {
+                    opened = ch.get();
+                    break;
+                }
+            }
+            if (!opened) {
+                pool.channels.push_back(
+                    std::make_unique<codec_channel>(samples_per_frame, future_size, window_samples));
+                opened = pool.channels.back().get();
+            }
+            opened->reopen(outputs, metrics, run_label, chunk_size);
+        }
+        // A channel that still needs its graph is work in itself, and the
+        // worker may be parked with nothing else to do.
+        has_work.notify_one();
+        return opened;
+    }
+
+    // Give the channel back. Its audio must already have been waited for --
+    // release does not flush.
+    void release_channel(codec_channel* ch) {
+        if (!ch) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        ch->in_use = false;
+        ch->outputs = nullptr;
+        ch->metrics = nullptr;
+        ch->audio_codes.clear();
+        ch->audio_codes.shrink_to_fit();
+    }
+
+    int open_channels() {
+        std::lock_guard<std::mutex> lock(mutex);
+        int n = 0;
+        for (auto& ch : pool.channels) {
+            n += ch->in_use ? 1 : 0;
+        }
+        return n;
+    }
+
+    bool write_frame(codec_channel& ch, const std::vector<int32_t>& frame) {
         const ggml_nvtx::range nvtx_range("magpietts_stream_queue_write_frame");
         std::unique_lock<std::mutex> lock(mutex);
         has_room.wait(lock, [&] {
-            const int buffered = write_idx - read_idx;
-            return buffered < (int)max_buffered_frames || failed || abort_requested || input_closed;
+            const int buffered = ch.write_idx - ch.read_idx;
+            return buffered < (int)max_buffered_frames || ch.failed || ch.abort_requested ||
+                   ch.input_closed || stopping;
         });
-        if (failed || abort_requested || input_closed) {
+        if (ch.failed || ch.abort_requested || ch.input_closed || stopping) {
             return false;
         }
-        audio_codes.push_back(frame);
-        ++write_idx;
+        ch.audio_codes.push_back(frame);
+        ++ch.write_idx;
         has_work.notify_one();
         return true;
     }
 
-    bool is_failed() {
+    // Room for one more frame without waiting. The engine thread drives every
+    // lane in the wave, so it must never block on one session's backpressure.
+    bool has_room_for(codec_channel& ch) {
         std::lock_guard<std::mutex> lock(mutex);
-        return failed;
+        return (ch.write_idx - ch.read_idx) < (int)max_buffered_frames;
+    }
+
+    bool is_failed(codec_channel& ch) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return ch.failed;
     }
 
     std::vector<int32_t> eos_frame() const {
@@ -1096,74 +1240,94 @@ struct codec_stream_worker {
         return frame;
     }
 
-    void finish_tokens() {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (!is_last_token_in) {
-            last_token_id = write_idx;
-            is_last_token_in = true;
-            for (int i = 0; i < future_size; ++i) {
-                audio_codes.push_back(eos_frame());
-                ++write_idx;
-            }
-        }
-        input_closed = true;
-        has_work.notify_one();
-    }
-
-    void close_input() {
+    // This session has produced its last frame. The tail still has to be
+    // decoded and flushed, which is what wait_channel waits for.
+    void finish_tokens(codec_channel& ch) {
         {
             std::lock_guard<std::mutex> lock(mutex);
-            input_closed = true;
+            if (!ch.is_last_token_in) {
+                ch.last_token_id = ch.write_idx;
+                ch.is_last_token_in = true;
+                for (int i = 0; i < future_size; ++i) {
+                    ch.audio_codes.push_back(eos_frame());
+                    ++ch.write_idx;
+                }
+            }
+            ch.input_closed = true;
         }
         has_work.notify_one();
     }
 
-    bool join() {
-        close_input();
-        if (worker.joinable()) {
-            worker.join();
-        }
-
-        std::lock_guard<std::mutex> lock(mutex);
-        if (failed && !error.empty()) {
-            fprintf(stderr, "codec worker failed: %s\n", error.c_str());
-        }
-        return !failed;
-    }
-
-    void cancel() {
+    void close_input(codec_channel& ch) {
         {
             std::lock_guard<std::mutex> lock(mutex);
-            abort_requested = true;
-            input_closed = true;
+            ch.input_closed = true;
+        }
+        has_work.notify_one();
+    }
+
+    // Block until the worker has decoded and flushed everything this session
+    // wrote. Only this session's stream is waited on.
+    bool wait_channel(codec_channel& ch) {
+        close_input(ch);
+        std::unique_lock<std::mutex> lock(mutex);
+        channel_retired.wait(lock, [&] { return ch.retired || ch.failed || stopping; });
+        if (ch.failed && !ch.error.empty()) {
+            fprintf(stderr, "codec channel failed: %s\n", ch.error.c_str());
+        }
+        return !ch.failed;
+    }
+
+    // Drop whatever this session has queued. Its neighbours keep decoding.
+    void cancel_channel(codec_channel& ch) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            ch.abort_requested = true;
+            ch.input_closed = true;
+            ch.retired = true;
         }
         has_work.notify_all();
         has_room.notify_all();
+        channel_retired.notify_all();
+    }
+
+    // Stop the worker thread. Channels are expected to have been waited for
+    // already; anything still queued is dropped.
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        has_work.notify_all();
+        has_room.notify_all();
+        channel_retired.notify_all();
         if (worker.joinable()) {
             worker.join();
         }
     }
 
-    void set_failed(const std::string& message) {
+    void set_failed(codec_channel& ch, const std::string& message) {
         {
             std::lock_guard<std::mutex> lock(mutex);
-            failed = true;
-            if (error.empty()) {
-                error = message;
+            ch.failed = true;
+            if (ch.error.empty()) {
+                ch.error = message;
             }
-            input_closed = true;
+            ch.input_closed = true;
+            ch.retired = true;
         }
         has_work.notify_all();
         has_room.notify_all();
+        channel_retired.notify_all();
     }
 
-    bool has_tokens_locked() const {
-        const int diff = write_idx - read_idx;
+    bool has_tokens_locked(const codec_channel& ch) const {
+        const int diff = ch.write_idx - ch.read_idx;
         if (true_stateful) {
             if (diff <= 0) {
                 return false;
             }
-            if (is_last_token_in || input_closed) {
+            if (ch.is_last_token_in || ch.input_closed) {
                 return true;
             }
             return diff >= chunk_size;
@@ -1171,95 +1335,128 @@ struct codec_stream_worker {
         if (diff <= future_size) {
             return false;
         }
-        if (read_idx == 0 && diff > future_size) {
+        if (ch.read_idx == 0 && diff > future_size) {
             return true;
         }
-        if (read_idx == 1 && diff > future_size) {
+        if (ch.read_idx == 1 && diff > future_size) {
             return true;
         }
-        if (is_last_token_in && diff > future_size) {
+        if (ch.is_last_token_in && diff > future_size) {
             return true;
         }
         return diff >= chunk_size;
     }
 
-    codec_read_result read_tokens_locked() {
+    codec_read_result read_tokens_locked(codec_channel& ch) {
         codec_read_result out;
-        const int end = write_idx;
+        const int end = ch.write_idx;
         if (true_stateful) {
-            if (end <= read_idx) {
+            if (end <= ch.read_idx) {
                 return out;
             }
-            const int chunk_end = std::min(end, read_idx + chunk_size);
+            const int chunk_end = std::min(end, ch.read_idx + chunk_size);
             out.history_frames = 0;
-            out.chunk_index = chunks_done;
-            out.final_read = is_last_token_in && last_token_id <= chunk_end;
-            out.frames.assign(audio_codes.begin() + read_idx, audio_codes.begin() + chunk_end);
-            read_idx = chunk_end;
-            has_room.notify_one();
+            out.chunk_index = ch.chunks_done;
+            out.final_read = ch.is_last_token_in && ch.last_token_id <= chunk_end;
+            out.frames.assign(
+                ch.audio_codes.begin() + ch.read_idx, ch.audio_codes.begin() + chunk_end);
+            ch.read_idx = chunk_end;
+            has_room.notify_all();
             return out;
         }
-        if (end - read_idx <= future_size) {
+        if (end - ch.read_idx <= future_size) {
             return out;
         }
-        const int start = std::max(0, read_idx - history_size);
-        out.history_frames = read_idx - start;
-        out.chunk_index = chunks_done;
-        out.final_read = is_last_token_in && last_token_id <= end;
-        out.frames.assign(audio_codes.begin() + start, audio_codes.begin() + end);
-        read_idx = end - future_size;
-        has_room.notify_one();
+        const int start = std::max(0, ch.read_idx - history_size);
+        out.history_frames = ch.read_idx - start;
+        out.chunk_index = ch.chunks_done;
+        out.final_read = ch.is_last_token_in && ch.last_token_id <= end;
+        out.frames.assign(ch.audio_codes.begin() + start, ch.audio_codes.begin() + end);
+        ch.read_idx = end - future_size;
+        has_room.notify_all();
         return out;
     }
 
-    bool next_work(codec_read_result& item, bool& flush_final) {
-        const ggml_nvtx::range nvtx_range("magpietts_stream_worker_next_work");
-        std::unique_lock<std::mutex> lock(mutex);
-        has_work.wait(lock, [&] {
-            return abort_requested || send_final_audio || input_closed || has_tokens_locked();
-        });
-        if (abort_requested) {
-            return false;
-        }
-        if (has_tokens_locked()) {
-            item = read_tokens_locked();
-            return !item.frames.empty();
-        }
-        if (send_final_audio) {
-            send_final_audio = false;
-            final_audio_sent = true;
-            flush_final = true;
+    // Round robin over the channels, so one session with a deep queue cannot
+    // starve another's first chunk.
+    bool pick_locked(codec_work& out) {
+        const size_t n = pool.channels.size();
+        for (size_t k = 0; k < n; ++k) {
+            const size_t idx = (cursor + k) % n;
+            codec_channel& ch = *pool.channels[idx];
+            if (!ch.in_use || ch.failed || ch.abort_requested) {
+                continue;
+            }
+            codec_work::kind what = codec_work::none;
+            if (true_stateful && !ch.warmed) {
+                what = codec_work::prewarm;
+            } else if (has_tokens_locked(ch)) {
+                out.item = read_tokens_locked(ch);
+                if (out.item.frames.empty()) {
+                    continue;
+                }
+                what = codec_work::decode;
+            } else if (ch.send_final_audio) {
+                ch.send_final_audio = false;
+                ch.final_audio_sent = true;
+                what = codec_work::flush_tail;
+            } else if (ch.input_closed && !ch.retired) {
+                what = codec_work::retire;
+            } else {
+                continue;
+            }
+            out.ch = &ch;
+            out.what = what;
+            cursor = (idx + 1) % n;
             return true;
         }
-        if (input_closed) {
-            return false;
-        }
         return false;
+    }
+
+    bool next_work(codec_work& out) {
+        const ggml_nvtx::range nvtx_range("magpietts_stream_worker_next_work");
+        std::unique_lock<std::mutex> lock(mutex);
+        has_work.wait(lock, [&] { return stopping || pick_locked(out); });
+        return !stopping;
     }
 
     // Build the fixed-size graph and push one throwaway chunk through it before any real
     // tokens arrive. That moves the graph allocation and the backend's first-run graph
     // capture off the first audio chunk's latency, while the acoustic model is still
     // generating. The caches are zeroed afterwards, so the stream still starts from silence.
-    bool prewarm() {
+    bool prewarm(codec_channel& ch) {
         const ggml_nvtx::range nvtx_range("magpietts_stream_codec_prewarm");
-        // A workspace reused across requests keeps its graph, and with it the backend's
-        // captured version of it; zeroing the caches is all a fresh stream needs.
-        if (stream_graph.initialized() && stream_graph.chunkFrames() == chunk_size) {
-            stream_state.clear();
+        // A pooled channel keeps its graph, and with it the backend's captured
+        // version; zeroing the caches is all a fresh stream needs.
+        if (ch.stream_graph.initialized() && ch.stream_graph.chunkFrames() == chunk_size) {
+            ch.stream_state.clear();
+            std::lock_guard<std::mutex> lock(mutex);
+            ch.warmed = true;
             return true;
         }
-        if (!decoder.initStreamGraph(stream_state, chunk_size, stream_graph)) {
-            set_failed("failed to initialize the codec stream graph");
+        if (!decoder.initStreamGraph(ch.stream_state, chunk_size, ch.stream_graph)) {
+            set_failed(ch, "failed to initialize the codec stream graph");
             return false;
         }
         const nc::NanoCodecFrames warm((size_t)chunk_size, nc::NanoCodecFrame{});
         std::vector<float> discard;
-        if (!decoder.decodeStream(stream_state, stream_graph, warm, threads, discard)) {
-            set_failed("failed to warm up the codec stream graph");
+        if (!decoder.decodeStream(ch.stream_state, ch.stream_graph, warm, threads, discard)) {
+            set_failed(ch, "failed to warm up the codec stream graph");
             return false;
         }
-        stream_state.clear();
+        ch.stream_state.clear();
+        std::lock_guard<std::mutex> lock(mutex);
+        ch.warmed = true;
+        return true;
+    }
+
+    bool flush_channel_tail(codec_channel& ch) {
+        if (!ch.audio_pp.flush([&](const std::vector<float>& processed) {
+                return ch.outputs->write_audio(processed);
+            })) {
+            set_failed(ch, "failed to flush final audio");
+            return false;
+        }
         return true;
     }
 
@@ -1267,70 +1464,119 @@ struct codec_stream_worker {
         const ggml_nvtx::range nvtx_range("magpietts_stream_codec_worker_run");
         if (verbose) {
             fprintf(
-                stderr,
-                "codec worker started: chunk_size=%d history=%d future=%d max_buffered=%zu\n",
+                stderr, "codec worker started: chunk_size=%d history=%d future=%d max_buffered=%zu\n",
                 chunk_size, history_size, future_size, max_buffered_frames);
         }
-        if (true_stateful && !prewarm()) {
-            return;
-        }
+        int chunks_total = 0;
         try {
             for (;;) {
-                codec_read_result item;
-                bool flush_final = false;
-                if (!next_work(item, flush_final)) {
+                codec_work work;
+                if (!next_work(work)) {
                     break;
                 }
-                if (flush_final) {
-                    if (!audio_pp.flush([&](const std::vector<float>& processed) {
-                            return outputs.write_audio(processed);
-                        })) {
-                        set_failed("failed to flush final audio");
-                        return;
+                codec_channel& ch = *work.ch;
+                if (work.what == codec_work::prewarm) {
+                    if (!prewarm(ch)) {
+                        continue;
                     }
+                    continue;
+                }
+                if (work.what == codec_work::flush_tail) {
+                    flush_channel_tail(ch);
+                    continue;
+                }
+                if (work.what == codec_work::retire) {
+                    bool flushed = true;
+                    {
+                        std::unique_lock<std::mutex> lock(mutex);
+                        flushed = ch.final_audio_sent;
+                    }
+                    if (!flushed && !flush_channel_tail(ch)) {
+                        continue;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        ch.retired = true;
+                    }
+                    channel_retired.notify_all();
                     continue;
                 }
                 // Reads are capped at chunk_size and a short final chunk is zero-padded by
                 // the decoder, so one graph serves the whole stream.
-                nc::NanoCodecStreamGraph* graph = true_stateful ? &stream_graph : nullptr;
+                nc::NanoCodecStreamGraph* graph = true_stateful ? &ch.stream_graph : nullptr;
                 if (!decode_and_stream_chunk(
-                        codec, decoder, true_stateful ? &stream_state : nullptr, graph, item.frames,
-                        threads, outputs, audio_pp, metrics, run_label, item.chunk_index,
-                        item.history_frames, item.final_read, verbose)) {
-                    set_failed("decode or audio output failed");
-                    return;
+                        codec, decoder, true_stateful ? &ch.stream_state : nullptr, graph,
+                        work.item.frames, threads, *ch.outputs, ch.audio_pp, ch.metrics,
+                        ch.run_label, work.item.chunk_index, work.item.history_frames,
+                        work.item.final_read, verbose)) {
+                    set_failed(ch, "decode or audio output failed");
+                    continue;
                 }
-                ++chunks_done;
-                if (item.final_read) {
+                ++ch.chunks_done;
+                ++chunks_total;
+                if (work.item.final_read) {
                     std::lock_guard<std::mutex> lock(mutex);
-                    send_final_audio = true;
+                    ch.send_final_audio = true;
                     has_work.notify_one();
                 }
             }
-
-            bool should_flush = false;
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                should_flush = !abort_requested && !failed && !final_audio_sent;
-            }
-            if (should_flush && !audio_pp.flush([&](const std::vector<float>& processed) {
-                    return outputs.write_audio(processed);
-                })) {
-                set_failed("failed to flush overlap audio");
-                return;
-            }
         }
         catch (const std::exception& e) {
-            set_failed(e.what());
-            return;
+            fprintf(stderr, "codec worker aborted: %s\n", e.what());
+            worker_failed = true;
         }
         catch (...) {
-            set_failed("unknown exception");
-            return;
+            fprintf(stderr, "codec worker aborted: unknown exception\n");
+            worker_failed = true;
         }
+        // Nothing will decode for the channels still open, so nobody should
+        // wait for them.
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (auto& ch : pool.channels) {
+                if (ch->in_use && !ch->retired) {
+                    ch->retired = true;
+                    if (worker_failed) {
+                        ch->failed = true;
+                        if (ch->error.empty()) {
+                            ch->error = "codec worker aborted";
+                        }
+                    }
+                }
+            }
+        }
+        channel_retired.notify_all();
+        has_room.notify_all();
         if (verbose) {
-            fprintf(stderr, "codec worker stopped after %d chunks\n", chunks_done);
+            fprintf(stderr, "codec worker stopped after %d chunks\n", chunks_total);
         }
+    }
+};
+
+// A session's end of the codec: the shared worker, and the channel that keeps
+// this session's stream apart from every other session's.
+struct codec_sink {
+    codec_stream_worker* worker = nullptr;
+    codec_channel* channel = nullptr;
+
+    bool valid() const { return worker && channel; }
+    bool write_frame(const std::vector<int32_t>& frame) {
+        return worker->write_frame(*channel, frame);
+    }
+    bool has_room() const { return worker->has_room_for(*channel); }
+    std::vector<int32_t> silence_frame() const { return worker->silence_frame(); }
+    void finish_tokens() { worker->finish_tokens(*channel); }
+    bool wait() { return worker->wait_channel(*channel); }
+    void cancel() {
+        if (valid()) {
+            worker->cancel_channel(*channel);
+        }
+    }
+    void release() {
+        if (worker) {
+            worker->release_channel(channel);
+        }
+        channel = nullptr;
     }
 };
 
@@ -1374,7 +1620,7 @@ struct WaveSession {
     const char* label;
     stream_run_metrics& metrics;
     stream_code_writer& code_writer;
-    codec_stream_worker& codec_worker;
+    codec_sink sink;
     MagpiePinnedHostScratch& text_context_staging;
     int& frames_generated;
     int& decoder_frames_generated;
@@ -1551,9 +1797,9 @@ struct WaveSession {
             return true;
         }
         for (const std::vector<int32_t>& frame : item.frames) {
-            if (!code_writer.write_frame(frame) || !codec_worker.write_frame(frame)) {
+            if (!code_writer.write_frame(frame) || !sink.write_frame(frame)) {
                 fprintf(stderr, "failed to write streamed codec frame\n");
-                codec_worker.join();
+                sink.cancel();
                 return false;
             }
             ++frames_generated;
@@ -1576,11 +1822,11 @@ struct WaveSession {
         }
         if (!last_chunk) {
             const int silence_frames = boundary_silence_dist(boundary_silence_rng);
-            const std::vector<int32_t> silence = codec_worker.silence_frame();
+            const std::vector<int32_t> silence = sink.silence_frame();
             for (int i = 0; i < silence_frames; ++i) {
-                if (!code_writer.write_frame(silence) || !codec_worker.write_frame(silence)) {
+                if (!code_writer.write_frame(silence) || !sink.write_frame(silence)) {
                     fprintf(stderr, "failed to write streamed silence codec frame\n");
-                    codec_worker.join();
+                    sink.cancel();
                     return false;
                 }
                 ++frames_generated;
@@ -2078,12 +2324,12 @@ stream_magpie_to_audio(
     }
 
     codec_stream_worker codec_worker(
-        codec, workspace.codec_decoder, workspace.codec_stream_state, workspace.codec_stream_graph,
-        params.codec_threads, outputs, codec.samplesPerFrame(), params.chunk_frames,
-        params.codec_history_frames, params.codec_future_frames, window_samples,
-        (size_t)params.codec_queue_depth, params.use_stateful_codec, &metrics, label,
-        params.verbose);
+        codec, workspace.codec_decoder, workspace.codec_channels, params.codec_threads,
+        codec.samplesPerFrame(), params.chunk_frames, params.codec_history_frames,
+        params.codec_future_frames, window_samples, (size_t)params.codec_queue_depth,
+        params.use_stateful_codec, params.verbose);
     codec_worker.start();
+    codec_sink codec_out{&codec_worker, codec_worker.open_channel(outputs, &metrics, label)};
     if (params.verbose) {
         fprintf(
             stderr, "%s MagpieTTS producer and %s NanoCodec worker are running in parallel\n",
@@ -2091,7 +2337,9 @@ stream_magpie_to_audio(
     }
 
     auto cancel_worker = [&]() -> bool {
-        codec_worker.cancel();
+        codec_out.cancel();
+        codec_worker.stop();
+        codec_out.release();
         return false;
     };
 
@@ -2165,7 +2413,7 @@ stream_magpie_to_audio(
                 session_staging.push_back(std::make_unique<MagpiePinnedHostScratch>());
                 sessions.push_back(std::make_unique<WaveSession>(WaveSession{
                     magpie, workspace.encoder, h, params, token_chunks, label,
-                    *session_metrics.back(), code_writer, codec_worker, *session_staging.back(),
+                    *session_metrics.back(), code_writer, codec_sink{}, *session_staging.back(),
                     session_frames[(size_t)i], session_frames[(size_t)i], boundary_silence_rng,
                     boundary_silence_dist}));
                 sessions.back()->discard_audio = true;
@@ -2287,7 +2535,9 @@ stream_magpie_to_audio(
                                  : 0.0,
                 engine.bursts);
             engine.close();
-            codec_worker.cancel();
+            codec_out.cancel();
+            codec_worker.stop();
+            codec_out.release();
             return true;
         }
 
@@ -2300,7 +2550,7 @@ stream_magpie_to_audio(
                                 label,
                                 metrics,
                                 code_writer,
-                                codec_worker,
+                                codec_sink{&codec_worker, codec_out.channel},
                                 text_context_staging,
                                 frames_generated,
                                 decoder_frames_generated,
@@ -2407,9 +2657,8 @@ stream_magpie_to_audio(
                     if (live == 0 && pending == 0) {
                         break;
                     }
-                    if (codec_worker.is_failed()) {
-                        codec_worker.join();
-                        return false;
+                    if (codec_worker.is_failed(*codec_out.channel)) {
+                        return cancel_worker();
                     }
                     if (!engine.step() || !session.drain_in_order()) {
                         return cancel_worker();
@@ -2547,9 +2796,8 @@ stream_magpie_to_audio(
                 if (frames_remaining <= 0) {
                     break;
                 }
-                if (codec_worker.is_failed()) {
-                    codec_worker.join();
-                    return false;
+                if (codec_worker.is_failed(*codec_out.channel)) {
+                    return cancel_worker();
                 }
                 if (params.verbose && step % 10 == 0) {
                     fprintf(
@@ -2750,10 +2998,9 @@ stream_magpie_to_audio(
                 metrics.record_decoder_frame(ggml_time_us(), first_frame);
                 decoder_frames_generated += h.frame_stacking_factor;
                 for (const std::vector<int32_t>& frame : outcome.frames) {
-                    if (!code_writer.write_frame(frame) || !codec_worker.write_frame(frame)) {
+                    if (!code_writer.write_frame(frame) || !codec_out.write_frame(frame)) {
                         fprintf(stderr, "failed to write streamed codec frame\n");
-                        codec_worker.join();
-                        return false;
+                        return cancel_worker();
                     }
                     ++frames_generated;
                 }
@@ -2764,16 +3011,15 @@ stream_magpie_to_audio(
 
             if (longform_active && !final_text_chunk) {
                 const int boundary_silence_frames = boundary_silence_dist(boundary_silence_rng);
-                const std::vector<int32_t> silence = codec_worker.silence_frame();
+                const std::vector<int32_t> silence = codec_out.silence_frame();
                 for (int i = 0; i < boundary_silence_frames; ++i) {
                     if (!code_writer.write_frame(silence)) {
                         fprintf(stderr, "failed to write streamed silence codec frame\n");
                         return cancel_worker();
                     }
                     ++frames_generated;
-                    if (!codec_worker.write_frame(silence)) {
-                        codec_worker.join();
-                        return false;
+                    if (!codec_out.write_frame(silence)) {
+                        return cancel_worker();
                     }
                 }
                 if (params.verbose) {
@@ -2792,17 +3038,19 @@ stream_magpie_to_audio(
         metrics.decoder.last_event_us > 0 ? metrics.decoder.last_event_us : ggml_time_us());
 
     if (frames_generated == 0) {
-        codec_worker.cancel();
         fprintf(stderr, "no codec frames generated\n");
-        return false;
+        return cancel_worker();
     }
 
     if (params.flush_partial_chunk) {
-        codec_worker.finish_tokens();
-    } else {
-        codec_worker.close_input();
+        codec_out.finish_tokens();
     }
-    if (!codec_worker.join()) {
+    // Wait for this session's own audio, then stop the thread. In a serving
+    // engine the worker outlives the request and only the wait remains.
+    const bool codec_ok = codec_out.wait();
+    codec_worker.stop();
+    codec_out.release();
+    if (!codec_ok) {
         return false;
     }
 
