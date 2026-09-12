@@ -200,6 +200,33 @@ So a node draining a backlog wants its wave sized to the concurrency it intends
 to hold, and should let the rest queue: widening past that trades first audio
 for nothing, and narrowing below it gives up throughput as well as latency.
 
+### A slow client stalls every stream
+
+The right question for TTS is not how fast a request finishes but how many
+streams can be held at 1x. `--stream-realtime` asks it: each stream is consumed
+at playback rate, accepting no more than `--jitter-ms` ahead, and underruns are
+counted. It has not produced a capacity number yet, because the first run found
+something else.
+
+64 streams into a 64-lane wave, consumed at 1x: **25.5x aggregate, 63 of 64
+streams underran, first audio p50 32 s** -- against 216x and 659 ms for the same
+load read as fast as possible.
+
+The cause is the PCM callback's thread. It runs on the codec worker, and there
+is one codec worker for every session, so a consumer that paces -- which is what
+every real client does, through TCP flow control, a blocking `stream->Write`, or
+a jitter buffer -- blocks audio for every other session while it waits. The
+benchmark's sleep is only the most obvious version of it.
+
+This has to be fixed before any streaming-capacity number means anything, and it
+is a serving bug in its own right: one slow client currently degrades everyone.
+The fix is to decouple delivery from decoding -- the codec writes into the
+session's own buffer and a per-session consumer drains it -- which is the same
+inversion the engine thread already needed for `drain_item`.
+
+Until then, the concurrency numbers above describe a client that reads as fast
+as the engine can produce, which flatters the engine.
+
 ### The admission window
 
 `tts.admission-window-ms` (default 2) and `tts.admission-window-max-ms`

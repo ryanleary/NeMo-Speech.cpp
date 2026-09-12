@@ -94,6 +94,8 @@ print_synthesize_help(const char* program) {
         "  --rounds N                Repeat the concurrent burst N times in one process\n"
         "  --size-mix A,B,C          Sample each request's length from these sentence counts\n"
         "  --poisson                 Exponential inter-arrival times with mean --arrival-ms\n"
+        "  --stream-realtime         Consume each stream at 1x and count underruns\n"
+        "  --jitter-ms N             Lead a realtime consumer is allowed (default 500)\n"
         "  --no-warmup               Skip warmup\n"
         "  --force                   Replace an existing WAV\n",
         program);
@@ -129,6 +131,8 @@ command_synthesize(int argc, char** argv) {
         int rounds = 1;
         std::string size_mix;
         bool poisson = false;
+        bool stream_realtime = false;
+        int jitter_ms = 500;
         bool force = false;
         bool warmup = true;
         int output_rate = 0;
@@ -157,6 +161,10 @@ command_synthesize(int argc, char** argv) {
                 size_mix = value(i, arg);
             else if (arg == "--poisson")
                 poisson = true;
+            else if (arg == "--stream-realtime")
+                stream_realtime = true;
+            else if (arg == "--jitter-ms")
+                jitter_ms = std::stoi(value(i, arg));
             else if (arg == "--magpie-model")
                 parsed.runtime.magpie_model = value(i, arg);
             else if (arg == "--codec-model")
@@ -325,8 +333,14 @@ command_synthesize(int argc, char** argv) {
                 std::string pcm;
                 double ttfa_ms = 0.0;
                 double wall_s = 0.0;
+                // What a player at 1x would have seen: how often the stream
+                // arrived later than the moment it was needed, and by how much.
+                int underruns = 0;
+                double worst_deficit_s = 0.0;
+                double delivered_s = 0.0;
                 nemo_speech::tts::SynthesisResult result;
                 std::string error;
+                std::chrono::steady_clock::time_point play_start;
             };
           // A warm-up burst first: the codec builds a graph per channel on its
           // first use, and those land on the first burst's first audio. Its
@@ -362,12 +376,43 @@ command_synthesize(int argc, char** argv) {
                                             .count() > cancel_after_ms) {
                                     return false;
                                 }
+                                const auto now = std::chrono::steady_clock::now();
                                 if (run.pcm.empty() && !chunk.empty()) {
-                                    run.ttfa_ms = std::chrono::duration<double, std::milli>(
-                                                      std::chrono::steady_clock::now() - started)
-                                                      .count();
+                                    run.ttfa_ms =
+                                        std::chrono::duration<double, std::milli>(now - started)
+                                            .count();
+                                    run.play_start = now;
                                 }
                                 run.pcm += chunk;
+                                if (stream_realtime && !chunk.empty()) {
+                                    const double rate = 22050.0;
+                                    const double chunk_s = (double)(chunk.size() / 2) / rate;
+                                    // This chunk's first sample was due when
+                                    // everything before it had finished playing.
+                                    const double due_s = run.delivered_s;
+                                    const double late_s =
+                                        std::chrono::duration<double>(now - run.play_start)
+                                            .count() -
+                                        due_s;
+                                    if (late_s > 0.0) {
+                                        ++run.underruns;
+                                        run.worst_deficit_s =
+                                            std::max(run.worst_deficit_s, late_s);
+                                    }
+                                    run.delivered_s += chunk_s;
+                                    // A real client accepts no more than its
+                                    // jitter buffer ahead of playback, which is
+                                    // the backpressure the engine never sees
+                                    // from a benchmark that reads as fast as it
+                                    // can.
+                                    const auto release =
+                                        run.play_start +
+                                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                            std::chrono::duration<double>(
+                                                run.delivered_s - jitter_ms / 1000.0));
+                                    if (release > std::chrono::steady_clock::now())
+                                        std::this_thread::sleep_until(release);
+                                }
                                 return true;
                             });
                     }
@@ -422,6 +467,18 @@ command_synthesize(int argc, char** argv) {
                 return ttfa[i];
             };
             if (!cli_quiet()) {
+                int starved = 0;
+                double worst = 0.0;
+                for (const load_result& run : runs) {
+                    if (run.underruns > 0)
+                        ++starved;
+                    worst = std::max(worst, run.worst_deficit_s);
+                }
+                if (stream_realtime) {
+                    std::fprintf(
+                        stderr, "%d of %d streams underran, worst %.2f s late\n", starved,
+                        concurrency, worst);
+                }
                 if (cancelled > 0) {
                     // Every request that ran to completion must still produce
                     // the same audio as it would have alone.
