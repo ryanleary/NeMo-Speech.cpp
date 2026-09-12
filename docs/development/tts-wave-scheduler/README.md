@@ -10,6 +10,7 @@ numbers came from.
 |---|---|
 | [continuous-batching.md](continuous-batching.md) | The design, what shipped, and the results. **Start here.** |
 | [stragglers.md](stragglers.md) | Why a fixed group pays for its slowest member, and what that costs. |
+| [serving.md](serving.md) | Many concurrent requests through one wave: what is done, the numbers, and the decision that gates the rest. |
 | [handoff.md](handoff.md) | What the wave batches, and the state of the two benchmark machines. |
 | [joint-tuning.md](joint-tuning.md) | Width and chunk-frames interact; tuning one alone misleads. |
 | [pr-body.md](pr-body.md), [pr-table.md](pr-table.md) | Review-facing summaries. |
