@@ -82,6 +82,10 @@ struct MagpieWavePrefillItem {
     const std::vector<float>* text_cond = nullptr;
     const magpietts_backend_tensor* text_cond_device = nullptr;
     int text_len = 0;
+    // The chunk's own voice. A step never re-supplies it -- the baked context
+    // lands in this lane's K/V ring here and stays -- so voices only have to be
+    // separable at admission, and lanes opened together may differ.
+    int speaker = 0;
     const std::vector<std::vector<int32_t>>* audio_codes = nullptr;
     DecoderCrossKvCache* cross_kv = nullptr;
     // Length is this chunk's own text_len, not the wave's widest.
@@ -192,7 +196,7 @@ class MagpieDecoder {
     // full width and only the write-back is narrowed to them.
     bool prefillWave(
         std::vector<MagpieWavePrefillItem>& items, const std::vector<int>& lanes, int width,
-        int speaker, int threads, int stacked_position_budget, int text_capacity,
+        int threads, int stacked_position_budget, int text_capacity,
         magpietts_backend_tensor* cond_hidden_out,
         magpietts_backend_tensor* uncond_hidden_out) const;
 

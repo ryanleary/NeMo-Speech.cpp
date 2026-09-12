@@ -23,12 +23,29 @@ bool magpietts_cuda_sampler_bind_stream(
 bool magpietts_cuda_sampler_configure(
     magpietts_cuda_sampler* sampler, bool use_cfg, float cfg_scale, float temperature, int top_k,
     bool forbid_audio_eos, uint64_t seed, int frame_index, char* error, size_t error_size);
-// Give each slot in the launch its own EOS floor. A batched round is one slot
-// per item, so slot i is item i. Call after configure, which sets every slot to
-// the scalar value.
-bool magpietts_cuda_sampler_configure_forbid_eos(
-    magpietts_cuda_sampler* sampler, const uint8_t* forbid, int count, char* error,
-    size_t error_size);
+// Everything one item of a batched round decides for itself. A round is one slot
+// per item, so slot i is item i; once a wave carries chunks from more than one
+// request, these are the fields that differ between them.
+struct magpietts_cuda_sample_item {
+    uint64_t seed = 0;
+    float cfg_scale = 1.0f;
+    float temperature = 0.0f;
+    int top_k = 1;
+    // The item's own position in its own RNG stream. A counter shared across the
+    // wave would make a request's output depend on when its neighbours were
+    // admitted.
+    int frame_index = 0;
+    // False once the chunk is past its opening frames. Under continuous batching
+    // a freshly admitted chunk is inside them while its neighbours are hundreds
+    // of steps in.
+    bool forbid_audio_eos = false;
+};
+
+// Give each slot its own settings. Call after configure, which sets every slot
+// to the scalar values.
+bool magpietts_cuda_sampler_configure_items(
+    magpietts_cuda_sampler* sampler, const magpietts_cuda_sample_item* items, int count,
+    char* error, size_t error_size);
 bool magpietts_cuda_sampler_upload_config(
     magpietts_cuda_sampler* sampler, char* error, size_t error_size);
 

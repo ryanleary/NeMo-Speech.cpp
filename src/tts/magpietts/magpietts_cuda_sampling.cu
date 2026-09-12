@@ -17,20 +17,25 @@ static constexpr int MAGPIETTS_CUDA_SMALL_ITEMS_PER_THREAD =
 static constexpr int MAGPIETTS_CUDA_MAX_ITEMS_PER_THREAD =
     MAGPIETTS_CUDA_MAX_VOCAB / MAGPIETTS_CUDA_BLOCK_SIZE;
 
+// Everything that can differ between the items of one batched round, one entry
+// per slot. A round is one slot per item, so slot i is item i -- and once a wave
+// carries chunks from different requests, item i has its own voice, its own
+// sampling settings and its own RNG stream. These arrays ride the same memcpy
+// node the composed CUDA graph already replays, so per-item costs no new upload
+// and no graph change; the whole struct is ~7 KB at 256 slots.
+//
+// Left deliberately without member initialisers: value-initialising the struct
+// zeroes them, and configure() fills every slot before any launch.
 struct alignas(16) magpietts_cuda_sampling_config {
-    float cfg_scale = 1.0f;
-    float temperature = 0.0f;
-    int top_k = 1;
-    int frame_index = 0;
-    uint64_t seed = 0;
-    int use_cfg = 0;
-    // One flag per slot in the launch, not one for the launch. A batched round
-    // is one slot per item, and under continuous batching a freshly admitted
-    // chunk is inside its opening frames while its neighbours are hundreds of
-    // steps in -- so whether EOS is forbidden is the item's own answer.
-    // Uploaded with the rest of the config, by the same memcpy node the
-    // composed graph already replays.
-    int forbid_audio_eos[MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS] = {0};
+    uint64_t seed[MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS];
+    float cfg_scale[MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS];
+    float temperature[MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS];
+    int top_k[MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS];
+    int frame_index[MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS];
+    int forbid_audio_eos[MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS];
+    // A wave's graph width is kMagpieCfgLanesPerItem * items, so guidance is a
+    // property of the engine rather than of any one item.
+    int use_cfg;
 };
 
 struct magpietts_cuda_sampler {
@@ -148,7 +153,10 @@ magpietts_sample_codebooks_kernel(
     __shared__ typename block_sort::TempStorage sort_storage;
     __shared__ double s_sums[MAGPIETTS_CUDA_BLOCK_SIZE];
 
-    int k = config.top_k < vocab_size ? config.top_k : vocab_size;
+    // Slot in the launch, which is this item's index within the round.
+    const int slot = c < MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS ? c : 0;
+    const float slot_temperature = config.temperature[slot];
+    int k = config.top_k[slot] < vocab_size ? config.top_k[slot] : vocab_size;
     if (k < 1) {
         k = 1;
     }
@@ -167,8 +175,8 @@ magpietts_sample_codebooks_kernel(
             id < vocab_size
                 ? sampled_logit(
                       logits_cond, logits_uncond, off, id, audio_codebook_size, audio_eos_id,
-                      config.use_cfg != 0, config.cfg_scale,
-                      config.forbid_audio_eos[c < MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS ? c : 0] != 0)
+                      config.use_cfg != 0, config.cfg_scale[slot],
+                      config.forbid_audio_eos[slot] != 0)
                 : -INFINITY;
         thread_ids[item] = id;
     }
@@ -190,14 +198,14 @@ magpietts_sample_codebooks_kernel(
     }
 
     int sampled = top_ids[0];
-    if (config.temperature <= 0.0f) {
+    if (slot_temperature <= 0.0f) {
         sampled = top_ids[0];
     } else {
         const float max_logit = top_vals[0];
         double local_sum = 0.0;
         for (int i = threadIdx.x; i < k; i += blockDim.x) {
             if (isfinite(top_vals[i])) {
-                local_sum += exp((double)(top_vals[i] - max_logit) / (double)config.temperature);
+                local_sum += exp((double)(top_vals[i] - max_logit) / (double)slot_temperature);
             }
         }
         s_sums[threadIdx.x] = local_sum;
@@ -210,11 +218,12 @@ magpietts_sample_codebooks_kernel(
         }
         if (threadIdx.x == 0 && s_sums[0] > 0.0) {
             const double target =
-                uniform01(config.seed, config.frame_index, codebook_offset + c) * s_sums[0];
+                uniform01(config.seed[slot], config.frame_index[slot], codebook_offset + c) *
+                s_sums[0];
             double acc = 0.0;
             for (int i = 0; i < k; ++i) {
                 if (isfinite(top_vals[i])) {
-                    acc += exp((double)(top_vals[i] - max_logit) / (double)config.temperature);
+                    acc += exp((double)(top_vals[i] - max_logit) / (double)slot_temperature);
                 }
                 if (target <= acc) {
                     sampled = top_ids[i];
@@ -365,15 +374,15 @@ magpietts_cuda_sampler_configure(
         set_error(error, error_size, "invalid CUDA sampler configuration");
         return false;
     }
-    sampler->h_config->cfg_scale = cfg_scale;
-    sampler->h_config->temperature = temperature;
-    sampler->h_config->top_k = top_k;
-    sampler->h_config->frame_index = frame_index;
-    sampler->h_config->seed = seed;
-    sampler->h_config->use_cfg = use_cfg ? 1 : 0;
     // The scalar form says the same thing about every slot, which is what every
-    // caller outside a continuous-batching wave means.
+    // caller outside a multi-request wave means.
+    sampler->h_config->use_cfg = use_cfg ? 1 : 0;
     for (int slot = 0; slot < MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS; ++slot) {
+        sampler->h_config->cfg_scale[slot] = cfg_scale;
+        sampler->h_config->temperature[slot] = temperature;
+        sampler->h_config->top_k[slot] = top_k;
+        sampler->h_config->frame_index[slot] = frame_index;
+        sampler->h_config->seed[slot] = seed;
         sampler->h_config->forbid_audio_eos[slot] = forbid_audio_eos ? 1 : 0;
     }
     if (error && error_size > 0)
@@ -382,16 +391,22 @@ magpietts_cuda_sampler_configure(
 }
 
 bool
-magpietts_cuda_sampler_configure_forbid_eos(
-    magpietts_cuda_sampler* sampler, const uint8_t* forbid, int count, char* error,
-    size_t error_size) {
-    if (!sampler || !sampler->h_config || !forbid || count <= 0 ||
+magpietts_cuda_sampler_configure_items(
+    magpietts_cuda_sampler* sampler, const magpietts_cuda_sample_item* items, int count,
+    char* error, size_t error_size) {
+    if (!sampler || !sampler->h_config || !items || count <= 0 ||
         count > MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS) {
-        set_error(error, error_size, "invalid CUDA sampler per-item EOS mask");
+        set_error(error, error_size, "invalid CUDA sampler per-item configuration");
         return false;
     }
     for (int slot = 0; slot < count; ++slot) {
-        sampler->h_config->forbid_audio_eos[slot] = forbid[slot] ? 1 : 0;
+        const magpietts_cuda_sample_item& item = items[slot];
+        sampler->h_config->seed[slot] = item.seed;
+        sampler->h_config->cfg_scale[slot] = item.cfg_scale;
+        sampler->h_config->temperature[slot] = item.temperature;
+        sampler->h_config->top_k[slot] = item.top_k;
+        sampler->h_config->frame_index[slot] = item.frame_index;
+        sampler->h_config->forbid_audio_eos[slot] = item.forbid_audio_eos ? 1 : 0;
     }
     if (error && error_size > 0)
         error[0] = '\0';

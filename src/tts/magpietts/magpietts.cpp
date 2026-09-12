@@ -1826,6 +1826,7 @@ stream_magpie_to_audio(
                     slot.text_cond = &item.text_cond;
                     slot.text_cond_device = &item.text_cond_device;
                     slot.text_len = item.text_len;
+                    slot.speaker = params.speaker;
                     slot.audio_codes = &item.audio_codes;
                     slot.cross_kv = &item.cross_kv;
                     slot.prior = item.prior.priorForStep(h, item.text_len);
@@ -1836,8 +1837,8 @@ stream_magpie_to_audio(
                 }
                 const int64_t admit_start = ggml_time_us();
                 if (!decoder.prefillWave(
-                        opening, into, width, params.speaker, params.threads,
-                        max_decoder_positions + 1, wave_text_capacity, &wave_cond, &wave_uncond)) {
+                        opening, into, width, params.threads, max_decoder_positions + 1,
+                        wave_text_capacity, &wave_cond, &wave_uncond)) {
                     fprintf(stderr, "%s wave prefill failed\n", label);
                     return false;
                 }
@@ -1862,17 +1863,23 @@ stream_magpie_to_audio(
                 // Step 0, sampled off the prefill's own hidden pair.
                 std::vector<int32_t> codes;
                 std::vector<int32_t> argmax;
-                std::vector<uint8_t> forbid((size_t)width, 0);
+                std::vector<magpietts_cuda_sample_item> per_item((size_t)width);
                 for (int l = 0; l < width; ++l) {
                     const WaveItem* held = lane_of[(size_t)l];
-                    forbid[(size_t)l] =
+                    magpietts_cuda_sample_item& slot = per_item[(size_t)l];
+                    slot.seed = (uint64_t)(uint32_t)params.seed;
+                    slot.cfg_scale = h.cfg_scale;
+                    slot.temperature = h.temperature;
+                    slot.top_k = h.top_k;
+                    slot.frame_index = wave_frame_index;
+                    slot.forbid_audio_eos =
                         held && held->step * h.frame_stacking_factor < h.min_generated_frames;
                 }
 #if defined(MAGPIETTS_CUDA_SAMPLING)
                 if (!local_sampler->sampleCuda(
                         wave_cond, wave_uncond, params.use_cfg, h.cfg_scale, h.temperature, h.top_k,
                         false, workspace.cudaSampler(), (uint64_t)(uint32_t)params.seed,
-                        wave_frame_index, codes, argmax, width, forbid.data())) {
+                        wave_frame_index, codes, argmax, width, per_item.data())) {
                     return false;
                 }
 #else
@@ -1918,10 +1925,16 @@ stream_magpie_to_audio(
                 std::vector<std::vector<float>> scores((size_t)width);
                 std::vector<char> collect((size_t)width, 0);
                 std::vector<MagpieWaveDecodeItem> slots((size_t)width);
-                std::vector<uint8_t> forbid((size_t)width, 0);
+                std::vector<magpietts_cuda_sample_item> per_item((size_t)width);
                 for (int l = 0; l < width; ++l) {
                     WaveItem* item = lane_of[(size_t)l];
                     MagpieWaveDecodeItem& slot = slots[(size_t)l];
+                    magpietts_cuda_sample_item& sampling = per_item[(size_t)l];
+                    sampling.seed = (uint64_t)(uint32_t)params.seed;
+                    sampling.cfg_scale = h.cfg_scale;
+                    sampling.temperature = h.temperature;
+                    sampling.top_k = h.top_k;
+                    sampling.frame_index = wave_frame_index;
                     slot.audio_codes = &item->audio_codes;
                     slot.live = !item->done;
                     if (!slot.live) {
@@ -1934,7 +1947,7 @@ stream_magpie_to_audio(
                     }
                     // Each chunk's opening frames are its own, so the floor that
                     // stops it ending before it has said anything is its own too.
-                    forbid[(size_t)l] =
+                    sampling.forbid_audio_eos =
                         item->step * h.frame_stacking_factor < h.min_generated_frames;
                 }
                 const ggml_nvtx::range nvtx_step("magpietts_stream_wave_step");
@@ -1957,7 +1970,7 @@ stream_magpie_to_audio(
                 if (!local_sampler->sampleCuda(
                         wave_cond, wave_uncond, params.use_cfg, h.cfg_scale, h.temperature, h.top_k,
                         false, workspace.cudaSampler(), (uint64_t)(uint32_t)params.seed,
-                        wave_frame_index, codes, argmax, width, forbid.data())) {
+                        wave_frame_index, codes, argmax, width, per_item.data())) {
                     return false;
                 }
 #else

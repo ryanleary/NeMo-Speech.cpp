@@ -1200,8 +1200,8 @@ class MagpieDecoder::PersistentDecoderRuntime {
     // K/V land straight in the ring the steps append to, so a wave opened this
     // way needs no seeding and no per-chunk staging caches.
     bool prefill(
-        std::vector<MagpieWavePrefillItem>& wave, const std::vector<int>& admit, int speaker,
-        int threads, magpietts_backend_tensor* cond_hidden_out,
+        std::vector<MagpieWavePrefillItem>& wave, const std::vector<int>& admit, int threads,
+        magpietts_backend_tensor* cond_hidden_out,
         magpietts_backend_tensor* uncond_hidden_out) {
         const ggml_nvtx::range nvtx_range("magpietts_decoder_prefill_wave");
         const magpietts_hparams& h = model_.hparams;
@@ -1256,9 +1256,11 @@ class MagpieDecoder::PersistentDecoderRuntime {
 
         std::vector<std::pair<std::string, std::vector<int32_t>>> i32_inputs;
         std::vector<std::pair<std::string, std::vector<float>>> f32_inputs;
-        i32_inputs.push_back(
-            {std::string("magpietts_prefill_speaker"),
-             std::vector<int32_t>(static_cast<size_t>(items), speaker)});
+        std::vector<int32_t> speakers(static_cast<size_t>(items));
+        for (int at = 0; at < items; ++at) {
+            speakers[static_cast<size_t>(at)] = wave[static_cast<size_t>(at)].speaker;
+        }
+        i32_inputs.push_back({std::string("magpietts_prefill_speaker"), std::move(speakers)});
         for (int codebook = 0; codebook < h.stacked_audio_codebooks(); ++codebook) {
             // Item-major, so a reshape turns one get_rows into [n_embd, T, items].
             std::vector<int32_t> rows(static_cast<size_t>(items) * audio_len);
@@ -2029,7 +2031,7 @@ MagpieDecoder::resetWave() const {
 bool
 MagpieDecoder::prefillWave(
     std::vector<MagpieWavePrefillItem>& items, const std::vector<int>& lanes, int width,
-    int speaker, int threads, int stacked_position_budget, int text_capacity,
+    int threads, int stacked_position_budget, int text_capacity,
     magpietts_backend_tensor* cond_hidden_out, magpietts_backend_tensor* uncond_hidden_out) const {
     static const std::vector<float> no_host_text;
     if (items.empty() || items.size() != lanes.size() || width <= 0 ||
@@ -2071,7 +2073,7 @@ MagpieDecoder::prefillWave(
             wave_runtime_->waveFits(text_len, stacked_position_budget) &&
             wave_runtime_->refillWaveCross(lanes, item_cross_kv) &&
             wave_runtime_->prefill(
-                items, lanes, speaker, threads, cond_hidden_out, uncond_hidden_out)) {
+                items, lanes, threads, cond_hidden_out, uncond_hidden_out)) {
             return true;
         }
     }
