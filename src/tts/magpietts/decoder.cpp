@@ -951,7 +951,6 @@ class MagpieDecoder::PersistentDecoderRuntime {
           stacked_position_budget_(stacked_position_budget),
           cache_len_(checked_persistent_cache_len(model, stacked_position_budget)),
           lanes_(kMagpieCfgLanesPerItem * items), wave_(!item_cross_kv.empty()),
-          item_cross_kv_(item_cross_kv),
           backend_manager_(ggml_runtime::Params{true, 0, nullptr}, model.backend),
           module_(model, cross_kv, text_len, cache_len_, lanes_, std::move(item_cross_kv)),
           session_(backend_manager_, &module_, nullptr) {
@@ -1062,7 +1061,6 @@ class MagpieDecoder::PersistentDecoderRuntime {
                 mk.tensor, column.data(),
                 static_cast<size_t>(item) * static_cast<size_t>(text_len_) * sizeof(float),
                 column.size() * sizeof(float));
-            item_cross_kv_[static_cast<size_t>(item)] = caches[at];
             module_.set_item_text_len(item, len);
         }
         return true;
@@ -1390,9 +1388,19 @@ class MagpieDecoder::PersistentDecoderRuntime {
                 GGML_TRI_TYPE_UPPER);
         }
 
-        // Where this chunk's context lands in the ring, and whether it wraps.
-        const int ring_start = ((ring_next_ - total_len) % cache_len_ + cache_len_) % cache_len_;
-        const int head_span = std::min(total_len, cache_len_ - ring_start);
+        // A chunk opens at the end of the ring with its head at 0, which is where
+        // a runtime built for it alone would have put it. That matters beyond
+        // tidiness: flash attention accumulates over the K/V axis in memory
+        // order, so a chunk admitted at some other rotation sums the same values
+        // in a different order and rounds differently. Keeping the layout keeps
+        // the output byte-identical to the wave that decoded whole groups.
+        //
+        // The cost is that lanes admitted at different steps hold different ring
+        // heads, so write_step_state falls off its single strided mask upload
+        // onto one small transfer per lane -- measured at 6.5% of end to end at
+        // width 32. Admitting at the live lanes' current head would buy that back
+        // and cost the gate; worth revisiting once the scheduler is measured.
+        const int ring_start = cache_len_ - total_len;
         const int admit_first = admit.front();
         const int admit_count = static_cast<int>(admit.size());
         bool admit_contiguous = true;
@@ -1425,21 +1433,15 @@ class MagpieDecoder::PersistentDecoderRuntime {
                 session_.model_tensor_container->get_tensor_by_name(runtime_kv_name(layer_index));
             const size_t arena_element = ggml_element_size(arena.tensor);
             const size_t row_bytes = static_cast<size_t>(tr.n_embd) * arena_element;
-            // Open the chunk so that its ring head lands where every other lane's
-            // already is. All lanes advance one slot a step, so heads that agree
-            // once agree forever -- which is what keeps write_step_state's single
-            // strided upload, rather than one small synchronous transfer per lane
-            // per step. At the opening prefill ring_next_ is 0 and this is exactly
-            // the end of the ring, as it was when a wave could only open whole.
+            // Each admitted lane's slab, written where a runtime opened for that
+            // chunk alone would have written it. See ring_start above for why the
+            // position and not just the contents has to match.
             for (int plane = 0; plane < 2; ++plane) {
                 for (int half = 0; half < kMagpieCfgLanesPerItem; ++half) {
-                    for (int part = 0; part < 2; ++part) {
-                        const int rows = part == 0 ? head_span : total_len - head_span;
-                        if (rows <= 0) {
-                            continue;
-                        }
-                        const int src_row = part == 0 ? 0 : head_span;
-                        const int dst_row = part == 0 ? ring_start : 0;
+                    {
+                        const int rows = total_len;
+                        const int src_row = 0;
+                        const int dst_row = ring_start;
                         if (admit_contiguous) {
                             // The common case, and the only one the opening
                             // prefill takes: one copy covers the whole run.
@@ -1606,7 +1608,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
             const size_t at = static_cast<size_t>(item);
             n_tokens_[at] = total_len;
             valid_tokens_[at] = total_len;
-            ring_heads_[at] = ring_next_;
+            ring_heads_[at] = 0;
         }
         reset_mask();
         return true;
@@ -1869,7 +1871,6 @@ class MagpieDecoder::PersistentDecoderRuntime {
             ring_heads_[static_cast<size_t>(item)] =
                 (ring_heads_[static_cast<size_t>(item)] + 1) % cache_len_;
         }
-        ring_next_ = (ring_next_ + 1) % cache_len_;
         return true;
     }
 
@@ -1966,11 +1967,6 @@ class MagpieDecoder::PersistentDecoderRuntime {
     int cache_len_ = 0;
     int lanes_ = kMagpieCfgLanes;
     bool wave_ = false;
-    // The slot every lane appends at this step. Lanes admitted at different
-    // times still share it, because a prefill opens a chunk so that its head
-    // lands here -- and every lane then advances one slot a step together.
-    int ring_next_ = 0;
-    std::vector<const DecoderCrossKvCache*> item_cross_kv_;
     // Per item. A fixed group holds them equal; once lanes are re-formed with
     // survivors alongside freshly admitted chunks they differ, and the position
     // each item feeds the graph is its own.

@@ -1499,6 +1499,10 @@ stream_magpie_to_audio(
                 MagpieLongformAttentionPriorState prior;
                 std::vector<std::vector<int32_t>> frames;
                 MagpieChunkDecodeState chunk;
+                // This chunk's own decode step. Under continuous batching two
+                // lanes of the same wave are at different steps, so the step is
+                // the chunk's, not the loop's.
+                int step = 0;
                 bool done = false;
             };
 
@@ -1615,30 +1619,17 @@ stream_magpie_to_audio(
             // Codes arrive round-major from the batched sampler: round c of a
             // wave of B occupies slots [c*B, c*B+B), so item b's codebook c is
             // at c*B+b.
-            auto wave_step_finish = [&](WaveItem& item, int step, std::vector<float>& scores,
+            // Only ever called for a lane whose chunk is still going: a finished
+            // one holds its lane until another chunk is admitted, but it no
+            // longer grows, because its position stops advancing with it.
+            auto wave_step_finish = [&](WaveItem& item, std::vector<float>& scores,
                                         bool collected, const std::vector<int32_t>& all_codes,
                                         const std::vector<int32_t>& all_argmax, int item_index,
                                         int width) -> bool {
-                // A finished item still has to advance: the wave shares one ring
-                // head, so every column's history must grow by a frame a step.
-                // What it decodes is discarded, so it repeats its last frame.
-                auto hold_lockstep = [&](WaveItem& held) {
-                    for (int c = 0; c < h.audio_codebooks; ++c) {
-                        std::vector<int32_t>& codes = held.audio_codes[c];
-                        const int32_t last = codes.empty() ? h.audio_bos_id : codes.back();
-                        for (int lane = 0; lane < h.frame_stacking_factor; ++lane) {
-                            codes.push_back(last);
-                        }
-                    }
-                };
-                if (item.done) {
-                    hold_lockstep(item);
-                    return true;
-                }
+                const int step = item.step;
                 const int frames_remaining = h.max_decoder_steps - step * h.frame_stacking_factor;
                 if (frames_remaining <= 0) {
                     item.done = true;
-                    hold_lockstep(item);
                     return true;
                 }
                 const bool forbid_eos = step * h.frame_stacking_factor < h.min_generated_frames;
@@ -1723,54 +1714,67 @@ stream_magpie_to_audio(
             // by the whole group -- 30 ms becomes 490 ms on a twenty-sentence
             // script. The wave takes everything after it, where latency is
             // already hidden behind the audio the codec is still playing out.
-            std::vector<std::pair<size_t, size_t>> groups;
-            if (!chunk_ids.empty()) {
-                groups.emplace_back(0, 1);
-                for (size_t at = 1; at < chunk_ids.size(); at += (size_t)wave_width) {
-                    groups.emplace_back(at, std::min((size_t)wave_width, chunk_ids.size() - at));
-                }
-            }
+            //
+            // Everything after chunk 0 then decodes in ONE runtime, whose width
+            // is fixed for the rest of the run. The decoder's captured graph and
+            // the local transformer's composed chain are built once rather than
+            // once per group, and a lane whose chunk has finished can be refilled
+            // in place -- which is what continuous batching needs.
+            const int wave_lanes =
+                chunk_ids.size() > 1 ? (int)std::min((size_t)wave_width, chunk_ids.size() - 1) : 0;
+
             // The CUDA sampler seeds every draw with (seed, frame_index,
             // round*width + item). A group-local step index would make each
             // group replay the previous group's uniforms, so this counts across
             // the whole run.
             int wave_frame_index = 0;
-            for (const std::pair<size_t, size_t>& group : groups) {
-                const size_t base = group.first;
-                const size_t width = group.second;
-                // Encode this group's chunks now. Group 0 is chunk 0 alone, so
-                // first audio waits on one encode rather than the whole script.
-                for (size_t k = 0; k < width; ++k) {
-                    if (!prepare_chunk(base + k)) {
-                        return cancel_worker();
+            // Which chunk occupies each lane. A lane holds its chunk until
+            // another is admitted, so after the opening cohort no lane is ever
+            // empty -- a finished chunk is simply no longer live.
+            std::vector<WaveItem*> lane_of;
+            // One [n_embd, width] pair carries the whole wave's guidance states,
+            // which is what the batched local transformer reads. Allocated once
+            // per runtime: the composed chain bakes in both the width and these
+            // addresses, so reallocating it would recompose the chain.
+            magpietts_backend_tensor wave_cond;
+            magpietts_backend_tensor wave_uncond;
+
+            // Hand the codec everything the head chunk has, then retire chunks
+            // from the head while they are finished. Frames leave in chunk order
+            // -- the codec is one in-order stream over a serial convolution
+            // state, so a later chunk cannot overtake -- but an earlier one need
+            // not wait for its neighbours, which is what keeps first audio early.
+            // Each chunk buffers its own frames until its turn comes, so this is
+            // the reorder buffer a wave that retires out of order needs.
+            size_t next_drain = 0;
+            auto drain_in_order = [&]() -> bool {
+                if (next_drain < plan.size() && !drain_item(*plan[next_drain])) {
+                    return false;
+                }
+                while (next_drain < plan.size() && plan[next_drain]->done) {
+                    if (!flush_item(*plan[next_drain], next_drain + 1 == chunk_ids.size())) {
+                        return false;
+                    }
+                    ++next_drain;
+                    if (next_drain < plan.size() && !drain_item(*plan[next_drain])) {
+                        return false;
                     }
                 }
-                // One [n_embd, width] pair carries the whole wave's guidance
-                // states, which is what the batched local transformer reads.
-                magpietts_backend_tensor wave_cond;
-                magpietts_backend_tensor wave_uncond;
-                if (!wave_cond.alloc2d(
-                        magpie, GGML_TYPE_F32, h.n_embd, (int)width, "wave_hidden_cond") ||
-                    !wave_uncond.alloc2d(
-                        magpie, GGML_TYPE_F32, h.n_embd, (int)width, "wave_hidden_uncond")) {
-                    return cancel_worker();
-                }
+                return true;
+            };
 
-                // Open the group: every chunk's cross-K/V, then all of their
-                // baked contexts through one graph, straight into the ring the
-                // steps append to. Step 0's guidance pair comes back in the same
-                // tensors every later step writes.
-                std::vector<std::vector<float>> step0_scores(width);
-                std::vector<char> step0_collect(width, 0);
-                std::vector<MagpieWavePrefillItem> opening(width);
-                // Lane k for item k: this group opens every lane it has.
-                std::vector<int> opening_lanes(width);
-                for (size_t k = 0; k < width; ++k) {
-                    opening_lanes[k] = (int)k;
-                }
-                for (size_t k = 0; k < width; ++k) {
-                    WaveItem& item = *plan[base + k];
-                    MagpieWavePrefillItem& slot = opening[k];
+            // Open the given chunks into the given lanes of a runtime `width`
+            // wide, building it if there is none. Step 0's guidance pair comes
+            // back in the same tensors every later step writes, so the chunks
+            // are sampled straight off the prefill.
+            auto admit_chunks = [&](int width, const std::vector<size_t>& chunks,
+                                    const std::vector<int>& into) -> bool {
+                std::vector<MagpieWavePrefillItem> opening(chunks.size());
+                std::vector<std::vector<float>> scores(chunks.size());
+                std::vector<char> collect(chunks.size(), 0);
+                for (size_t j = 0; j < chunks.size(); ++j) {
+                    WaveItem& item = *plan[chunks[j]];
+                    MagpieWavePrefillItem& slot = opening[j];
                     slot.text_cond = &item.text_cond;
                     slot.text_cond_device = &item.text_cond_device;
                     slot.text_len = item.text_len;
@@ -1778,162 +1782,249 @@ stream_magpie_to_audio(
                     slot.cross_kv = &item.cross_kv;
                     slot.prior = item.prior.priorForStep(h, item.text_len);
                     if (item.prior.shouldCollect(h, 0, item.text_len)) {
-                        step0_collect[k] = 1;
-                        slot.alignment_scores = &step0_scores[k];
+                        collect[j] = 1;
+                        slot.alignment_scores = &scores[j];
                     }
                 }
+                const int64_t admit_start = ggml_time_us();
                 if (!decoder.prefillWave(
-                        opening, opening_lanes, (int)width, params.speaker, params.threads,
+                        opening, into, width, params.speaker, params.threads,
                         max_decoder_positions + 1, wave_text_capacity, &wave_cond, &wave_uncond)) {
                     fprintf(stderr, "%s wave prefill failed\n", label);
-                    return cancel_worker();
-                }
-                // The encoder output has done its only job: building the
-                // cross-K/V the wave attends over.
-                for (size_t k = 0; k < width; ++k) {
-                    plan[base + k]->text_cond_device.reset();
-                    plan[base + k]->text_cond.clear();
-                    plan[base + k]->text_cond.shrink_to_fit();
-                }
-                {
-                    std::vector<int32_t> codes;
-                    std::vector<int32_t> argmax;
-#if defined(MAGPIETTS_CUDA_SAMPLING)
-                    if (!local_sampler->sampleCuda(
-                            wave_cond, wave_uncond, params.use_cfg, h.cfg_scale, h.temperature,
-                            h.top_k, 0 < h.min_generated_frames, workspace.cudaSampler(),
-                            (uint64_t)(uint32_t)params.seed, wave_frame_index, codes, argmax,
-                            (int)width)) {
-                        return cancel_worker();
-                    }
-#else
-                    fprintf(
-                        stderr,
-                        "wave decoding requires CUDA sampling, which was not compiled into this "
-                        "build\n");
-                    return cancel_worker();
-#endif
-                    ++wave_frame_index;
-                    for (size_t k = 0; k < width; ++k) {
-                        if (!wave_step_finish(
-                                *plan[base + k], 0, step0_scores[k], step0_collect[k] != 0, codes,
-                                argmax, (int)k, (int)width)) {
-                            return cancel_worker();
-                        }
-                    }
-                }
-                if (!drain_item(*plan[base])) {
                     return false;
                 }
+                for (size_t j = 0; j < chunks.size(); ++j) {
+                    WaveItem& item = *plan[chunks[j]];
+                    // The encoder output and the chunk's own cross-K/V have done
+                    // their only job: the text the wave attends over now lives in
+                    // the runtime's arena.
+                    item.text_cond_device.reset();
+                    item.text_cond.clear();
+                    item.text_cond.shrink_to_fit();
+                    item.cross_kv.reset();
+                    lane_of[(size_t)into[j]] = &item;
+                }
+                if (params.verbose) {
+                    fprintf(
+                        stderr, "%s wave admit: %zu chunks into %d lanes, %.2f ms\n", label,
+                        chunks.size(), width,
+                        (double)(ggml_time_us() - admit_start) / 1000.0);
+                }
 
-                // Frames leave in chunk order, and as soon as their chunk is
-                // done rather than when the whole group is: the codec is one
-                // in-order stream, so a later chunk cannot overtake, but an
-                // earlier one need not wait for its neighbours.
-                size_t next_flush = 0;
-                for (int step = 1; step < max_decoder_positions; ++step) {
-                    bool all_done = true;
-                    for (size_t k = 0; k < width; ++k) {
-                        if (!plan[base + k]->done) {
-                            all_done = false;
-                            break;
-                        }
+                // Step 0, sampled off the prefill's own hidden pair.
+                std::vector<int32_t> codes;
+                std::vector<int32_t> argmax;
+                std::vector<uint8_t> forbid((size_t)width, 0);
+                for (int l = 0; l < width; ++l) {
+                    const WaveItem* held = lane_of[(size_t)l];
+                    forbid[(size_t)l] =
+                        held && held->step * h.frame_stacking_factor < h.min_generated_frames;
+                }
+#if defined(MAGPIETTS_CUDA_SAMPLING)
+                if (!local_sampler->sampleCuda(
+                        wave_cond, wave_uncond, params.use_cfg, h.cfg_scale, h.temperature, h.top_k,
+                        false, workspace.cudaSampler(), (uint64_t)(uint32_t)params.seed,
+                        wave_frame_index, codes, argmax, width, forbid.data())) {
+                    return false;
+                }
+#else
+                fprintf(
+                    stderr,
+                    "wave decoding requires CUDA sampling, which was not compiled into this "
+                    "build\n");
+                return false;
+#endif
+                ++wave_frame_index;
+                for (size_t j = 0; j < chunks.size(); ++j) {
+                    WaveItem& item = *plan[chunks[j]];
+                    if (!wave_step_finish(
+                            item, scores[j], collect[j] != 0, codes, argmax, into[j], width)) {
+                        return false;
                     }
-                    if (all_done) {
-                        break;
+                    ++item.step;
+                }
+                return true;
+            };
+
+            // The ring holds one opening plus the position budget and no more, so a
+            // chunk that has spent the budget is finished whether or not it has
+            // said so -- the decoder would refuse the next step. The group loop
+            // this replaces enforced the same bound as its own `step <
+            // max_decoder_positions`, which is why it never had to be said here.
+            auto retire_if_exhausted = [&](WaveItem* item) {
+                if (item && !item->done && item->step >= max_decoder_positions) {
+                    if (params.verbose) {
+                        fprintf(
+                            stderr, "%s wave chunk %zu hit the %d-step budget\n", label,
+                            item->chunk_index, max_decoder_positions);
                     }
+                    item->done = true;
+                }
+            };
+
+            // One decode step over every lane, live or not: the graph is a fixed
+            // width, so a lane whose chunk has finished is decoded anyway and its
+            // result thrown away. What `live` buys is that its position stops
+            // advancing, so it cannot run past the ring.
+            auto wave_step = [&](int width) -> bool {
+                std::vector<std::vector<float>> scores((size_t)width);
+                std::vector<char> collect((size_t)width, 0);
+                std::vector<MagpieWaveDecodeItem> slots((size_t)width);
+                std::vector<uint8_t> forbid((size_t)width, 0);
+                for (int l = 0; l < width; ++l) {
+                    WaveItem* item = lane_of[(size_t)l];
+                    MagpieWaveDecodeItem& slot = slots[(size_t)l];
+                    slot.audio_codes = &item->audio_codes;
+                    slot.live = !item->done;
+                    if (!slot.live) {
+                        continue;
+                    }
+                    slot.prior = item->prior.priorForStep(h, item->text_len);
+                    if (item->prior.shouldCollect(h, item->step, item->text_len)) {
+                        collect[(size_t)l] = 1;
+                        slot.alignment_scores = &scores[(size_t)l];
+                    }
+                    // Each chunk's opening frames are its own, so the floor that
+                    // stops it ending before it has said anything is its own too.
+                    forbid[(size_t)l] =
+                        item->step * h.frame_stacking_factor < h.min_generated_frames;
+                }
+                const ggml_nvtx::range nvtx_step("magpietts_stream_wave_step");
+                // One slot more than the step budget: the prefill takes one
+                // and each step takes another, so at exactly the budget the
+                // last step finds the ring full. The single-item path
+                // survives that by falling back to the non-persistent
+                // decoder; a wave has no fallback and fails the run.
+                if (!decoder.evalWave(
+                        slots, max_decoder_positions + 1, wave_text_capacity, &wave_cond,
+                        &wave_uncond)) {
+                    fprintf(stderr, "%s wave decode step failed\n", label);
+                    return false;
+                }
+                // One sampler call for the whole wave: the local transformer
+                // runs its rounds once, with width items per round.
+                std::vector<int32_t> codes;
+                std::vector<int32_t> argmax;
+#if defined(MAGPIETTS_CUDA_SAMPLING)
+                if (!local_sampler->sampleCuda(
+                        wave_cond, wave_uncond, params.use_cfg, h.cfg_scale, h.temperature, h.top_k,
+                        false, workspace.cudaSampler(), (uint64_t)(uint32_t)params.seed,
+                        wave_frame_index, codes, argmax, width, forbid.data())) {
+                    return false;
+                }
+#else
+                fprintf(
+                    stderr,
+                    "wave decoding requires CUDA sampling, which was not compiled into this "
+                    "build\n");
+                return false;
+#endif
+                ++wave_frame_index;
+                for (int l = 0; l < width; ++l) {
+                    WaveItem* item = lane_of[(size_t)l];
+                    if (item->done) {
+                        continue;
+                    }
+                    if (!wave_step_finish(
+                            *item, scores[(size_t)l], collect[(size_t)l] != 0, codes, argmax, l,
+                            width)) {
+                        return false;
+                    }
+                    ++item->step;
+                }
+                return true;
+            };
+
+            // Chunk 0, in a runtime of its own.
+            if (!chunk_ids.empty()) {
+                if (!prepare_chunk(0)) {
+                    return cancel_worker();
+                }
+                if (!wave_cond.alloc2d(magpie, GGML_TYPE_F32, h.n_embd, 1, "wave_hidden_cond") ||
+                    !wave_uncond.alloc2d(
+                        magpie, GGML_TYPE_F32, h.n_embd, 1, "wave_hidden_uncond")) {
+                    return cancel_worker();
+                }
+                lane_of.assign(1, nullptr);
+                if (!admit_chunks(1, {0}, {0}) || !drain_in_order()) {
+                    return cancel_worker();
+                }
+                for (retire_if_exhausted(plan[0].get()); !plan[0]->done;
+                     retire_if_exhausted(plan[0].get())) {
                     if (codec_worker.is_failed()) {
                         codec_worker.join();
                         return false;
                     }
-                    const int frames_remaining =
-                        h.max_decoder_steps - step * h.frame_stacking_factor;
-                    if (frames_remaining <= 0) {
-                        break;
+                    if (!wave_step(1) || !drain_in_order()) {
+                        return cancel_worker();
                     }
+                }
+                decoder.resetWave();
+                wave_cond.reset();
+                wave_uncond.reset();
+            }
 
-                    // A finished item keeps stepping so the wave stays in
-                    // lockstep; its output is dropped.
-                    std::vector<std::vector<float>> scores(width);
-                    std::vector<char> collect(width, 0);
-                    std::vector<MagpieWaveDecodeItem> slots(width);
-                    for (size_t k = 0; k < width; ++k) {
-                        WaveItem& item = *plan[base + k];
-                        MagpieWaveDecodeItem& slot = slots[k];
-                        slot.audio_codes = &item.audio_codes;
-                        slot.prior = item.prior.priorForStep(h, item.text_len);
-                        if (!item.done && item.prior.shouldCollect(h, step, item.text_len)) {
-                            collect[k] = 1;
-                            slot.alignment_scores = &scores[k];
-                        }
-                    }
-                    const ggml_nvtx::range nvtx_step("magpietts_stream_wave_step");
-                    // One slot more than the step budget: the prefill takes one
-                    // and each step takes another, so at exactly the budget the
-                    // last step finds the ring full. The single-item path
-                    // survives that by falling back to the non-persistent
-                    // decoder; a wave has no fallback and fails the run.
-                    if (!decoder.evalWave(
-                            slots, max_decoder_positions + 1, wave_text_capacity, &wave_cond,
-                            &wave_uncond)) {
-                        fprintf(stderr, "%s wave decode step %d failed\n", label, step);
-                        return cancel_worker();
-                    }
-                    // One sampler call for the whole wave: the local transformer
-                    // runs its 8 rounds once, with width items per round.
-                    std::vector<int32_t> codes;
-                    std::vector<int32_t> argmax;
-#if defined(MAGPIETTS_CUDA_SAMPLING)
-                    if (!local_sampler->sampleCuda(
-                            wave_cond, wave_uncond, params.use_cfg, h.cfg_scale, h.temperature,
-                            h.top_k, step * h.frame_stacking_factor < h.min_generated_frames,
-                            workspace.cudaSampler(), (uint64_t)(uint32_t)params.seed,
-                            wave_frame_index, codes, argmax, (int)width)) {
-                        return cancel_worker();
-                    }
-#else
-                    fprintf(
-                        stderr,
-                        "wave decoding requires CUDA sampling, which was not compiled into this "
-                        "build\n");
+            // Everything after it, in one runtime held for the rest of the run.
+            if (wave_lanes > 0) {
+                if (!wave_cond.alloc2d(
+                        magpie, GGML_TYPE_F32, h.n_embd, wave_lanes, "wave_hidden_cond") ||
+                    !wave_uncond.alloc2d(
+                        magpie, GGML_TYPE_F32, h.n_embd, wave_lanes, "wave_hidden_uncond")) {
                     return cancel_worker();
-#endif
-                    ++wave_frame_index;
-                    for (size_t k = 0; k < width; ++k) {
-                        if (!wave_step_finish(
-                                *plan[base + k], step, scores[k], collect[k] != 0, codes, argmax,
-                                (int)k, (int)width)) {
+                }
+                lane_of.assign((size_t)wave_lanes, nullptr);
+                if (params.verbose) {
+                    fprintf(
+                        stderr, "%s wave scheduler: %zu chunks, %d lanes, pinned history %d\n",
+                        label, chunk_ids.size(), wave_lanes, params.longform_history_tokens);
+                }
+                size_t next_chunk = 1;
+                while (next_chunk < chunk_ids.size()) {
+                    // A cohort at a time: every lane is refilled once the whole
+                    // group it held has finished. Continuous batching turns this
+                    // into "once enough of them have".
+                    std::vector<size_t> chunks;
+                    std::vector<int> into;
+                    for (int l = 0; l < wave_lanes && next_chunk < chunk_ids.size(); ++l) {
+                        if (!prepare_chunk(next_chunk)) {
+                            return cancel_worker();
+                        }
+                        chunks.push_back(next_chunk++);
+                        into.push_back(l);
+                    }
+                    if (!admit_chunks(wave_lanes, chunks, into) || !drain_in_order()) {
+                        return cancel_worker();
+                    }
+                    for (;;) {
+                        bool any_live = false;
+                        for (int l = 0; l < wave_lanes; ++l) {
+                            retire_if_exhausted(lane_of[(size_t)l]);
+                            if (lane_of[(size_t)l] && !lane_of[(size_t)l]->done) {
+                                any_live = true;
+                                break;
+                            }
+                        }
+                        if (!any_live) {
+                            break;
+                        }
+                        if (codec_worker.is_failed()) {
+                            codec_worker.join();
+                            return false;
+                        }
+                        if (!wave_step(wave_lanes) || !drain_in_order()) {
                             return cancel_worker();
                         }
                     }
-                    if (next_flush < width && !drain_item(*plan[base + next_flush])) {
-                        return false;
-                    }
-                    while (next_flush < width && plan[base + next_flush]->done) {
-                        if (!flush_item(
-                                *plan[base + next_flush],
-                                base + next_flush + 1 == chunk_ids.size())) {
-                            return false;
-                        }
-                        ++next_flush;
-                        if (next_flush < width && !drain_item(*plan[base + next_flush])) {
-                            return false;
-                        }
-                    }
                 }
-
-                for (size_t k = next_flush; k < width; ++k) {
-                    WaveItem& item = *plan[base + k];
-                    const bool last_chunk = base + k + 1 == chunk_ids.size();
-                    if (!flush_item(item, last_chunk)) {
-                        return false;
-                    }
-                }
-                // The wave graph held pointers to these for the group's life.
                 decoder.resetWave();
-                for (size_t k = 0; k < width; ++k) {
-                    plan[base + k]->cross_kv.reset();
+            }
+
+            // Anything still holding frames -- the tail of the drain order.
+            while (next_drain < plan.size()) {
+                if (!flush_item(*plan[next_drain], next_drain + 1 == chunk_ids.size())) {
+                    return false;
                 }
+                ++next_drain;
             }
         }
 
