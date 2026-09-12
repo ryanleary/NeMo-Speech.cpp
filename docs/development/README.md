@@ -15,4 +15,7 @@ the server want [ASR configuration](../asr/configuration.md),
   they are applied at build setup.
 - [`cublas-shim.md`](cublas-shim.md) - the in-tree drop-in cuBLAS replacement
   under `kernels/` and where the custom GPU kernels live.
+- [`tts-wave-scheduler/`](tts-wave-scheduler/README.md) - batched long-form TTS
+  decoding: the wave scheduler, continuous batching, and the measurements behind
+  them.
 - [Windows build notes](windows-build.md)

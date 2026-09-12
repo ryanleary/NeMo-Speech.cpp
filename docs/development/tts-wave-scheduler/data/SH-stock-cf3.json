@@ -1,0 +1,134 @@
+{
+ "label": "stock-cf3",
+ "reps": 5,
+ "seed": 7,
+ "greedy": true,
+ "runs": {
+  "line": [
+   {
+    "e2e_rtf": 0.0449,
+    "decoder_itl_avg_ms": 1.81,
+    "codec_rtfx": 26.93,
+    "codec_ttfa_ms": 6.69,
+    "e2e_ttfa_ms": 27.57,
+    "e2e_audio_s": 2.74
+   },
+   {
+    "e2e_rtf": 0.0452,
+    "decoder_itl_avg_ms": 1.79,
+    "codec_rtfx": 26.81,
+    "codec_ttfa_ms": 6.67,
+    "e2e_ttfa_ms": 27.85,
+    "e2e_audio_s": 2.74
+   },
+   {
+    "e2e_rtf": 0.0451,
+    "decoder_itl_avg_ms": 1.81,
+    "codec_rtfx": 26.9,
+    "codec_ttfa_ms": 6.75,
+    "e2e_ttfa_ms": 27.87,
+    "e2e_audio_s": 2.74
+   },
+   {
+    "e2e_rtf": 0.045,
+    "decoder_itl_avg_ms": 1.8,
+    "codec_rtfx": 26.88,
+    "codec_ttfa_ms": 6.65,
+    "e2e_ttfa_ms": 27.63,
+    "e2e_audio_s": 2.74
+   },
+   {
+    "e2e_rtf": 0.0446,
+    "decoder_itl_avg_ms": 1.79,
+    "codec_rtfx": 26.89,
+    "codec_ttfa_ms": 6.71,
+    "e2e_ttfa_ms": 26.52,
+    "e2e_audio_s": 2.74
+   }
+  ],
+  "paragraph": [
+   {
+    "e2e_rtf": 0.0408,
+    "decoder_itl_avg_ms": 1.77,
+    "codec_rtfx": 29.65,
+    "codec_ttfa_ms": 6.66,
+    "e2e_ttfa_ms": 27.88,
+    "e2e_audio_s": 25.449
+   },
+   {
+    "e2e_rtf": 0.0406,
+    "decoder_itl_avg_ms": 1.76,
+    "codec_rtfx": 29.55,
+    "codec_ttfa_ms": 6.67,
+    "e2e_ttfa_ms": 27.42,
+    "e2e_audio_s": 25.449
+   },
+   {
+    "e2e_rtf": 0.0411,
+    "decoder_itl_avg_ms": 1.78,
+    "codec_rtfx": 29.66,
+    "codec_ttfa_ms": 6.67,
+    "e2e_ttfa_ms": 27.84,
+    "e2e_audio_s": 25.449
+   },
+   {
+    "e2e_rtf": 0.041,
+    "decoder_itl_avg_ms": 1.78,
+    "codec_rtfx": 29.56,
+    "codec_ttfa_ms": 6.71,
+    "e2e_ttfa_ms": 28.05,
+    "e2e_audio_s": 25.449
+   },
+   {
+    "e2e_rtf": 0.0411,
+    "decoder_itl_avg_ms": 1.78,
+    "codec_rtfx": 29.67,
+    "codec_ttfa_ms": 6.69,
+    "e2e_ttfa_ms": 28.04,
+    "e2e_audio_s": 25.449
+   }
+  ],
+  "script": [
+   {
+    "e2e_rtf": 0.0407,
+    "decoder_itl_avg_ms": 1.76,
+    "codec_rtfx": 30.1,
+    "codec_ttfa_ms": 6.71,
+    "e2e_ttfa_ms": 28.0,
+    "e2e_audio_s": 100.032
+   },
+   {
+    "e2e_rtf": 0.0409,
+    "decoder_itl_avg_ms": 1.77,
+    "codec_rtfx": 30.11,
+    "codec_ttfa_ms": 6.69,
+    "e2e_ttfa_ms": 27.92,
+    "e2e_audio_s": 100.032
+   },
+   {
+    "e2e_rtf": 0.041,
+    "decoder_itl_avg_ms": 1.77,
+    "codec_rtfx": 30.08,
+    "codec_ttfa_ms": 6.75,
+    "e2e_ttfa_ms": 28.14,
+    "e2e_audio_s": 100.032
+   },
+   {
+    "e2e_rtf": 0.041,
+    "decoder_itl_avg_ms": 1.77,
+    "codec_rtfx": 29.99,
+    "codec_ttfa_ms": 6.71,
+    "e2e_ttfa_ms": 28.18,
+    "e2e_audio_s": 100.032
+   },
+   {
+    "e2e_rtf": 0.0409,
+    "decoder_itl_avg_ms": 1.76,
+    "codec_rtfx": 30.06,
+    "codec_ttfa_ms": 6.69,
+    "e2e_ttfa_ms": 27.89,
+    "e2e_audio_s": 100.032
+   }
+  ]
+ }
+}

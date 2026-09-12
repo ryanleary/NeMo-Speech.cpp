@@ -1,0 +1,96 @@
+BATCHED CROSS-ATTENTION -- the wave now beats the fork
+perf/upstream-best, greedy, median of 5, GB300 idle-gated.
+
+  case        seq      wave-8    wave-16   delta (16)
+  line       0.0394    0.0394    0.0394     +0.0%   (one chunk, control)
+  paragraph  0.0356    0.0220    0.0220    -38.2%
+  script     0.0358    0.0195    0.0176    -50.8%
+
+  decoder ITL 1.55 -> 0.61 ms
+
+Against stock upstream a5b6953 (script 0.0401): -56.1%.
+Against our fork's wave-16 (script 0.0204): -13.7%. We are ahead.
+
+WHAT MOVED IT
+
+Profiling the width-16 step found the GPU busy only 121 ms of a 1288 ms
+decode. The cost was not arithmetic and not transfer -- it was the sheer
+number of sequential tiny ops, roughly 0.25 us of latency each even
+inside a captured CUDA graph. Cross-attention ran once per item, so the
+graph grew with the wave:
+
+  width 1     639 nodes
+  width 16   4649 nodes
+
+Batching it puts every item's cross K/V in one arena padded to the wave's
+widest text, with an additive mask that is zero inside a chunk's own
+length and -inf past it. One batched matmul replaces one attention per
+item, and the graph stops growing:
+
+  width 16    617 nodes   (was 4649)
+
+Step 4.72 -> ~2.4 ms, and RTF 0.0229 -> 0.0176.
+
+TWO BUGS FOUND, BOTH THE SAME SHAPE
+
+The local transformer's composed CUDA graph captures the *device
+pointers* of the hidden tensors it was built against. It has now bitten
+three times:
+
+  1. per-item hidden tensors      -> chunk 0 right, later chunks babble
+  2. per-group wave_cond/uncond   -> group 1 emitted 167 s of audio for
+                                     a 101 s script, because it had the
+                                     same width as group 0 and so never
+                                     invalidated
+  3. width change between groups  -> composed at one width, replayed at
+                                     another
+
+The chain is now invalidated on a change of width *or* of either hidden
+tensor's address, and given three eager passes to warm before recomposing
+-- composing too early fails once and disables the chain for the run.
+
+CAVEAT WORTH CHECKING BY EAR
+
+Script audio holds at 101.5 s against the sequential 101.7 s (-0.2%).
+Paragraph comes out 24.8 s against 26.0 s (-4.6%), which is larger than
+greedy divergence usually accounts for. Worth a listen before this is
+called done.
+
+FINAL PROFILE (width 16, script, nsys NVTX)
+
+  magpietts_stream_generation_loop      1014 ms   (producer thread)
+  magpietts_stream_codec_worker_run     1019 ms   (consumer thread, parallel)
+
+  Inside the generation loop:
+    wave_step                    632 ms  n=284  med 2.430 ms   62%
+      persistent_decoder_eval_wave 439 ms        med 1.719 ms
+      sample_local_codebooks_cuda  188 ms        med 0.702 ms
+    encoder_eval_device           93 ms  n=21    med 2.532 ms    9%
+    remainder                   ~290 ms                         29%
+      (per-group step-0 prefills through the single-item path,
+       host gathers into the wave pair, and flushes)
+
+  Inside the codec worker:
+    nanocodec_decode_eval_stream 1173 ms n=549   med 1.971 ms
+
+THE DISTRIBUTION HAS FLIPPED. Decoder and codec are now within 0.5% of
+each other and run concurrently, so the wall clock is max(them). Further
+decoder work has little headroom left until the codec moves.
+
+REMAINING FRUIT, RANKED
+
+  1. Codec chunk width (--tts.chunk-frames 3 -> 32) is worth RTF 0.0176
+     -> ~0.0102 on its own. Pre-existing knob, applies to stock main too,
+     and costs byte-reproducibility (-49 dB SNR). A deployment choice
+     rather than a patch.
+  2. The ~290 ms of per-group step-0 work, 29% of the producer thread.
+     Twenty chunks each open through the single-item decoder path, and
+     each one's opening hidden state is gathered into the wave pair by a
+     host round trip. Batching the opening prefill would recover most of
+     it.
+  3. Encoder at 93 ms, of which about 20% is the overlapping history
+     windows that get encoded and then overwritten -- a pre-existing
+     waste, unchanged by any of this.
+
+  Nothing else in the decoder looks cheap: the wave step is 2.43 ms for
+  16 items, or 0.15 ms per item against 1.55 ms sequential.

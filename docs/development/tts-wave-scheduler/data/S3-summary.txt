@@ -1,0 +1,55 @@
+S3 = perf/upstream-best @ 4d17924 (tag best/s3-flash-attn)
+  origin/main a5b6953 + #28 guard + #32 elision + #33 SVE/im2col + 0024 norm
+  + #37 codec device state + flash_attn_ext decoder attention
+
+  case        stock a5b6953   S3        delta
+  line          0.0430      0.0396     -7.9%
+  paragraph     0.0401      0.0356    -11.2%
+  script        0.0401      0.0357    -11.0%
+
+  kernels 43.09 -> 40.37 ms/audio-s; self-attn 6.47 -> 3.57 (-45%)
+  graph replays 51.0 -> 50.9 (preserved); GPU busy 70.5% -> 72.0%
+
+  Largest remaining kernel: mul_mat_vec_f, 9.86 ms/audio-s (24.4%) over
+  3091 launches/audio-s -- single-token mat-vec, which is what the wave
+  turns into mat-mat. Next target.
+
+WAVE PROOF OF LIFE (4c765a5, tag wave/proof-of-life)
+  Decode step batched over 2B lanes. MAGPIETTS_WAVE_PROBE=B replicates the
+  live item into B slots to measure step cost against batch.
+
+  B    decoder ITL   work   time
+  1      1.55 ms      1x    1.00x
+  2      1.61 ms      2x    1.04x
+  4      1.81 ms      4x    1.17x
+  8      2.00 ms      8x    1.29x
+
+  Item 0 bit-identical at frame 0 for every B (line and paragraph); first
+  difference always frame 1+; B=2 line same length. Step-0 exactness is the
+  gate, not a file hash -- batching changes the matmul kernel, which changes
+  the last bits, which flips a greedy argmax.
+
+  Implication: 8 chunks decoded together cost 2.00 ms/step against 8 x 1.55
+  = 12.4 ms sequentially, i.e. ~6.2x less decoder time per chunk. Real gain
+  bounded by the codec (RTFx ~70 = RTF 0.0143) and by chunk availability.
+
+  NOT the wave yet: no scheduler, no per-item text, no per-item cross-KV,
+  LT still single-item. Probe does B x work for one output so its RTF rises.
+
+HISTORY PINNING (6c93673) -- the wave's semantic prerequisite, measured
+  20-sentence script, greedy, sequential decode:
+
+  history      audio      RTF      sha256
+  adaptive    101.657s   0.0358   5c5d4ebc9e3b
+  0           104.768s   0.0357   04e89741765d   (different output)
+  20          101.657s   0.0358   5c5d4ebc9e3b   (IDENTICAL to adaptive)
+
+  Pinning at 20 reproduces the adaptive output byte for byte here. The
+  adaptive path only diverges when required_history exceeds default_history
+  = min(prior_tokens, current_tokens, 20, max_history), i.e. when a chunk
+  under-attends and the next needs a longer window to recover. So the wave's
+  semantic cost is zero on inputs where that never happens, and pinning at 20
+  is the setting that preserves current behaviour.
+
+  --tts.batch-size > 1 refuses without a pinned history rather than silently
+  falling back. Defaults (batch 1, adaptive) are bit-identical to S3.

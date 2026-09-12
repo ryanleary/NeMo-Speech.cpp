@@ -1,0 +1,36 @@
+F16 KV arena for upstream's fused attention: MEASURED, REJECTED (2026-09-09)
+
+Converted the persistent K/V arena from F32 to F16 (decoder arena, local
+transformer arena, kernel cache pointers templated on the cache type, strides
+fixed to divide by the arena's own element size).
+
+Kernel time, five-sentence paragraph, per audio-second, identical launch counts:
+
+  kernel                              F32 arena   F16 arena
+  fused_cached_attention_q1_d64        6.47 ms     8.01 ms    +24%
+  fused_attention_kernel               2.05 ms     2.04 ms      --
+  fused_attention_update_cache         0.66 ms     0.67 ms      --
+
+End to end (greedy, median of 5, idle-gated), against the S0 stack:
+
+  case        S0 (F32)   S1 (F16)
+  line          0.0386     0.0391
+  paragraph     0.0368     0.0383
+  script        0.0368     0.0386
+
+Halving the bytes made it slower. The kernel is NOT bandwidth-bound on the
+arena: attention_load4(const half*) fetches an int2 (8 bytes) and converts four
+values, where attention_load4(const float*) is one 16-byte float4 load. Same
+number of load instructions, half the bytes, plus conversion ALU on the critical
+path -- strictly worse for a kernel bound by instruction latency rather than
+bandwidth.
+
+Consequence for the flash_attn_ext plan: the projected win (our 4.37 ms/audio-s
+against their 9.74) cannot be attributed to F16 storage. It has to come from the
+kernel's structure -- tiling and occupancy -- so that swap should be attempted
+with the arena left in F32.
+
+Untested variant that could rescue F16: widen the half load path to 16 bytes
+(8 halves) per instruction instead of 8, so the byte saving also halves the
+number of loads. That needs the kernel's inner loop restructured to consume 8
+elements per step rather than 4.

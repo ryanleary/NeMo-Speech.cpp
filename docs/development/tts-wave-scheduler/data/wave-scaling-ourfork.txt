@@ -1,0 +1,19 @@
+Wave scaling on our fork (tts/zero-shot-cloning @ bb15b7d), 20-sentence script,
+greedy, --tts.longform-history-tokens 0, GB300 idle. One run per width.
+
+width   e2e RTF   decoder ITL   speedup vs width 1
+    1    0.0417       1.80 ms         1.00x
+    4    0.0251       3.21 ms         1.66x
+    8    0.0220       4.48 ms         1.90x
+   16    0.0204       5.91 ms         2.04x
+
+ITL grows 3.3x for 16x the work: the mat-vec -> mat-mat effect.
+
+Calibration against upstream a5b6953 + codec-device-state (item 1), same script,
+same harness: 0.0395 at width 1 against our 0.0417, so upstream's sequential
+decode is ~5% faster per step. The wave's ~2.0x should therefore largely carry,
+putting a wave-16 upstream script near RTF 0.021.
+
+Codec ceiling: without item 1 the codec caps at RTFx 39 = RTF 0.0256, which
+would bind before the decoder reached 0.021. With item 1 (RTFx 70 = RTF 0.0143)
+it does not. Item 1 is a prerequisite for the wave paying out.

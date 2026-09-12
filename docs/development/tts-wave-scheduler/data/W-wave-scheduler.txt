@@ -1,0 +1,51 @@
+WAVE SCHEDULER on upstream -- working, measured
+perf/upstream-best, greedy, median of 5, GB300 idle-gated.
+Wave arm: --tts.batch-size 8 --tts.longform-history-tokens 20
+
+  case        seq RTF   wave-8 RTF   delta    decoder ITL      codec RTFx
+  line         0.0394     0.0394      0.0%    1.67 -> 1.68     68 -> 68
+  paragraph    0.0356     0.0335     -5.9%    1.55 -> 0.99     69 -> 97
+  script       0.0358     0.0323     -9.8%    1.55 -> 1.28     69 -> 98
+
+Line is one chunk, so there is no wave to form and nothing moves -- that
+is the control.
+
+Against stock upstream a5b6953 (script 0.0401) the stack is now -19.5%.
+
+Single-run width sweep on the script case, for shape:
+  seq 0.0382 | w=2 0.0366 | w=4 0.0336 | w=8 0.0322
+Audio duration holds at 99-102 s across all widths, so the wave is not
+buying speed by generating less.
+
+WHY THE GAIN IS SMALLER THAN THE 2.3x PROJECTION
+
+Decoder ITL falls 1.55 -> 1.28 ms (script), not to ~0.7. Three reasons:
+  1. The local transformer is still serial per item and is 35% of a step.
+     Batching it is the remaining lever (projected ~5.6x on the decoder).
+  2. A wave runs until its slowest chunk finishes; finished items keep
+     stepping and their output is discarded. Occupancy is mean/max over
+     the group, and sentence lengths vary a lot.
+  3. The codec floor (RTFx ~70 sequential) binds sooner once the decoder
+     speeds up. Wave codec RTFx reads 97 because frames now arrive in
+     bursts, which is a measurement artefact of batching, not a codec
+     improvement.
+
+ROOT CAUSE OF THE EARLIER WRONG AUDIO (fixed)
+
+The local transformer composes its 8-codebook chain into one reusable
+CUDA graph, and that graph captures the *device pointers* of the hidden
+tensors it was composed against. Each wave item had its own
+cond_hidden/uncond_hidden, so from the second chunk on the replayed
+graph read the first chunk's stale hidden state: the LT emitted
+near-constant codes, the decoder stalled, alignment froze, and every
+chunk ran to max steps producing ~2x the audio.
+
+Signature: chunk 0 correct, all later chunks wrong; identical at width 1;
+independent of the history setting; and alignment matching the sequential
+path exactly for 11 steps before freezing. The composition message prints
+during chunk 0, which is what pinned it down.
+
+Fix: one stable pair of [n_embd,1] tensors for the whole run, with each
+item's hidden copied in before its sampler call. Our fork never hit this
+because it allocates one wave_cond/wave_uncond pair and passes them to a
+batched sampler.

@@ -1,0 +1,37 @@
+LT SHARE OF A DECODE STEP -- measured, not assumed
+perf/upstream-best @ a4a942a, paragraph case, greedy, GB300 idle,
+nsys --trace=nvtx,cuda, medians over 592 steps.
+
+  magpietts_stream_generation_step        1.408 ms   (592 instances)
+    magpietts_persistent_decoder_eval     0.902 ms   64%   (582)
+    magpietts_sample_local_codebooks_cuda 0.486 ms   35%   (592)
+
+The two account for the whole step (0.902 + 0.486 = 1.388 of 1.408).
+
+WHAT THAT IMPLIES FOR THE WAVE
+
+The probe measured whole-step ITL while the LT ran once, so its curve is
+decoder(B) + LT(1):
+
+  B    probe ITL   implied decoder-only
+  1      1.55 ms      1.06 ms
+  8      2.00 ms      1.51 ms      (8x work, 1.42x time)
+
+Two wave designs, at width 8:
+
+  serial per-item LT   1.51 + 8 x 0.49 = 5.43 ms / 8 = 0.68 ms/item   2.3x
+  batched LT (W2)      1.51 + 1 x 0.69 = 2.20 ms / 8 = 0.28 ms/item   5.6x
+
+The 5.6x is consistent with our fork's measured 4.9x at width 16, which
+has a batched LT. Projected script RTF, taking the codec floor (RTFx 70
+= RTF 0.0143) as fixed and scaling only the decoder's share of 0.0357:
+
+  today (S3)            0.0357
+  wave, serial LT       ~0.0236   -34% vs S3, -41% vs stock upstream
+  wave, batched LT      ~0.0181   -49% vs S3
+
+CONCLUSION: build the scheduler with a serial per-item LT first. It is
+worth 2.3x on its own, it needs no change to the LT or the CUDA sampler,
+and it proves the per-item cross-attention, per-item alignment, and
+per-item seeding that a batched LT would otherwise be debugged on top of.
+Batch the LT second, as a pure speedup against a working baseline.
