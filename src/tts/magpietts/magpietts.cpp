@@ -1985,8 +1985,14 @@ stream_magpie_to_audio(
                 // fraction is an empirical question; a quarter of the lanes is
                 // the starting point, and the verbose trace below is what makes
                 // it measurable.
-                constexpr int kWaveAdmitFraction = 4;
-                const int admit_threshold = std::max(1, wave_lanes / kWaveAdmitFraction);
+                // Swept at width 32 over 150 chunks of prose: 1 lane costs 112x
+                // realtime (107 bursts, all prefill), 2 gives 125x, 4 gives 134x,
+                // 8 gives 133x, 16 gives 132x and 24 falls back to 124x as lanes
+                // sit idle. The optimum is a plateau at 4 to 8; below it the
+                // prefills dominate, above it the idle lanes do. Never fewer than
+                // two, so a narrow wave does not end up admitting singly.
+                constexpr int kWaveAdmitFraction = 8;
+                const int admit_threshold = std::max(2, wave_lanes / kWaveAdmitFraction);
                 size_t next_chunk = 1;
                 int64_t idle_lane_steps = 0;
                 int bursts = 0;
