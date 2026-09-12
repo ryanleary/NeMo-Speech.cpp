@@ -102,6 +102,10 @@ struct stream_latency_metrics {
 };
 
 struct stream_run_metrics {
+    // The caller stopped reading. Not a failure: it is the one way a run ends
+    // early on purpose, and everything downstream of the PCM callback reports
+    // it exactly as it would report a decode error.
+    bool cancelled = false;
     int64_t start_us = 0;
     int chunks = 0;
     int e2e_chunks = 0;

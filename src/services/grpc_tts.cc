@@ -266,7 +266,7 @@ GrpcTtsService::Synthesize(
                 audio.append(pcm);
                 return true;
             });
-        if (ctx->IsCancelled())
+        if (result.cancelled || ctx->IsCancelled())
             return grpc::Status(grpc::StatusCode::CANCELLED, "client cancelled");
         resp->set_audio(std::move(audio));
         fill_response_metadata(*resp, req->id(), result.metadata);
@@ -301,7 +301,7 @@ GrpcTtsService::SynthesizeOnline(
                     }
                     return true;
                 });
-            if (write_failed || ctx->IsCancelled())
+            if (result.cancelled || write_failed || ctx->IsCancelled())
                 return grpc::Status(grpc::StatusCode::CANCELLED, "client stopped reading");
             log_benchmark(benchmark_, "streaming", req, result);
         }

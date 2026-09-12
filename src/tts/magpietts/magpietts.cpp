@@ -963,7 +963,11 @@ struct stream_audio_outputs {
         }
 
         if (pcm_callback && !pcm_callback(bytes)) {
-            fprintf(stderr, "failed to write PCM callback output\n");
+            // A caller that stops reading has not failed. Record it, and let
+            // every layer above tell the two apart by asking.
+            if (metrics) {
+                metrics->cancelled = true;
+            }
             return false;
         }
 
@@ -1414,6 +1418,17 @@ struct codec_stream_worker {
         }
     }
 
+    // Stop serving a channel without calling it a failure.
+    void retire_now(codec_channel& ch) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            ch.input_closed = true;
+            ch.retired = true;
+        }
+        has_room.notify_all();
+        channel_retired.notify_all();
+    }
+
     void set_failed(codec_channel& ch, const std::string& message) {
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -1617,7 +1632,13 @@ struct codec_stream_worker {
                         work.item.frames, threads, *ch.outputs, ch.audio_pp, ch.metrics,
                         ch.run_label, work.item.chunk_index, work.item.history_frames,
                         work.item.final_read, verbose)) {
-                    set_failed(ch, "decode or audio output failed");
+                    if (ch.metrics && ch.metrics->cancelled) {
+                        // The caller stopped reading mid-chunk. Retire the
+                        // stream quietly -- there is nobody left to give it to.
+                        retire_now(ch);
+                    } else {
+                        set_failed(ch, "decode or audio output failed");
+                    }
                     continue;
                 }
                 ++ch.chunks_done;
@@ -1924,7 +1945,9 @@ struct WaveSession {
         while (written < item.frames.size() && sink.has_room()) {
             const std::vector<int32_t>& frame = item.frames[written];
             if (!code_writer.write_frame(frame) || !sink.write_frame(frame)) {
-                fprintf(stderr, "failed to write streamed codec frame\n");
+                if (!metrics.cancelled) {
+                    fprintf(stderr, "failed to write streamed codec frame\n");
+                }
                 sink.cancel();
                 return false;
             }
@@ -2588,7 +2611,9 @@ struct MagpieWaveService {
         for (WaveSession* s : active) {
             const size_t before = s->next_drain;
             if (!s->drain_in_order()) {
-                s->fail_reason = "could not hand a decoded frame to the codec";
+                s->fail_reason = s->metrics.cancelled
+                                     ? "the caller stopped reading"
+                                     : "could not hand a decoded frame to the codec";
                 broken.push_back(s);
                 continue;
             }
@@ -2962,12 +2987,14 @@ stream_magpie_to_audio(
             label, params.use_stateful_codec ? "fast stateful" : "rolling-window");
     }
 
-    // Only this request's stream is dropped. The worker and its other channels
-    // keep running.
-    auto cancel_worker = [&]() -> bool {
+    // End this request early. Only its own stream is dropped; the worker and
+    // its other channels keep running. Whether that is a failure depends on who
+    // asked: a caller that stopped reading gets its audio so far and a clean
+    // return, anything else gets false.
+    auto end_run = [&]() -> bool {
         codec_out.cancel();
         codec_out.release();
-        return false;
+        return metrics.cancelled;
     };
 
     int frames_generated = 0;
@@ -3012,7 +3039,7 @@ stream_magpie_to_audio(
                     boundary_silence_dist}));
                 sessions.back()->discard_audio = true;
                 if (!sessions.back()->plan_chunks()) {
-                    return cancel_worker();
+                    return end_run();
                 }
                 capacity = std::max(capacity, sessions.back()->text_capacity);
             }
@@ -3024,7 +3051,7 @@ stream_magpie_to_audio(
                 engine.idle_codes[c].assign((size_t)h.frame_stacking_factor, h.audio_bos_id);
             }
             if (!engine.open(magpie, probe_lanes, capacity, max_decoder_positions + 1)) {
-                return cancel_worker();
+                return end_run();
             }
             const int admit_threshold = std::max(2, probe_lanes / 8);
 
@@ -3082,7 +3109,7 @@ stream_magpie_to_audio(
                 all_lanes[(size_t)l] = l;
             }
             if (!fill(all_lanes)) {
-                return cancel_worker();
+                return end_run();
             }
             for (;;) {
                 for (int l = 0; l < probe_lanes; ++l) {
@@ -3096,7 +3123,7 @@ stream_magpie_to_audio(
                     plan_wave_admission(engine.idle_mask(), pending, admit_threshold);
                 if (!admit.empty()) {
                     if (!fill(admit)) {
-                        return cancel_worker();
+                        return end_run();
                     }
                     continue;
                 }
@@ -3104,11 +3131,11 @@ stream_magpie_to_audio(
                     break;
                 }
                 if (!engine.step()) {
-                    return cancel_worker();
+                    return end_run();
                 }
                 for (auto& who : sessions) {
                     if (!who->drain_in_order()) {
-                        return cancel_worker();
+                        return end_run();
                     }
                 }
             }
@@ -3141,7 +3168,7 @@ stream_magpie_to_audio(
             MagpieWaveService* service = workspace.waveService(
                 wave_width, params.threads, h, local_sampler, params.verbose);
             if (!service) {
-                return cancel_worker();
+                return end_run();
             }
             WaveSession session{magpie,
                                 workspace.encoder,
@@ -3158,7 +3185,7 @@ stream_magpie_to_audio(
                                 boundary_silence_rng,
                                 boundary_silence_dist};
             if (!session.plan_chunks()) {
-                return cancel_worker();
+                return end_run();
             }
             if (params.verbose) {
                 fprintf(
@@ -3169,10 +3196,13 @@ stream_magpie_to_audio(
             const int64_t idle_before = service->engine.idle_lane_steps;
             const int bursts_before = service->engine.bursts;
             if (!service->submit(session)) {
-                fprintf(
-                    stderr, "%s wave session failed: %s\n", label,
-                    session.fail_reason.empty() ? "no reason recorded" : session.fail_reason.c_str());
-                return cancel_worker();
+                if (!metrics.cancelled) {
+                    fprintf(
+                        stderr, "%s wave session failed: %s\n", label,
+                        session.fail_reason.empty() ? "no reason recorded"
+                                                    : session.fail_reason.c_str());
+                }
+                return end_run();
             }
             if (params.verbose) {
                 const int64_t took = service->engine.steps - steps_before;
@@ -3198,7 +3228,7 @@ stream_magpie_to_audio(
                 fprintf(
                     stderr, "%s text chunk %zu has %zu tokens, exceeding model context %d\n", label,
                     chunk_index, current_tokens.size(), h.n_ctx);
-                return cancel_worker();
+                return end_run();
             }
 
             // The adaptive path asks where the previous chunk's decode ended up
@@ -3246,7 +3276,7 @@ stream_magpie_to_audio(
             const int64_t encoder_start_us = ggml_time_us();
             if (use_cuda_sampling) {
                 if (!encoder.evalDevice(text_window, params.threads, text_cond_device)) {
-                    return cancel_worker();
+                    return end_run();
                 }
                 if (longform_active) {
                     text_cond.resize((size_t)h.n_embd * (size_t)text_len);
@@ -3257,23 +3287,23 @@ stream_magpie_to_audio(
                 if (params.use_local_transformer) {
                     if (!cond_hidden_device.alloc2d(
                             magpie, GGML_TYPE_F32, h.n_embd, 1, "decoder_hidden_cond_device")) {
-                        return cancel_worker();
+                        return end_run();
                     }
                     if (params.use_cfg &&
                         !uncond_hidden_device.alloc2d(
                             magpie, GGML_TYPE_F32, h.n_embd, 1, "decoder_hidden_uncond_device")) {
-                        return cancel_worker();
+                        return end_run();
                     }
                 }
             } else if (!encoder.eval(text_window, params.threads, text_cond)) {
-                return cancel_worker();
+                return end_run();
             }
             if (longform_active) {
                 if (!first_text_chunk) {
                     if (!splice_longform_history_context(
                             text_cond, text_len, (int)current_tokens.size(), h.n_embd,
                             history_text_context, history_text_context_len)) {
-                        return cancel_worker();
+                        return end_run();
                     }
                     if (use_cuda_sampling && history_len > 0) {
                         magpietts_backend_tensor_set_staged(
@@ -3296,7 +3326,7 @@ stream_magpie_to_audio(
                     break;
                 }
                 if (codec_worker.is_failed(*codec_out.channel)) {
-                    return cancel_worker();
+                    return end_run();
                 }
                 if (params.verbose && step % 10 == 0) {
                     fprintf(
@@ -3350,7 +3380,7 @@ stream_magpie_to_audio(
                                              params.threads, cond, nullptr, &text_cond_device,
                                              &cond_hidden_device, decoder_attention_arg));
                         if (!decode_ok) {
-                            return cancel_worker();
+                            return end_run();
                         }
 #if defined(MAGPIETTS_CUDA_SAMPLING)
                         if (!local_sampler->sampleCuda(
@@ -3358,12 +3388,12 @@ stream_magpie_to_audio(
                                 h.cfg_scale, h.temperature, h.top_k, forbid_eos,
                                 workspace.cudaSampler(), (uint64_t)(uint32_t)params.seed,
                                 sample_frame_index, next_codes, argmax_codes)) {
-                            return cancel_worker();
+                            return end_run();
                         }
 #else
                         fprintf(
                             stderr, "CUDA sampling was not compiled into this MagpieTTS build\n");
-                        return cancel_worker();
+                        return end_run();
 #endif
                     } else {
                         magpietts_cuda_sample_request cuda_sample;
@@ -3403,7 +3433,7 @@ stream_magpie_to_audio(
                                              params.threads, cond, &cuda_sample, &text_cond_device,
                                              nullptr, decoder_attention_arg));
                         if (!decode_ok) {
-                            return cancel_worker();
+                            return end_run();
                         }
                         next_codes = std::move(cuda_sample.codes);
                         argmax_codes = std::move(cuda_sample.argmax_codes);
@@ -3412,7 +3442,7 @@ stream_magpie_to_audio(
                         (int)argmax_codes.size() != h.stacked_audio_codebooks()) {
                         fprintf(
                             stderr, "CUDA sampler returned an unexpected number of codebooks\n");
-                        return cancel_worker();
+                        return end_run();
                     }
                 } else {
                     if (params.use_cfg) {
@@ -3428,7 +3458,7 @@ stream_magpie_to_audio(
                                       params.threads, cond, uncond, nullptr, nullptr, nullptr,
                                       nullptr, decoder_attention_arg);
                         if (!pair_ok) {
-                            return cancel_worker();
+                            return end_run();
                         }
                     } else {
                         const bool cond_ok =
@@ -3442,7 +3472,7 @@ stream_magpie_to_audio(
                                       params.threads, cond, nullptr, nullptr, nullptr,
                                       decoder_attention_arg);
                         if (!cond_ok) {
-                            return cancel_worker();
+                            return end_run();
                         }
                     }
 
@@ -3467,7 +3497,7 @@ stream_magpie_to_audio(
                             if (!magpietts_stack_forced_code_frames(
                                     forced_code_frames, first_forced_frame, h,
                                     stacked_forced_codes)) {
-                                return cancel_worker();
+                                return end_run();
                             }
                             forced_codes = &stacked_forced_codes;
                         }
@@ -3475,7 +3505,7 @@ stream_magpie_to_audio(
                                 cond.hidden_last, uncond.hidden_last, params.use_cfg, h.cfg_scale,
                                 h.temperature, h.top_k, forbid_eos, rng, next_codes, argmax_codes,
                                 dump_logits ? &logit_dump : nullptr, forced_codes)) {
-                            return cancel_worker();
+                            return end_run();
                         }
                     } else {
                         next_codes = MagpieCodebookSampler::sampleParallel(
@@ -3490,7 +3520,7 @@ stream_magpie_to_audio(
                         final_text_chunk, forbid_eos, frames_remaining, next_codes, argmax_codes,
                         decoder_attention.alignment_scores ? &alignment_scores : nullptr,
                         attention_prior, chunk_state, audio_codes, outcome)) {
-                    return cancel_worker();
+                    return end_run();
                 }
 
                 bool first_frame = false;
@@ -3499,7 +3529,7 @@ stream_magpie_to_audio(
                 for (const std::vector<int32_t>& frame : outcome.frames) {
                     if (!code_writer.write_frame(frame) || !codec_out.write_frame(frame)) {
                         fprintf(stderr, "failed to write streamed codec frame\n");
-                        return cancel_worker();
+                        return end_run();
                     }
                     ++frames_generated;
                 }
@@ -3514,11 +3544,11 @@ stream_magpie_to_audio(
                 for (int i = 0; i < boundary_silence_frames; ++i) {
                     if (!code_writer.write_frame(silence)) {
                         fprintf(stderr, "failed to write streamed silence codec frame\n");
-                        return cancel_worker();
+                        return end_run();
                     }
                     ++frames_generated;
                     if (!codec_out.write_frame(silence)) {
-                        return cancel_worker();
+                        return end_run();
                     }
                 }
                 if (params.verbose) {
@@ -3537,8 +3567,10 @@ stream_magpie_to_audio(
         metrics.decoder.last_event_us > 0 ? metrics.decoder.last_event_us : ggml_time_us());
 
     if (frames_generated == 0) {
-        fprintf(stderr, "no codec frames generated\n");
-        return cancel_worker();
+        if (!metrics.cancelled) {
+            fprintf(stderr, "no codec frames generated\n");
+        }
+        return end_run();
     }
 
     if (params.flush_partial_chunk) {

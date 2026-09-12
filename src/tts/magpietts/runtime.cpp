@@ -212,10 +212,13 @@ class MagpieTtsRuntime::Impl {
                         std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
                 },
                 metrics, "riva_tts", false)) {
+            // A caller that stopped reading returns true with `cancelled` set,
+            // so reaching here really is a failure.
             throw std::runtime_error("MagpieTTS synthesis failed");
         }
 
         MagpieSynthesisStats stats;
+        stats.cancelled = metrics.cancelled;
         stats.sample_rate = stream_->sampleRate();
         stats.generated_frames = metrics.generated_frames;
         stats.chunks = metrics.chunks;

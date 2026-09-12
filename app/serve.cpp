@@ -739,7 +739,7 @@ print_serve_help(const char* program) {
         "  --codec-model MODEL     NanoCodec path or indexed model\n"
         "  --tokenizer-dir MODEL   TTS tokenizer directory or indexed model\n"
         "  --tn-model-dir MODEL    Optional TTS text-normalization assets\n"
-        "  --tts.preempt           Cancel older HTTP TTS synthesis for the newest request\n"
+        "  --tts.preempt           Ignored; TTS requests now run concurrently\n"
 #endif
 #if defined(NEMO_SPEECH_CLI_NMT)
         "  --nmt-model MODEL       Optional translation model\n"

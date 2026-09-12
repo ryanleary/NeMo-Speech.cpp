@@ -79,6 +79,8 @@ struct MagpieSynthesisOptions {
 };
 
 struct MagpieSynthesisStats {
+    // The PCM callback asked to stop. The audio up to that point is real.
+    bool cancelled = false;
     int sample_rate = 0;
     int generated_frames = 0;
     int chunks = 0;

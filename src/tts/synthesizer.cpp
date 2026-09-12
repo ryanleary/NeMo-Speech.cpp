@@ -230,6 +230,9 @@ Synthesizer::synthesize(const PreparedSynthesis& request, const PcmCallback& cal
     };
 
     result.stats = impl_->runtime.synthesize(request.token_chunks, request.options, process);
+    // The stop may have been seen by a layer this one never hears from -- the
+    // codec thread writes the last chunk, not the request thread.
+    result.cancelled = result.cancelled || result.stats.cancelled;
     if (!result.cancelled && resampler) {
         std::vector<uint8_t> tail;
         resampler->finish(&tail);

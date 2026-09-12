@@ -89,6 +89,7 @@ print_synthesize_help(const char* program) {
         "  --concurrency N           Fire N identical requests at once and report the\n"
         "                            aggregate realtime factor and first-audio spread\n"
         "  --arrival-ms N            Stagger those requests N ms apart instead\n"
+        "  --cancel-after-ms N       Stop reading audio after N ms, as a client hanging up\n"
         "  --no-warmup               Skip warmup\n"
         "  --force                   Replace an existing WAV\n",
         program);
@@ -120,6 +121,7 @@ command_synthesize(int argc, char** argv) {
         std::string format = "wav";
         int concurrency = 1;
         int arrival_ms = 0;
+        int cancel_after_ms = 0;
         bool force = false;
         bool warmup = true;
         int output_rate = 0;
@@ -140,6 +142,8 @@ command_synthesize(int argc, char** argv) {
                 concurrency = std::stoi(value(i, arg));
             else if (arg == "--arrival-ms")
                 arrival_ms = std::stoi(value(i, arg));
+            else if (arg == "--cancel-after-ms")
+                cancel_after_ms = std::stoi(value(i, arg));
             else if (arg == "--magpie-model")
                 parsed.runtime.magpie_model = value(i, arg);
             else if (arg == "--codec-model")
@@ -281,9 +285,19 @@ command_synthesize(int argc, char** argv) {
                     if (arrival_ms > 0)
                         std::this_thread::sleep_for(std::chrono::milliseconds(arrival_ms * i));
                     const auto started = std::chrono::steady_clock::now();
+                    // With --cancel-after-ms, every fourth request hangs up
+                    // mid-stream. The rest must be unaffected, which is what
+                    // says a cancelled session releases its lanes cleanly.
+                    const bool hangs_up = cancel_after_ms > 0 && (i % 4) == 1;
                     try {
                         run.result = synthesizer->synthesize(
                             request, [&](const auto&, const std::string& chunk) {
+                                if (hangs_up &&
+                                    std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - started)
+                                            .count() > cancel_after_ms) {
+                                    return false;
+                                }
                                 if (run.pcm.empty() && !chunk.empty()) {
                                     run.ttfa_ms = std::chrono::duration<double, std::milli>(
                                                       std::chrono::steady_clock::now() - started)
@@ -309,18 +323,40 @@ command_synthesize(int argc, char** argv) {
 
             double audio_s = 0.0;
             std::vector<double> ttfa;
+            std::vector<double> durations;
             int failures = 0;
+            int cancelled = 0;
             for (const load_result& run : runs) {
                 if (!run.error.empty()) {
                     ++failures;
                     std::fprintf(stderr, "request failed: %s\n", run.error.c_str());
                     continue;
                 }
-                audio_s += (double)run.result.output_samples / run.result.metadata.sample_rate;
-                ttfa.push_back(run.ttfa_ms);
+                const double seconds =
+                    (double)run.result.output_samples / run.result.metadata.sample_rate;
+                audio_s += seconds;
+                // A request that hung up before its first frame has no time to
+                // first audio; counting it as zero would flatter the spread.
+                if (run.ttfa_ms > 0.0) {
+                    ttfa.push_back(run.ttfa_ms);
+                }
+                if (run.result.cancelled) {
+                    ++cancelled;
+                } else {
+                    durations.push_back(seconds);
+                }
             }
             std::sort(ttfa.begin(), ttfa.end());
             if (!cli_quiet()) {
+                if (cancelled > 0) {
+                    // Every request that ran to completion must still produce
+                    // the same audio as it would have alone.
+                    std::sort(durations.begin(), durations.end());
+                    std::fprintf(
+                        stderr, "%d cancelled, %zu completed spanning %.2f-%.2f s of audio\n",
+                        cancelled, durations.size(), durations.empty() ? 0.0 : durations.front(),
+                        durations.empty() ? 0.0 : durations.back());
+                }
                 std::fprintf(
                     stderr,
                     "%d concurrent requests, %d failed: %.1f s of audio in %.2f s = %.1fx "
@@ -336,10 +372,30 @@ command_synthesize(int argc, char** argv) {
             pcm = std::move(runs.front().pcm);
             result = runs.front().result;
         } else {
+            const auto started = std::chrono::steady_clock::now();
             result = synthesizer->synthesize(request, [&](const auto&, const std::string& chunk) {
+                if (cancel_after_ms > 0 &&
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - started)
+                            .count() > cancel_after_ms) {
+                    return false;
+                }
                 pcm += chunk;
                 return true;
             });
+        }
+        if (result.cancelled) {
+            // A caller that hangs up gets the audio produced so far, not an
+            // error: the run was stopped, not broken.
+            if (!cli_quiet()) {
+                std::fprintf(
+                    stderr, "cancelled after %llu samples (%.2f s)\n",
+                    static_cast<unsigned long long>(result.output_samples),
+                    result.metadata.sample_rate > 0
+                        ? (double)result.output_samples / result.metadata.sample_rate
+                        : 0.0);
+            }
+            return 0;
         }
         if (pcm.empty())
             throw std::runtime_error("synthesizer returned no audio");
