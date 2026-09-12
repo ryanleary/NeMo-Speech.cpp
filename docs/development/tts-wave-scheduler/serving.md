@@ -98,15 +98,65 @@ that and 207x is everything else in the end-to-end path.
    requests are ~160 chunks queueing for 32 lanes. Admission already serves
    sessions with nothing in flight first (`plan_session_admission`), which is
    what keeps the minimum at ~340 ms rather than the median.
-3. **Cancellation beyond the callback.** A client hanging up is handled: the
+3. **The steady-state TTFA tail.** ~1.4 s worst case against a 350 ms median,
+   with no session that should be waiting. See above.
+
+4. **Cancellation beyond the callback.** A client hanging up is handled: the
    run returns its audio so far with `cancelled` set, gRPC answers CANCELLED
    and HTTP 499, and the session releases its lanes without disturbing its
    neighbours. What is not handled is a request that wants to stop while it is
-   still *queued*, or a server shutting down with sessions in flight -- both go
-   through `MagpieWaveService::fail_all`, which reports them as failures.
-4. **Deterministic concurrency tests.** `MagpieWaveService::drive_once` is
+   still queued is handled too, through `should_cancel`. Shutdown drains rather
+   than failing what it is serving.
+5. **Deterministic concurrency tests.** `MagpieWaveService::drive_once` is
    already the single-threaded drive mode this needs; what is missing is a test
    that can run it without a model.
+
+## Sizing the wave, and what it costs first audio
+
+Lanes, text capacity and the position budget are baked into the captured graph,
+so growing the wave means rebuilding it, which needs the lanes empty. The
+barrier used to wait for every admitted session to *finish*. A burst landing
+just after the engine had sized itself for one request was therefore held for
+that request's entire synthesis -- visible as a first-audio tail of 1449 ms
+against a 495 ms median for the same burst.
+
+It now waits for the chunks in the lanes instead. A chunk mid-decode cannot be
+un-admitted, but a session can stop being fed: those already admitted keep their
+place and carry on once the wider wave is up. Worst case fell to 979 ms with
+median and throughput unchanged.
+
+What is left of the tail is not the barrier. Repeating the same burst in one
+process (`--rounds`) separates the first-burst costs from steady state:
+
+| round | aggregate | TTFA min/median/max |
+|---|---|---|
+| 1 | 167.8x | 236/844/979 ms |
+| 2 | 180.0x | 245/351/1439 ms |
+| 3 | 181.6x | 253/357/1377 ms |
+
+Round 1 carries the per-channel codec graph builds -- ~145 ms on the median,
+paid once per process because channels are pooled. The steady-state median is
+350 ms. The steady-state **max** of ~1.4 s is unexplained: by round 2 the wave
+is already at full width, all 32 sessions are admitted in the opening burst, and
+no session should wait. It is the next thing to chase.
+
+Smaller codec chunks cut the minimum but not the median, which is consistent
+with the tail being elsewhere:
+
+| chunk_frames | aggregate | TTFA min/median/max |
+|---|---|---|
+| 4 | 78.8x | 169/304/1107 ms |
+| 8 | 115.0x | 190/775/906 ms |
+| 16 | 155.1x | 202/790/929 ms |
+| 32 | 179.7x | 331/872/1359 ms |
+
+Note the obvious lever is closed: NanoCodec zero-pads a short chunk to the
+graph's width and the caches are refreshed from the padded input, so a short
+**non-final** read would carry that padding into the next chunk's convolution
+state. Short reads are safe only at the end of a stream, which is why the codec
+does them only there. Giving a session a small opening chunk needs the state to
+survive a graph rebuild, which today it does not -- `nc_stream_decode_graph_init`
+frees the caches.
 
 ## Cancellation
 
@@ -124,9 +174,16 @@ which is the only place that knows the callback said stop. Gate:
 nemo-speech synthesize "<paragraph>" --concurrency 32 --cancel-after-ms 300 ...
 ```
 
-8 cancelled, 0 failed, and the 24 survivors produce 24.7-26.1 s of audio each
+8 cancelled, 0 failed, and the 24 survivors produce 24.4-25.9 s of audio each
 against the 25.2 s they produce alone. A cancelled session releases its lanes
-and its neighbours do not notice.
+and its neighbours do not notice. `should_cancel` covers the case the callback
+cannot: cancelling at 30 ms, before any audio exists, returns cleanly with zero
+samples.
+
+One survivor in one run produced 32.5 s rather than ~25 s. That is the
+straggler behaviour long-form decoding already has -- a degenerate chunk runs to
+its step budget -- not something cancellation introduced, but it has not been
+run down.
 
 ## The failure that was silent
 
