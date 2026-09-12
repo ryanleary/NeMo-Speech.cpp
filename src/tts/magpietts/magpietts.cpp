@@ -698,6 +698,10 @@ class MagpieStreamingWorkspace {
     // and runs alone. Holding it exclusively also parks the engine thread: a
     // session only exists while its request holds the shared side.
     std::shared_mutex gate;
+    // Both long-lived services are built on first use, from a request thread
+    // that holds only the shared side of the gate -- so several threads reach
+    // them at once and this is what decides which one builds.
+    std::mutex services_mutex;
     // Clearing the sequential path's caches belongs to the sequential path,
     // which owns the workspace while it runs. A wave never reads them.
     void resetSequentialCaches() {
@@ -2407,6 +2411,12 @@ struct MagpieWaveService {
     // only safe with the wave empty. A session that needs a bigger wave than
     // the live one therefore waits, and so does everything queued behind it:
     // letting later sessions past would starve it indefinitely.
+    // Whether anything is relying on this engine right now.
+    bool busy() {
+        std::lock_guard<std::mutex> lock(mu);
+        return !active.empty() || !queued.empty();
+    }
+
     bool take_queued() {
         std::lock_guard<std::mutex> lock(mu);
         if (queued.empty()) {
@@ -2657,6 +2667,7 @@ MagpieStreamingWorkspace::~MagpieStreamingWorkspace() {
 codec_stream_worker*
 MagpieStreamingWorkspace::codecWorker(
     const nc::NanoCodecModel& codec, const magpie_stream_params& params, int window_samples) {
+    std::lock_guard<std::mutex> lock(services_mutex);
     const MagpieCodecWorkerConfig want{
         params.codec_threads,      params.chunk_frames,       params.codec_history_frames,
         params.codec_future_frames, window_samples,           params.codec_queue_depth,
@@ -2692,12 +2703,22 @@ MagpieWaveService*
 MagpieStreamingWorkspace::waveService(
     int max_lanes, int threads, const magpietts_hparams& h, LocalCodebookSampler* sampler,
     bool verbose) {
+    std::lock_guard<std::mutex> lock(services_mutex);
     if (wave_service && (wave_service->max_lanes != max_lanes ||
                          wave_service->engine.local_sampler != sampler ||
                          wave_service->engine.threads != threads)) {
         // The captured graph bakes in the width, and the local transformer's
         // composed chain bakes in which sampler built it. Either changing means
-        // a new engine, which is only safe with nothing in flight.
+        // a new engine, which is only safe with nothing in flight -- stopping
+        // one that is serving would fail every session in it.
+        if (wave_service->busy()) {
+            fprintf(
+                stderr,
+                "the wave is serving %d-lane requests; batch size, thread count and local "
+                "transformer backend cannot change while requests are in flight\n",
+                wave_service->max_lanes);
+            return nullptr;
+        }
         wave_service->stop();
         wave_service.reset();
     }
