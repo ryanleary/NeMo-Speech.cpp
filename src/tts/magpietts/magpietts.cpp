@@ -2019,6 +2019,7 @@ stream_magpie_to_audio(
                 const int admit_threshold = std::max(2, wave_lanes / kWaveAdmitFraction);
                 size_t next_chunk = 1;
                 int64_t idle_lane_steps = 0;
+                int64_t wave_steps = 0;
                 int bursts = 0;
 
                 // Fill every lane to start with, then keep them full.
@@ -2084,15 +2085,21 @@ stream_magpie_to_audio(
                         return false;
                     }
                     idle_lane_steps += idle_now;
+                    ++wave_steps;
                     if (!wave_step(wave_lanes) || !drain_in_order()) {
                         return cancel_worker();
                     }
                 }
                 if (params.verbose) {
                     fprintf(
-                        stderr, "%s wave admission: %d bursts, threshold %d/%d lanes, %lld idle "
-                                "lane-steps\n",
-                        label, bursts, admit_threshold, wave_lanes, (long long)idle_lane_steps);
+                        stderr,
+                        "%s wave admission: %d bursts, threshold %d/%d lanes, %lld steps, %lld "
+                        "idle lane-steps, occupancy %.1f%%\n",
+                        label, bursts, admit_threshold, wave_lanes, (long long)wave_steps,
+                        (long long)idle_lane_steps,
+                        wave_steps > 0 ? 100.0 * (1.0 - (double)idle_lane_steps /
+                                                            ((double)wave_steps * wave_lanes))
+                                       : 0.0);
                 }
                 decoder.resetWave();
             }
