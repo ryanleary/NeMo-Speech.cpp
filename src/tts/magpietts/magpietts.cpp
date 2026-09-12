@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -389,8 +390,30 @@ struct MagpieCudaSamplerDeleter {
 };
 #endif
 
-// Defined below; a channel only ever holds a pointer to one.
+// All defined below the workspace, which holds them only by pointer.
 struct stream_audio_outputs;
+struct codec_stream_worker;
+struct MagpieWaveService;
+
+// What a codec worker was built for. The whole of it comes from engine
+// configuration rather than from request options, so concurrent requests agree
+// and the worker is built once.
+struct MagpieCodecWorkerConfig {
+    int threads = 0;
+    int chunk_frames = 0;
+    int history_frames = 0;
+    int future_frames = 0;
+    int window_samples = 0;
+    int queue_depth = 0;
+    bool stateful = true;
+
+    bool operator==(const MagpieCodecWorkerConfig& other) const {
+        return threads == other.threads && chunk_frames == other.chunk_frames &&
+               history_frames == other.history_frames && future_frames == other.future_frames &&
+               window_samples == other.window_samples && queue_depth == other.queue_depth &&
+               stateful == other.stateful;
+    }
+};
 
 // One session's codec stream: the convolution state, the graph built around
 // that state, the queue of frames waiting to be decoded, the overlap-add
@@ -483,6 +506,18 @@ class MagpieStreamingWorkspace {
     MagpieStreamingWorkspace(magpietts_model& magpie, const nc::NanoCodecModel& codec)
         : magpie_(magpie), encoder(magpie), decoder(magpie), local_sampler(magpie, 1),
           codec_decoder(codec) {}
+    // Out of line: the two types below are only declared at this point.
+    ~MagpieStreamingWorkspace();
+
+    // The codec worker and the wave engine outlive the requests that use them.
+    // Both own captured backend graphs that cost far more to build than a
+    // request should pay, and under concurrent serving there is exactly one of
+    // each: one thread on NanoCodec, one on MagpieTTS.
+    codec_stream_worker* codecWorker(
+        const nc::NanoCodecModel& codec, const magpie_stream_params& params, int window_samples);
+    MagpieWaveService* waveService(
+        int max_lanes, int threads, const magpietts_hparams& h, LocalCodebookSampler* sampler,
+        bool verbose);
 
     // A wave samples `batch` items per round, so the sampler's code and top-k
     // buffers have to hold stacked_codebooks * batch slots, not just one item's.
@@ -605,6 +640,9 @@ class MagpieStreamingWorkspace {
     // One stream per session in flight, pooled across requests so a graph and
     // its backend capture are built once rather than per request.
     codec_channel_pool codec_channels;
+    std::unique_ptr<codec_stream_worker> codec_worker;
+    MagpieCodecWorkerConfig codec_worker_config;
+    std::unique_ptr<MagpieWaveService> wave_service;
 
    private:
     MagpieModel local_transformer_cpu_model;
@@ -1599,6 +1637,10 @@ struct WaveItem {
     // steps, so the step is the chunk's, not the loop's.
     int step = 0;
     bool done = false;
+    // The silence between this chunk and the next is queued once, into `frames`
+    // like everything else. A partial drain can revisit a finished chunk, and
+    // the gap must not grow each time it does.
+    bool boundary_queued = false;
 };
 
 // One request's worth of work: its chunks, the conditioning that rolls between
@@ -1648,6 +1690,11 @@ struct WaveSession {
     // what the decode-throughput measurement needs.
     bool discard_audio = false;
     int64_t discarded_frames = 0;
+
+    // Where the session is in the engine's hands. Ordered so that anything at
+    // `completed` or beyond is terminal, which is what a submitter waits on.
+    enum run_state { building = 0, queued = 1, running = 2, completed = 3, failed = 4 };
+    run_state status = building;
 
     // Collect the non-empty chunks and the widest window they can need. Cheap:
     // no encoding, just enough to size the run.
@@ -1790,49 +1837,51 @@ struct WaveSession {
     // on the chunk at the head of this request's drain order, so the codec's
     // single in-order stream stays in order while the chunk is still being
     // decoded -- that is what keeps first audio early.
+    //
+    // Writes only as far as the codec has room and leaves the rest in place.
+    // The engine thread drives every lane in the wave, so it must never block
+    // on one session's backpressure -- the frames wait in the session instead.
     bool drain_item(WaveItem& item) {
         if (discard_audio) {
             discarded_frames += (int64_t)item.frames.size();
             item.frames.clear();
             return true;
         }
-        for (const std::vector<int32_t>& frame : item.frames) {
+        size_t written = 0;
+        while (written < item.frames.size() && sink.has_room()) {
+            const std::vector<int32_t>& frame = item.frames[written];
             if (!code_writer.write_frame(frame) || !sink.write_frame(frame)) {
                 fprintf(stderr, "failed to write streamed codec frame\n");
                 sink.cancel();
                 return false;
             }
+            ++written;
             ++frames_generated;
         }
-        item.frames.clear();
+        item.frames.erase(item.frames.begin(), item.frames.begin() + (long)written);
         return true;
     }
 
+    // Close a finished chunk: queue the gap to the next one behind its own
+    // frames, then drain as far as the codec will take. Returns with
+    // `item.frames` empty only when the whole chunk has reached the codec.
     bool flush_item(WaveItem& item, bool last_chunk) {
-        if (params.verbose) {
-            fprintf(
-                stderr, "%s wave flush chunk %zu: %zu frames pending (suppressed %d)\n", label,
-                item.chunk_index, item.frames.size(), item.chunk.suppressed_nonfinal_frames);
-        }
-        if (!drain_item(item)) {
-            return false;
-        }
-        if (discard_audio) {
-            return true;
-        }
-        if (!last_chunk) {
-            const int silence_frames = boundary_silence_dist(boundary_silence_rng);
-            const std::vector<int32_t> silence = sink.silence_frame();
-            for (int i = 0; i < silence_frames; ++i) {
-                if (!code_writer.write_frame(silence) || !sink.write_frame(silence)) {
-                    fprintf(stderr, "failed to write streamed silence codec frame\n");
-                    sink.cancel();
-                    return false;
-                }
-                ++frames_generated;
+        if (!item.boundary_queued) {
+            if (params.verbose) {
+                fprintf(
+                    stderr, "%s wave flush chunk %zu: %zu frames pending (suppressed %d)\n", label,
+                    item.chunk_index, item.frames.size(), item.chunk.suppressed_nonfinal_frames);
             }
+            if (!discard_audio && !last_chunk) {
+                const int silence_frames = boundary_silence_dist(boundary_silence_rng);
+                const std::vector<int32_t> silence = sink.silence_frame();
+                for (int i = 0; i < silence_frames; ++i) {
+                    item.frames.push_back(silence);
+                }
+            }
+            item.boundary_queued = true;
         }
-        return true;
+        return drain_item(item);
     }
 
     // Frames leave in chunk order -- the codec is one stream over a serial
@@ -1841,17 +1890,21 @@ struct WaveSession {
     // its turn, so this is the reorder buffer a wave that retires out of order
     // needs.
     bool drain_in_order() {
-        if (next_drain < plan.size() && !drain_item(*plan[next_drain])) {
-            return false;
-        }
-        while (next_drain < plan.size() && plan[next_drain]->done) {
-            if (!flush_item(*plan[next_drain], next_drain + 1 == chunk_ids.size())) {
+        while (next_drain < plan.size()) {
+            WaveItem& head = *plan[next_drain];
+            if (!head.done) {
+                // Still decoding: hand over what it has and stop here.
+                return drain_item(head);
+            }
+            if (!flush_item(head, next_drain + 1 == chunk_ids.size())) {
                 return false;
+            }
+            if (!head.frames.empty()) {
+                // The codec is backed up. The chunk keeps its place at the head
+                // of the order until the rest of it gets through.
+                return true;
             }
             ++next_drain;
-            if (next_drain < plan.size() && !drain_item(*plan[next_drain])) {
-                return false;
-            }
         }
         return true;
     }
@@ -2166,6 +2219,415 @@ struct WaveEngine {
     std::vector<std::vector<int32_t>> idle_codes;
 };
 
+// The engine as a server: one wave, one thread driving it, and a queue of
+// sessions waiting for lanes.
+//
+// Every piece of device work a session needs -- encoding its chunks, prefilling
+// them into lanes, stepping, handing frames to the codec -- happens on this one
+// thread. Request threads only tokenize, submit and wait. That is the property
+// that lets requests overlap at all: the MagpieTTS backend sees a single caller
+// no matter how many requests are in flight.
+struct MagpieWaveService {
+    MagpieWaveService(
+        magpietts_model& model, MagpieStreamingWorkspace& ws, const MagpieDecoder& dec,
+        LocalCodebookSampler* sampler, int max_lane_count, int thread_count, int audio_codebooks,
+        int frame_stacking, int bos_id, bool verbose_)
+        : engine{model, ws, dec, sampler, "serve", verbose_}, max_lanes(max_lane_count) {
+        engine.threads = thread_count;
+        engine.idle_codes.assign((size_t)audio_codebooks, {});
+        for (int c = 0; c < audio_codebooks; ++c) {
+            engine.idle_codes[(size_t)c].assign((size_t)frame_stacking, bos_id);
+        }
+    }
+
+    ~MagpieWaveService() { stop(); }
+
+    WaveEngine engine;
+    int max_lanes = 1;
+    // What the wave is currently built for. All three are baked into the
+    // decoder's captured graph, so changing any of them means rebuilding it.
+    int lanes = 0;
+    int capacity = 0;
+    int budget = 0;
+    bool opened = false;
+    int admit_threshold = 2;
+    size_t turn = 0;
+
+    std::mutex mu;
+    // The engine thread waits on this for something to do; submitters wait on
+    // `settled` for their own session and nobody else's.
+    std::condition_variable wake;
+    std::condition_variable settled;
+    std::vector<WaveSession*> queued;
+    std::vector<WaveSession*> active;
+    std::thread thread;
+    bool stopping = false;
+    bool running = false;
+
+    void start() {
+        std::lock_guard<std::mutex> lock(mu);
+        if (running) {
+            return;
+        }
+        stopping = false;
+        running = true;
+        thread = std::thread(&MagpieWaveService::run, this);
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (!running) {
+                return;
+            }
+            stopping = true;
+        }
+        wake.notify_all();
+        if (thread.joinable()) {
+            thread.join();
+        }
+        std::lock_guard<std::mutex> lock(mu);
+        running = false;
+        if (opened) {
+            engine.close();
+            opened = false;
+            lanes = 0;
+        }
+    }
+
+    // Hand a session to the engine and block until it has produced its last
+    // frame. Its audio is still draining through the codec when this returns.
+    bool submit(WaveSession& session) {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (stopping || !running) {
+                return false;
+            }
+            session.status = WaveSession::queued;
+            queued.push_back(&session);
+        }
+        wake.notify_one();
+        std::unique_lock<std::mutex> lock(mu);
+        settled.wait(lock, [&] { return session.status >= WaveSession::completed; });
+        return session.status == WaveSession::completed;
+    }
+
+    // How wide a wave this much pending work wants. Lanes are capped below the
+    // chunk count, not at it: a wave with a lane per chunk admits everything at
+    // once and never refills, which is the single-cohort behaviour continuous
+    // batching exists to remove. Above the floor, half the chunks is the cap.
+    // Two sessions or more go straight to the configured width -- the demand is
+    // no longer one request's and will not stop arriving.
+    int lanes_for(size_t pending, size_t sessions) const {
+        if (pending == 0) {
+            return 0;
+        }
+        if (sessions > 1) {
+            return max_lanes;
+        }
+        constexpr int kWaveLaneFloor = 32;
+        return (int)std::min(
+            (size_t)max_lanes,
+            std::min(pending, std::max((size_t)kWaveLaneFloor, pending / 2)));
+    }
+
+    // Take what the wave can hold as it stands, growing it when it cannot.
+    //
+    // The cross arena, the ring and the lane count are all baked into the
+    // captured graph, so growing any of them means rebuilding it -- which is
+    // only safe with the wave empty. A session that needs a bigger wave than
+    // the live one therefore waits, and so does everything queued behind it:
+    // letting later sessions past would starve it indefinitely.
+    bool take_queued() {
+        std::lock_guard<std::mutex> lock(mu);
+        while (!queued.empty()) {
+            WaveSession* next = queued.front();
+            size_t pending = next->chunk_ids.size();
+            for (WaveSession* s : active) {
+                pending += s->chunk_ids.size() - s->next_chunk;
+            }
+            const int want_lanes =
+                std::max(lanes, lanes_for(pending, active.size() + 1));
+            const int want_capacity = std::max(capacity, next->text_capacity);
+            // One slot more than the step budget: the prefill takes one and
+            // each step takes another.
+            const int want_budget = std::max(budget, next->position_budget() + 1);
+            if (opened &&
+                (want_lanes > lanes || want_capacity > capacity || want_budget > budget)) {
+                if (!active.empty() || engine.live_lanes() > 0) {
+                    return true;
+                }
+                engine.close();
+                opened = false;
+            }
+            if (!opened) {
+                lanes = std::max(1, want_lanes);
+                capacity = want_capacity;
+                budget = want_budget;
+                if (!engine.open(engine.magpie, lanes, capacity, budget)) {
+                    fprintf(stderr, "serve failed to open a %d-lane wave\n", lanes);
+                    return false;
+                }
+                opened = true;
+                // Admitting one chunk at a time would spend more on prefills
+                // than the refill saves -- a prefill costs about half a
+                // millisecond per lane it computes however few it opens. So
+                // idle lanes accumulate and fill in one burst.
+                constexpr int kWaveAdmitFraction = 8;
+                admit_threshold = std::max(2, lanes / kWaveAdmitFraction);
+                if (engine.verbose) {
+                    fprintf(
+                        stderr, "serve wave: %d lanes, text capacity %d, %d positions\n", lanes,
+                        capacity, budget);
+                }
+            }
+            queued.erase(queued.begin());
+            next->status = WaveSession::running;
+            active.push_back(next);
+        }
+        return true;
+    }
+
+    // Give each idle lane to a session, newest first and then round robin.
+    bool fill(const std::vector<int>& free_lanes) {
+        std::vector<MagpieSessionDemand> demand(active.size());
+        for (size_t i = 0; i < active.size(); ++i) {
+            demand[i].pending = active[i]->chunk_ids.size() - active[i]->next_chunk;
+        }
+        for (int l = 0; l < lanes; ++l) {
+            const WaveLane& held = engine.lane[(size_t)l];
+            if (!held.live()) {
+                continue;
+            }
+            for (size_t i = 0; i < active.size(); ++i) {
+                if (held.session == active[i]) {
+                    demand[i].occupied = true;
+                }
+            }
+        }
+        const std::vector<int> owner = plan_session_admission(demand, free_lanes, turn);
+        std::vector<WaveAdmission> admissions;
+        for (size_t j = 0; j < free_lanes.size(); ++j) {
+            if (owner[j] < 0) {
+                continue;
+            }
+            WaveSession& who = *active[(size_t)owner[j]];
+            // The encoder runs here, on the engine thread, for the same reason
+            // everything else does: it is MagpieTTS backend work.
+            if (!who.prepare_chunk(who.next_chunk)) {
+                return false;
+            }
+            admissions.push_back(WaveAdmission{&who, who.next_chunk, free_lanes[j]});
+            ++who.next_chunk;
+        }
+        return admissions.empty() || engine.admit(admissions);
+    }
+
+    bool holds_lane(const WaveSession* session) const {
+        for (int l = 0; l < lanes; ++l) {
+            if (engine.lane[(size_t)l].session == session && engine.lane[(size_t)l].live()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Release the lane table's claim on a session that has finished, so a
+    // retired chunk's pointer cannot outlive the request that owned it.
+    void clear_lanes_of(const WaveSession* session) {
+        for (int l = 0; l < lanes; ++l) {
+            if (engine.lane[(size_t)l].session == session) {
+                engine.lane[(size_t)l] = WaveLane{};
+            }
+        }
+    }
+
+    void settle(std::vector<WaveSession*>& done, WaveSession::run_state state) {
+        if (done.empty()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            for (WaveSession* s : done) {
+                clear_lanes_of(s);
+                s->status = state;
+                active.erase(std::find(active.begin(), active.end(), s));
+            }
+        }
+        done.clear();
+        settled.notify_all();
+    }
+
+    // One pass: retire what is spent, admit into what is idle, step everything
+    // else, and hand out whatever came back. `progressed` says whether the pass
+    // did any work -- a pass that did none means every lane is idle and some
+    // session is waiting on the codec, which is the one case worth pausing for.
+    bool drive_once(bool& progressed) {
+        progressed = false;
+        if (!opened || active.empty()) {
+            return true;
+        }
+        for (int l = 0; l < lanes; ++l) {
+            engine.retire_if_exhausted(engine.lane[(size_t)l]);
+        }
+        size_t pending = 0;
+        for (WaveSession* s : active) {
+            pending += s->chunk_ids.size() - s->next_chunk;
+        }
+        const std::vector<int> free_lanes =
+            plan_wave_admission(engine.idle_mask(), pending, admit_threshold);
+        if (!free_lanes.empty()) {
+            if (!fill(free_lanes)) {
+                return false;
+            }
+            progressed = true;
+        } else if (engine.live_lanes() > 0) {
+            if (!engine.step()) {
+                return false;
+            }
+            progressed = true;
+        }
+
+        std::vector<WaveSession*> done;
+        for (WaveSession* s : active) {
+            const size_t before = s->next_drain;
+            if (!s->drain_in_order()) {
+                done.push_back(s);
+                continue;
+            }
+            progressed = progressed || s->next_drain != before;
+            if (s->finished() && !holds_lane(s)) {
+                done.push_back(s);
+            }
+        }
+        // A session that failed to drain is finished either way; its caller
+        // sees the failure through its own channel.
+        std::vector<WaveSession*> completed;
+        std::vector<WaveSession*> broken;
+        for (WaveSession* s : done) {
+            (s->finished() ? completed : broken).push_back(s);
+        }
+        settle(completed, WaveSession::completed);
+        settle(broken, WaveSession::failed);
+        progressed = progressed || !done.empty();
+        return true;
+    }
+
+    void run() {
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(mu);
+                wake.wait(lock, [&] { return stopping || !queued.empty() || !active.empty(); });
+                if (stopping) {
+                    break;
+                }
+            }
+            bool progressed = false;
+            if (!take_queued() || !drive_once(progressed)) {
+                fail_all("wave decode failed");
+                break;
+            }
+            if (!progressed) {
+                // Every lane idle and a session still holding frames: the codec
+                // is backed up and the only thing to do is let it catch up.
+                std::unique_lock<std::mutex> lock(mu);
+                wake.wait_for(lock, std::chrono::milliseconds(1), [&] { return stopping; });
+            }
+        }
+        fail_all(nullptr);
+    }
+
+    // Release everyone still waiting. Nothing will decode for them now.
+    void fail_all(const char* why) {
+        std::vector<WaveSession*> orphans;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (why && (!active.empty() || !queued.empty())) {
+                fprintf(stderr, "serve: %s\n", why);
+            }
+            for (WaveSession* s : active) {
+                s->status = WaveSession::failed;
+            }
+            for (WaveSession* s : queued) {
+                s->status = WaveSession::failed;
+            }
+            active.clear();
+            queued.clear();
+        }
+        (void)orphans;
+        settled.notify_all();
+    }
+};
+
+MagpieStreamingWorkspace::~MagpieStreamingWorkspace() {
+    // Order matters: the engine hands frames to the codec, so it has to stop
+    // first.
+    if (wave_service) {
+        wave_service->stop();
+        wave_service.reset();
+    }
+    if (codec_worker) {
+        codec_worker->stop();
+        codec_worker.reset();
+    }
+}
+
+codec_stream_worker*
+MagpieStreamingWorkspace::codecWorker(
+    const nc::NanoCodecModel& codec, const magpie_stream_params& params, int window_samples) {
+    const MagpieCodecWorkerConfig want{
+        params.codec_threads,      params.chunk_frames,       params.codec_history_frames,
+        params.codec_future_frames, window_samples,           params.codec_queue_depth,
+        params.use_stateful_codec};
+    if (codec_worker && !(codec_worker_config == want)) {
+        // Chunk size and history are baked into every channel's graph, so a
+        // change means rebuilding all of them -- which cannot happen while a
+        // session is streaming through one.
+        if (codec_worker->open_channels() > 0) {
+            fprintf(
+                stderr,
+                "the codec worker is serving requests with a different chunk size; codec "
+                "settings cannot change while requests are in flight\n");
+            return nullptr;
+        }
+        codec_worker->stop();
+        codec_worker.reset();
+        codec_channels.channels.clear();
+    }
+    if (!codec_worker) {
+        codec_worker = std::make_unique<codec_stream_worker>(
+            codec, codec_decoder, codec_channels, params.codec_threads, codec.samplesPerFrame(),
+            params.chunk_frames, params.codec_history_frames, params.codec_future_frames,
+            window_samples, (size_t)params.codec_queue_depth, params.use_stateful_codec,
+            params.verbose);
+        codec_worker->start();
+        codec_worker_config = want;
+    }
+    return codec_worker.get();
+}
+
+MagpieWaveService*
+MagpieStreamingWorkspace::waveService(
+    int max_lanes, int threads, const magpietts_hparams& h, LocalCodebookSampler* sampler,
+    bool verbose) {
+    if (wave_service && (wave_service->max_lanes != max_lanes ||
+                         wave_service->engine.local_sampler != sampler ||
+                         wave_service->engine.threads != threads)) {
+        // The captured graph bakes in the width, and the local transformer's
+        // composed chain bakes in which sampler built it. Either changing means
+        // a new engine, which is only safe with nothing in flight.
+        wave_service->stop();
+        wave_service.reset();
+    }
+    if (!wave_service) {
+        wave_service = std::make_unique<MagpieWaveService>(
+            magpie_, *this, decoder, sampler, max_lanes, threads, h.audio_codebooks,
+            h.frame_stacking_factor, h.audio_bos_id, verbose);
+        wave_service->start();
+    }
+    return wave_service.get();
+}
+
 static bool
 stream_magpie_to_audio(
     magpietts_model& magpie, const nc::NanoCodecModel& codec, MagpieStreamingWorkspace& workspace,
@@ -2323,12 +2785,11 @@ stream_magpie_to_audio(
         return false;
     }
 
-    codec_stream_worker codec_worker(
-        codec, workspace.codec_decoder, workspace.codec_channels, params.codec_threads,
-        codec.samplesPerFrame(), params.chunk_frames, params.codec_history_frames,
-        params.codec_future_frames, window_samples, (size_t)params.codec_queue_depth,
-        params.use_stateful_codec, params.verbose);
-    codec_worker.start();
+    codec_stream_worker* worker = workspace.codecWorker(codec, params, window_samples);
+    if (!worker) {
+        return false;
+    }
+    codec_stream_worker& codec_worker = *worker;
     codec_sink codec_out{&codec_worker, codec_worker.open_channel(outputs, &metrics, label)};
     if (params.verbose) {
         fprintf(
@@ -2336,9 +2797,10 @@ stream_magpie_to_audio(
             label, params.use_stateful_codec ? "fast stateful" : "rolling-window");
     }
 
+    // Only this request's stream is dropped. The worker and its other channels
+    // keep running.
     auto cancel_worker = [&]() -> bool {
         codec_out.cancel();
-        codec_worker.stop();
         codec_out.release();
         return false;
     };
@@ -2536,12 +2998,19 @@ stream_magpie_to_audio(
                 engine.bursts);
             engine.close();
             codec_out.cancel();
-            codec_worker.stop();
             codec_out.release();
             return true;
         }
 
         if (use_wave) {
+            // The wave belongs to the process, not to this request: it outlives
+            // the call, and while this session decodes, other requests' chunks
+            // may be sharing its lanes.
+            MagpieWaveService* service = workspace.waveService(
+                wave_width, params.threads, h, local_sampler, params.verbose);
+            if (!service) {
+                return cancel_worker();
+            }
             WaveSession session{magpie,
                                 workspace.encoder,
                                 h,
@@ -2559,133 +3028,28 @@ stream_magpie_to_audio(
             if (!session.plan_chunks()) {
                 return cancel_worker();
             }
-            const std::vector<size_t>& chunk_ids = session.chunk_ids;
-            const int wave_text_capacity = session.text_capacity;
             if (params.verbose) {
                 fprintf(
                     stderr, "%s wave scheduler: %zu chunks, width %d, pinned history %d\n", label,
-                    chunk_ids.size(), wave_width, params.longform_history_tokens);
+                    session.chunk_ids.size(), wave_width, params.longform_history_tokens);
             }
-
-            // Lanes are capped below the chunk count, not at it. A wave with a
-            // lane per chunk admits everything at once and never refills, which
-            // is exactly the single-cohort behaviour continuous batching exists
-            // to remove -- it pays max(steps) over the whole run. Measured at 37
-            // chunks: 32 lanes gives 122x realtime and 37 lanes gives 86x.
-            //
-            // Above the floor, half the chunks is the cap: more lanes always win
-            // on throughput -- the per-step cost is mostly fixed, so widening
-            // amortises it -- until so few chunks are left over that the last
-            // arrivals have nothing to hide behind. Below the floor the cap does
-            // not apply, because at small chunk counts the parallelism is worth
-            // more than the refill: 37 chunks prefer 32 lanes to 18.
-            constexpr int kWaveLaneFloor = 32;
-            const size_t wave_pending = chunk_ids.size();
-            const int wave_lanes =
-                wave_pending > 0
-                    ? (int)std::min(
-                          (size_t)wave_width,
-                          std::min(
-                              wave_pending,
-                              std::max((size_t)kWaveLaneFloor, wave_pending / 2)))
-                    : 0;
-
-            WaveEngine engine{magpie,     workspace, decoder, local_sampler,
-                              label,      params.verbose};
-            engine.threads = params.threads;
-            engine.idle_codes.assign(h.audio_codebooks, {});
-            for (int c = 0; c < h.audio_codebooks; ++c) {
-                engine.idle_codes[c].assign((size_t)h.frame_stacking_factor, h.audio_bos_id);
-            }
-            if (wave_lanes > 0 &&
-                !engine.open(
-                    magpie, wave_lanes, wave_text_capacity, max_decoder_positions + 1)) {
+            const int64_t steps_before = service->engine.steps;
+            const int64_t idle_before = service->engine.idle_lane_steps;
+            const int bursts_before = service->engine.bursts;
+            if (!service->submit(session)) {
                 return cancel_worker();
             }
-
-            // Admitting one chunk at a time would be ~118 prefills on a
-            // 150-chunk script, and a prefill costs about half a millisecond per
-            // lane it computes regardless of how many it opens -- that would eat
-            // the whole saving. So idle lanes accumulate and are filled in one
-            // burst. Swept over 2377 chunks: an eighth of the lanes wins at both
-            // widths measured, and the curve is shallow. Never fewer than two,
-            // so a narrow wave does not end up admitting singly.
-            constexpr int kWaveAdmitFraction = 8;
-            const int admit_threshold = std::max(2, wave_lanes / kWaveAdmitFraction);
-
-            // Fill the given lanes with this session's next chunks.
-            auto admit_into = [&](const std::vector<int>& free_lanes) -> bool {
-                std::vector<WaveAdmission> admissions;
-                for (int l : free_lanes) {
-                    if (session.next_chunk >= chunk_ids.size()) {
-                        break;
-                    }
-                    if (!session.prepare_chunk(session.next_chunk)) {
-                        return false;
-                    }
-                    admissions.push_back(WaveAdmission{&session, session.next_chunk, l});
-                    ++session.next_chunk;
-                }
-                if (admissions.empty()) {
-                    return true;
-                }
-                return engine.admit(admissions) && session.drain_in_order();
-            };
-
-            if (wave_lanes > 0) {
-                std::vector<int> all_lanes(wave_lanes);
-                for (int l = 0; l < wave_lanes; ++l) {
-                    all_lanes[(size_t)l] = l;
-                }
-                if (!admit_into(all_lanes)) {
-                    return cancel_worker();
-                }
-                for (;;) {
-                    for (int l = 0; l < wave_lanes; ++l) {
-                        engine.retire_if_exhausted(engine.lane[(size_t)l]);
-                    }
-                    const int live = engine.live_lanes();
-                    const size_t pending = chunk_ids.size() - session.next_chunk;
-                    const std::vector<int> admit =
-                        plan_wave_admission(engine.idle_mask(), pending, admit_threshold);
-                    if (!admit.empty()) {
-                        if (!admit_into(admit)) {
-                            return cancel_worker();
-                        }
-                        continue;
-                    }
-                    if (live == 0 && pending == 0) {
-                        break;
-                    }
-                    if (codec_worker.is_failed(*codec_out.channel)) {
-                        return cancel_worker();
-                    }
-                    if (!engine.step() || !session.drain_in_order()) {
-                        return cancel_worker();
-                    }
-                }
-                if (params.verbose) {
-                    fprintf(
-                        stderr,
-                        "%s wave admission: %d bursts, threshold %d/%d lanes, %lld steps, %lld "
-                        "idle lane-steps, occupancy %.1f%%\n",
-                        label, engine.bursts, admit_threshold, wave_lanes,
-                        (long long)engine.steps, (long long)engine.idle_lane_steps,
-                        engine.steps > 0 ? 100.0 * (1.0 - (double)engine.idle_lane_steps /
-                                                              ((double)engine.steps * wave_lanes))
-                                         : 0.0);
-                }
-                engine.close();
-            }
-
-            // Anything still holding frames -- the tail of the drain order.
-            while (session.next_drain < session.plan.size()) {
-                if (!session.flush_item(
-                        *session.plan[session.next_drain],
-                        session.next_drain + 1 == chunk_ids.size())) {
-                    return false;
-                }
-                ++session.next_drain;
+            if (params.verbose) {
+                const int64_t took = service->engine.steps - steps_before;
+                const int64_t idled = service->engine.idle_lane_steps - idle_before;
+                const int width = service->lanes;
+                fprintf(
+                    stderr,
+                    "%s wave admission: %d bursts, threshold %d/%d lanes, %lld steps, %lld "
+                    "idle lane-steps, occupancy %.1f%%\n",
+                    label, service->engine.bursts - bursts_before, service->admit_threshold, width,
+                    (long long)took, (long long)idled,
+                    took > 0 ? 100.0 * (1.0 - (double)idled / ((double)took * width)) : 0.0);
             }
         }
 
@@ -3045,10 +3409,9 @@ stream_magpie_to_audio(
     if (params.flush_partial_chunk) {
         codec_out.finish_tokens();
     }
-    // Wait for this session's own audio, then stop the thread. In a serving
-    // engine the worker outlives the request and only the wait remains.
+    // Wait for this request's own audio. The worker outlives the request and
+    // keeps decoding for everyone else.
     const bool codec_ok = codec_out.wait();
-    codec_worker.stop();
     codec_out.release();
     if (!codec_ok) {
         return false;
