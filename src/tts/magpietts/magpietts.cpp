@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -463,6 +464,9 @@ struct codec_channel {
     // has been decoded and the tail flushed. What a caller waits on.
     bool retired = false;
     bool failed = false;
+    // The worker is inside this channel right now, holding its outputs and its
+    // queue. Nobody may take them back until it is out.
+    bool busy = false;
     std::string error;
 
     // Hand the channel to a new session. Only the stream's contents reset; the
@@ -1275,12 +1279,15 @@ struct codec_stream_worker {
     }
 
     // Give the channel back. Its audio must already have been waited for --
-    // release does not flush.
+    // release does not flush. It does wait for the worker to leave the channel:
+    // a cancelled request releases without waiting for its audio, and the
+    // outputs it is handing back may be in use on the codec thread.
     void release_channel(codec_channel* ch) {
         if (!ch) {
             return;
         }
-        std::lock_guard<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(mutex);
+        channel_retired.wait(lock, [&] { return !ch->busy; });
         ch->in_use = false;
         ch->outputs = nullptr;
         ch->metrics = nullptr;
@@ -1530,6 +1537,7 @@ struct codec_stream_worker {
             }
             out.ch = &ch;
             out.what = what;
+            ch.busy = true;
             cursor = (idx + 1) % n;
             return true;
         }
@@ -1598,6 +1606,19 @@ struct codec_stream_worker {
                     break;
                 }
                 codec_channel& ch = *work.ch;
+                // Released the moment this unit of work is done, whatever it
+                // was, so a caller waiting to take the channel back can.
+                struct leave_channel {
+                    codec_stream_worker* worker;
+                    codec_channel* ch;
+                    ~leave_channel() {
+                        {
+                            std::lock_guard<std::mutex> lock(worker->mutex);
+                            ch->busy = false;
+                        }
+                        worker->channel_retired.notify_all();
+                    }
+                } leaving{this, &ch};
                 if (work.what == codec_work::prewarm) {
                     if (!prewarm(ch)) {
                         continue;
@@ -1784,11 +1805,22 @@ struct WaveSession {
 
     // Where the session is in the engine's hands. Ordered so that anything at
     // `completed` or beyond is terminal, which is what a submitter waits on.
-    enum run_state { building = 0, queued = 1, running = 2, completed = 3, failed = 4 };
+    enum run_state {
+        building = 0,
+        queued = 1,
+        running = 2,
+        completed = 3,
+        cancelled = 4,
+        failed = 5
+    };
     run_state status = building;
     // Why it failed, in the session rather than on stderr: the engine thread is
     // shared, so the thread that hit the error is never the one that reports it.
     std::string fail_reason;
+    // The caller has given up. Set from its own thread, read by the engine at
+    // every point a session can leave, so one waiting for lanes can be dropped
+    // as readily as one mid-decode.
+    std::atomic<bool> abandoned{false};
 
     // Collect the non-empty chunks and the widest window they can need. Cheap:
     // no encoding, just enough to size the run.
@@ -2413,7 +2445,7 @@ struct MagpieWaveService {
 
     // Hand a session to the engine and block until it has produced its last
     // frame. Its audio is still draining through the codec when this returns.
-    bool submit(WaveSession& session) {
+    bool submit(WaveSession& session, const std::function<bool()>& should_cancel) {
         {
             std::lock_guard<std::mutex> lock(mu);
             if (stopping || draining || !running) {
@@ -2426,7 +2458,29 @@ struct MagpieWaveService {
         }
         wake.notify_one();
         std::unique_lock<std::mutex> lock(mu);
-        settled.wait(lock, [&] { return session.status >= WaveSession::completed; });
+        if (!should_cancel) {
+            settled.wait(lock, [&] { return session.status >= WaveSession::completed; });
+            return session.status == WaveSession::completed;
+        }
+        // A caller can give up before it has heard anything -- while it is still
+        // queued behind a wave being rebuilt, say -- and the PCM callback cannot
+        // report that, because no PCM has flowed. So ask.
+        while (session.status < WaveSession::completed) {
+            if (settled.wait_for(lock, std::chrono::milliseconds(20), [&] {
+                    return session.status >= WaveSession::completed;
+                })) {
+                break;
+            }
+            bool give_up = false;
+            {
+                lock.unlock();
+                give_up = should_cancel();
+                lock.lock();
+            }
+            if (give_up && session.status < WaveSession::completed) {
+                session.abandoned = true;
+            }
+        }
         return session.status == WaveSession::completed;
     }
 
@@ -2464,6 +2518,24 @@ struct MagpieWaveService {
 
     bool take_queued() {
         std::lock_guard<std::mutex> lock(mu);
+        // Drop anyone who gave up while waiting. Doing this first matters: a
+        // session nobody is listening to must not make the wave grow for it,
+        // which would hold up everyone behind it.
+        std::vector<WaveSession*> given_up;
+        for (auto it = queued.begin(); it != queued.end();) {
+            if ((*it)->abandoned.load()) {
+                given_up.push_back(*it);
+                it = queued.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (WaveSession* s : given_up) {
+            s->status = WaveSession::cancelled;
+        }
+        if (!given_up.empty()) {
+            settled.notify_all();
+        }
         if (queued.empty()) {
             return true;
         }
@@ -2594,7 +2666,10 @@ struct MagpieWaveService {
             for (WaveSession* s : done) {
                 clear_lanes_of(s);
                 s->status = state;
-                active.erase(std::find(active.begin(), active.end(), s));
+                const auto it = std::find(active.begin(), active.end(), s);
+                if (it != active.end()) {
+                    active.erase(it);
+                }
             }
         }
         done.clear();
@@ -2638,7 +2713,12 @@ struct MagpieWaveService {
 
         std::vector<WaveSession*> done;
         std::vector<WaveSession*> broken;
+        std::vector<WaveSession*> given_up;
         for (WaveSession* s : active) {
+            if (s->abandoned.load()) {
+                given_up.push_back(s);
+                continue;
+            }
             const size_t before = s->next_drain;
             if (!s->drain_in_order()) {
                 s->fail_reason = s->metrics.cancelled
@@ -2652,9 +2732,10 @@ struct MagpieWaveService {
                 done.push_back(s);
             }
         }
-        progressed = progressed || !done.empty() || !broken.empty();
+        progressed = progressed || !done.empty() || !broken.empty() || !given_up.empty();
         settle(done, WaveSession::completed);
         settle(broken, WaveSession::failed);
+        settle(given_up, WaveSession::cancelled);
         return true;
     }
 
@@ -3026,6 +3107,16 @@ stream_magpie_to_audio(
         codec_out.release();
         return metrics.cancelled;
     };
+    // A caller can give up before any audio exists, which the PCM callback
+    // cannot report. Ask once here so the sequential path answers the same way
+    // the wave does.
+    auto caller_gave_up = [&]() -> bool {
+        if (params.should_cancel && params.should_cancel()) {
+            metrics.cancelled = true;
+            return true;
+        }
+        return false;
+    };
 
     int frames_generated = 0;
     int decoder_frames_generated = 0;
@@ -3062,7 +3153,9 @@ stream_magpie_to_audio(
             for (int i = 0; i < n_sessions; ++i) {
                 session_metrics.push_back(std::make_unique<stream_run_metrics>());
                 session_staging.push_back(std::make_unique<MagpiePinnedHostScratch>());
-                sessions.push_back(std::make_unique<WaveSession>(WaveSession{
+                // Constructed in place rather than via make_unique: a session
+                // holds an atomic, so it cannot be moved from a temporary.
+                sessions.push_back(std::unique_ptr<WaveSession>(new WaveSession{
                     magpie, workspace.encoder, h, params, token_chunks, label,
                     *session_metrics.back(), code_writer, codec_sink{}, *session_staging.back(),
                     session_frames[(size_t)i], session_frames[(size_t)i], boundary_silence_rng,
@@ -3225,8 +3318,10 @@ stream_magpie_to_audio(
             const int64_t steps_before = service->engine.steps;
             const int64_t idle_before = service->engine.idle_lane_steps;
             const int bursts_before = service->engine.bursts;
-            if (!service->submit(session)) {
-                if (!metrics.cancelled) {
+            if (!service->submit(session, params.should_cancel)) {
+                if (session.status == WaveSession::cancelled) {
+                    metrics.cancelled = true;
+                } else if (!metrics.cancelled) {
                     fprintf(
                         stderr, "%s wave session failed: %s\n", label,
                         session.fail_reason.empty() ? "no reason recorded"

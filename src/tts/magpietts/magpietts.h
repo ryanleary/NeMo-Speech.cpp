@@ -21,6 +21,8 @@ enum magpie_longform_mode {
 };
 
 struct magpie_stream_params {
+    // See MagpieSynthesisOptions::should_cancel. Empty means never.
+    std::function<bool()> should_cancel;
     std::string magpie_model;
     std::string codec_model;
 

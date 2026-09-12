@@ -379,6 +379,15 @@ command_synthesize(int argc, char** argv) {
           }
         } else {
             const auto started = std::chrono::steady_clock::now();
+            if (cancel_after_ms > 0) {
+                // Asked even before any audio exists, which is the case the PCM
+                // callback below cannot cover.
+                request.options.should_cancel = [&] {
+                    return std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - started)
+                               .count() > cancel_after_ms;
+                };
+            }
             result = synthesizer->synthesize(request, [&](const auto&, const std::string& chunk) {
                 if (cancel_after_ms > 0 &&
                     std::chrono::duration<double, std::milli>(

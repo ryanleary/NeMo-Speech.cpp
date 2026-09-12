@@ -68,6 +68,10 @@ struct MagpieRuntimeConfig {
 };
 
 struct MagpieSynthesisOptions {
+    // Asked periodically while a request waits for lanes and while it decodes.
+    // The PCM callback can only report a cancel once audio is flowing, which is
+    // too late for a request still queued behind a wave being rebuilt.
+    std::function<bool()> should_cancel;
     int speaker = -1;
     int seed = -1;
     int steps = -1;

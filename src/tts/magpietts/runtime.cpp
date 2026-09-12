@@ -169,6 +169,7 @@ class MagpieTtsRuntime::Impl {
         params.token_chunks = token_chunks;
         params.warmup_tokens = tokens;
         params.warmup_token_chunks = token_chunks;
+        params.should_cancel = options.should_cancel;
         params.speaker = options.speaker >= 0 ? options.speaker : config_.speaker;
         params.threads = config_.threads;
         params.codec_threads = config_.codec_threads > 0 ? config_.codec_threads : config_.threads;

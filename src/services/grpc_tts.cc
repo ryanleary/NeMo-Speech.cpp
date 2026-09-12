@@ -259,8 +259,12 @@ GrpcTtsService::Synthesize(
     nr_tts::SynthesizeSpeechResponse* resp) {
     try {
         std::string audio;
+        auto request = map_request(*req);
+        // Asked while the request waits for lanes as well as while it decodes;
+        // the PCM callback below cannot speak until audio is flowing.
+        request.options.should_cancel = [ctx] { return ctx->IsCancelled(); };
         auto result =
-            synthesizer_->synthesize(map_request(*req), [&](const auto&, const std::string& pcm) {
+            synthesizer_->synthesize(request, [&](const auto&, const std::string& pcm) {
                 if (ctx->IsCancelled())
                     return false;
                 audio.append(pcm);
@@ -287,8 +291,10 @@ GrpcTtsService::SynthesizeOnline(
     while (stream->Read(&req)) {
         try {
             bool write_failed = false;
+            auto streaming = map_request(req);
+            streaming.options.should_cancel = [ctx] { return ctx->IsCancelled(); };
             auto result = synthesizer_->synthesize(
-                map_request(req),
+                streaming,
                 [&](const tts::SynthesisMetadata& metadata, const std::string& pcm) {
                     if (ctx->IsCancelled())
                         return false;
