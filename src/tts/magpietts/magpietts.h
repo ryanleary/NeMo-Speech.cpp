@@ -63,6 +63,14 @@ struct magpie_stream_params {
     // one alone lets its own later chunks fill every lane, and its neighbours
     // then wait a whole chunk for one. Longer trades first-audio latency for a
     // fuller wave; 0 disables the wait.
+    // Streams the engine will carry at once. Past this a request waits for a
+    // slot rather than being admitted, because a wave beyond its capacity does
+    // not fail -- it delivers stuttering audio to everyone in it. 0 is
+    // unlimited.
+    int max_sessions = 0;
+    // Requests allowed to wait for a slot. Past this one is refused outright,
+    // which is load shedding rather than backpressure. 0 is unlimited.
+    int max_queued_sessions = 0;
     int admission_window_ms = 2;
     int admission_window_max_ms = 20;
     int codec_queue_depth = 4;

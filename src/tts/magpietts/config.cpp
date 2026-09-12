@@ -149,6 +149,12 @@ register_runtime_config(common::ParameterParser& p, MagpieRuntimeConfig& c) {
         "Fixed long-form history tokens; -1 adapts to the previous chunk's alignment "
         "and is only valid at batch-size 1");
     p.Register(
+        "max-sessions", &c.max_sessions,
+        "Streams carried at once; further requests wait for a slot. 0 is unlimited");
+    p.Register(
+        "max-queued-sessions", &c.max_queued_sessions,
+        "Requests allowed to wait for a slot before one is refused. 0 is unlimited");
+    p.Register(
         "admission-window-ms", &c.admission_window_ms,
         "How long the wave waits, from idle, for a burst of requests to finish arriving "
         "before it admits any of them; 0 admits the first arrival immediately");
@@ -260,6 +266,12 @@ register_stream_params(common::ParameterParser& p, magpie_stream_params& c) {
         "longform-history-tokens", &c.longform_history_tokens,
         "Fixed long-form history tokens; -1 adapts to the previous chunk's alignment "
         "and is only valid at batch-size 1");
+    p.Register(
+        "max-sessions", &c.max_sessions,
+        "Streams carried at once; further requests wait for a slot. 0 is unlimited");
+    p.Register(
+        "max-queued-sessions", &c.max_queued_sessions,
+        "Requests allowed to wait for a slot before one is refused. 0 is unlimited");
     p.Register(
         "admission-window-ms", &c.admission_window_ms,
         "How long the wave waits, from idle, for a burst of requests to finish arriving "

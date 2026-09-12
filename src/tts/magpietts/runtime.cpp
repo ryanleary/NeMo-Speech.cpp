@@ -179,6 +179,8 @@ class MagpieTtsRuntime::Impl {
         params.chunk_frames = config_.chunk_frames;
         params.batch_size = config_.batch_size;
         params.longform_history_tokens = config_.longform_history_tokens;
+        params.max_sessions = config_.max_sessions;
+        params.max_queued_sessions = config_.max_queued_sessions;
         params.admission_window_ms = config_.admission_window_ms;
         params.admission_window_max_ms = config_.admission_window_max_ms;
         params.codec_queue_depth = config_.codec_queue_depth;
