@@ -1,11 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "commands.h"
 #if defined(_WIN32)
@@ -81,6 +86,8 @@ print_synthesize_help(const char* program) {
         "  --seed N --steps N --top-k N --temperature N --cfg-scale N\n"
         "  --config FILE             Load the complete TTS YAML config tree\n"
         "  --tts.KEY VALUE           Override any C++ TTS setting\n"
+        "  --concurrency N           Fire N identical requests at once and report the\n"
+        "                            aggregate realtime factor and first-audio spread\n"
         "  --no-warmup               Skip warmup\n"
         "  --force                   Replace an existing WAV\n",
         program);
@@ -110,6 +117,7 @@ command_synthesize(int argc, char** argv) {
 
         std::string text, input_path, output_path = "speech.wav", language, voice;
         std::string format = "wav";
+        int concurrency = 1;
         bool force = false;
         bool warmup = true;
         int output_rate = 0;
@@ -126,6 +134,8 @@ command_synthesize(int argc, char** argv) {
             const std::string arg = argv[i];
             if (arg == "--config")
                 ++i;
+            else if (arg == "--concurrency")
+                concurrency = std::stoi(value(i, arg));
             else if (arg == "--magpie-model")
                 parsed.runtime.magpie_model = value(i, arg);
             else if (arg == "--codec-model")
@@ -242,11 +252,86 @@ command_synthesize(int argc, char** argv) {
         request.output_sample_rate = output_rate;
         request.options = request_options;
         std::string pcm;
-        const auto result =
-            synthesizer->synthesize(request, [&](const auto&, const std::string& chunk) {
+        nemo_speech::tts::SynthesisResult result;
+        if (concurrency > 1) {
+            // Fire the same request from N threads at one synthesizer. What it
+            // measures is whether they share the wave: aggregate realtime
+            // factor against a single request's, at the same time to first
+            // audio.
+            struct load_result {
+                std::string pcm;
+                double ttfa_ms = 0.0;
+                double wall_s = 0.0;
+                nemo_speech::tts::SynthesisResult result;
+                std::string error;
+            };
+            std::vector<load_result> runs((size_t)concurrency);
+            std::vector<std::thread> threads;
+            const auto load_start = std::chrono::steady_clock::now();
+            for (int i = 0; i < concurrency; ++i) {
+                threads.emplace_back([&, i] {
+                    load_result& run = runs[(size_t)i];
+                    const auto started = std::chrono::steady_clock::now();
+                    try {
+                        run.result = synthesizer->synthesize(
+                            request, [&](const auto&, const std::string& chunk) {
+                                if (run.pcm.empty() && !chunk.empty()) {
+                                    run.ttfa_ms = std::chrono::duration<double, std::milli>(
+                                                      std::chrono::steady_clock::now() - started)
+                                                      .count();
+                                }
+                                run.pcm += chunk;
+                                return true;
+                            });
+                    }
+                    catch (const std::exception& error) {
+                        run.error = error.what();
+                    }
+                    run.wall_s =
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+                            .count();
+                });
+            }
+            for (auto& thread : threads)
+                thread.join();
+            const double load_wall_s =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - load_start)
+                    .count();
+
+            double audio_s = 0.0;
+            std::vector<double> ttfa;
+            int failures = 0;
+            for (const load_result& run : runs) {
+                if (!run.error.empty()) {
+                    ++failures;
+                    std::fprintf(stderr, "request failed: %s\n", run.error.c_str());
+                    continue;
+                }
+                audio_s += (double)run.result.output_samples / run.result.metadata.sample_rate;
+                ttfa.push_back(run.ttfa_ms);
+            }
+            std::sort(ttfa.begin(), ttfa.end());
+            if (!cli_quiet()) {
+                std::fprintf(
+                    stderr,
+                    "%d concurrent requests, %d failed: %.1f s of audio in %.2f s = %.1fx "
+                    "realtime; first audio min/median/max %.0f/%.0f/%.0f ms\n",
+                    concurrency, failures, audio_s, load_wall_s,
+                    load_wall_s > 0.0 ? audio_s / load_wall_s : 0.0,
+                    ttfa.empty() ? 0.0 : ttfa.front(),
+                    ttfa.empty() ? 0.0 : ttfa[ttfa.size() / 2],
+                    ttfa.empty() ? 0.0 : ttfa.back());
+            }
+            if (failures > 0)
+                throw std::runtime_error("one or more concurrent requests failed");
+            pcm = std::move(runs.front().pcm);
+            result = runs.front().result;
+        } else {
+            result = synthesizer->synthesize(request, [&](const auto&, const std::string& chunk) {
                 pcm += chunk;
                 return true;
             });
+        }
         if (pcm.empty())
             throw std::runtime_error("synthesizer returned no audio");
         const std::string audio =

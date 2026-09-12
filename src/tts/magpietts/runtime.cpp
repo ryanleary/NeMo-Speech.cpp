@@ -159,8 +159,9 @@ class MagpieTtsRuntime::Impl {
     MagpieSynthesisStats synthesize_impl(
         const std::vector<std::vector<int32_t>>& token_chunks, const std::vector<int32_t>& tokens,
         const MagpieSynthesisOptions& options, const MagpieTtsRuntime::PcmCallback& pcm_callback) {
-        std::lock_guard<std::mutex> lock(mutex_);
-
+        // No lock here. Requests that can share the wave run concurrently; the
+        // workspace's own gate keeps anything that cannot to itself. Everything
+        // below is this call's own state.
         magpie_stream_params params;
         params.magpie_model = config_.magpie_model;
         params.codec_model = config_.codec_model;
@@ -265,7 +266,6 @@ class MagpieTtsRuntime::Impl {
     std::string model_name_;
     std::string tokenizer_profile_;
     int text_vocab_size_ = 0;
-    std::mutex mutex_;
 };
 
 MagpieTtsRuntime::MagpieTtsRuntime(MagpieRuntimeConfig config)

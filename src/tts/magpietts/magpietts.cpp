@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <shared_mutex>
 #include <thread>
 #include <utility>
 
@@ -519,6 +520,57 @@ class MagpieStreamingWorkspace {
         int max_lanes, int threads, const magpietts_hparams& h, LocalCodebookSampler* sampler,
         bool verbose);
 
+    // What one request needs the workspace to have been set up for. Every field
+    // comes from engine configuration rather than request options, so in a
+    // server they are the same for every request and the setup happens once.
+    struct Setup {
+        int threads = 0;
+        int audio_codebooks = 0;
+        bool cuda_sampling = false;
+        bool cuda_lt = false;
+        bool fp32 = false;
+        bool cfg = false;
+        bool local_transformer = false;
+
+        bool operator==(const Setup& other) const {
+            return threads == other.threads && audio_codebooks == other.audio_codebooks &&
+                   cuda_sampling == other.cuda_sampling && cuda_lt == other.cuda_lt &&
+                   fp32 == other.fp32 && cfg == other.cfg &&
+                   local_transformer == other.local_transformer;
+        }
+    };
+
+    // Whether `prepare` has already run for exactly this shape. Cheap, and the
+    // answer is what decides between sharing the engine and owning it.
+    bool preparedFor(const Setup& want) {
+        std::lock_guard<std::mutex> lock(setup_mutex_);
+        return prepared_ && prepared_setup_ == want;
+    }
+
+    // Allocate the sampler and capture the local transformer's graphs. Does
+    // device work, so the caller must hold the gate exclusively -- which also
+    // means the engine thread is parked.
+    bool prepare(const Setup& want, bool verbose) {
+        std::lock_guard<std::mutex> lock(setup_mutex_);
+        if (prepared_ && prepared_setup_ == want) {
+            return true;
+        }
+        if (!beginRequest(
+                want.threads, want.cuda_sampling, want.audio_codebooks)) {
+            return false;
+        }
+        if (want.local_transformer) {
+            LocalCodebookSampler* sampler = localSampler(want.cuda_lt, want.fp32, want.threads);
+            if (!sampler ||
+                !prewarmLocalTransformer(*sampler, want.cuda_lt, want.fp32, want.cfg, verbose)) {
+                return false;
+            }
+        }
+        prepared_ = true;
+        prepared_setup_ = want;
+        return true;
+    }
+
     // A wave samples `batch` items per round, so the sampler's code and top-k
     // buffers have to hold stacked_codebooks * batch slots, not just one item's.
     bool beginRequest(int threads, bool use_cuda_sampling, int audio_codebooks, int batch = 1) {
@@ -533,9 +585,6 @@ class MagpieStreamingWorkspace {
         if (local_transformer_fp32_cuda_sampler) {
             local_transformer_fp32_cuda_sampler->setThreads(threads);
         }
-        cond_kv.clear();
-        uncond_kv.clear();
-        cond_cross_kv.clear();
 
 #if defined(MAGPIETTS_CUDA_SAMPLING)
         if (use_cuda_sampling && (!cuda_sampler || cuda_sampler_codebooks != audio_codebooks)) {
@@ -644,7 +693,24 @@ class MagpieStreamingWorkspace {
     MagpieCodecWorkerConfig codec_worker_config;
     std::unique_ptr<MagpieWaveService> wave_service;
 
+    // Requests that can share the wave hold this for reading and run together;
+    // anything that drives the decoder from its own thread holds it for writing
+    // and runs alone. Holding it exclusively also parks the engine thread: a
+    // session only exists while its request holds the shared side.
+    std::shared_mutex gate;
+    // Clearing the sequential path's caches belongs to the sequential path,
+    // which owns the workspace while it runs. A wave never reads them.
+    void resetSequentialCaches() {
+        cond_kv.clear();
+        uncond_kv.clear();
+        cond_cross_kv.clear();
+    }
+
    private:
+    std::mutex setup_mutex_;
+    bool prepared_ = false;
+    Setup prepared_setup_;
+
     MagpieModel local_transformer_cpu_model;
     std::unique_ptr<LocalCodebookSampler> local_transformer_cpu_sampler;
     MagpieModel local_transformer_fp32_cpu_model;
@@ -2340,51 +2406,67 @@ struct MagpieWaveService {
     // letting later sessions past would starve it indefinitely.
     bool take_queued() {
         std::lock_guard<std::mutex> lock(mu);
-        while (!queued.empty()) {
-            WaveSession* next = queued.front();
-            size_t pending = next->chunk_ids.size();
-            for (WaveSession* s : active) {
-                pending += s->chunk_ids.size() - s->next_chunk;
-            }
-            const int want_lanes =
-                std::max(lanes, lanes_for(pending, active.size() + 1));
-            const int want_capacity = std::max(capacity, next->text_capacity);
+        if (queued.empty()) {
+            return true;
+        }
+        // Size the wave to everything it can see, running and waiting alike.
+        // Deciding one session at a time would size it to whichever arrived
+        // first and then never grow: every later session would find the wave
+        // busy and wait for it, one at a time, forever.
+        size_t pending = 0;
+        for (WaveSession* s : active) {
+            pending += s->chunk_ids.size() - s->next_chunk;
+        }
+        int want_capacity = capacity;
+        int want_budget = budget;
+        for (WaveSession* s : queued) {
+            pending += s->chunk_ids.size();
+            want_capacity = std::max(want_capacity, s->text_capacity);
             // One slot more than the step budget: the prefill takes one and
             // each step takes another.
-            const int want_budget = std::max(budget, next->position_budget() + 1);
-            if (opened &&
-                (want_lanes > lanes || want_capacity > capacity || want_budget > budget)) {
-                if (!active.empty() || engine.live_lanes() > 0) {
-                    return true;
-                }
-                engine.close();
-                opened = false;
-            }
-            if (!opened) {
-                lanes = std::max(1, want_lanes);
-                capacity = want_capacity;
-                budget = want_budget;
-                if (!engine.open(engine.magpie, lanes, capacity, budget)) {
-                    fprintf(stderr, "serve failed to open a %d-lane wave\n", lanes);
-                    return false;
-                }
-                opened = true;
-                // Admitting one chunk at a time would spend more on prefills
-                // than the refill saves -- a prefill costs about half a
-                // millisecond per lane it computes however few it opens. So
-                // idle lanes accumulate and fill in one burst.
-                constexpr int kWaveAdmitFraction = 8;
-                admit_threshold = std::max(2, lanes / kWaveAdmitFraction);
-                if (engine.verbose) {
-                    fprintf(
-                        stderr, "serve wave: %d lanes, text capacity %d, %d positions\n", lanes,
-                        capacity, budget);
-                }
-            }
-            queued.erase(queued.begin());
-            next->status = WaveSession::running;
-            active.push_back(next);
+            want_budget = std::max(want_budget, s->position_budget() + 1);
         }
+        const int want_lanes =
+            std::max(lanes, lanes_for(pending, active.size() + queued.size()));
+
+        if (opened && (want_lanes > lanes || want_capacity > capacity || want_budget > budget)) {
+            if (!active.empty() || engine.live_lanes() > 0) {
+                // Let the wave drain so it can be rebuilt to fit. What is
+                // running finishes normally; nothing new is taken meanwhile.
+                // This happens once, when load first arrives -- the wave only
+                // ever grows, so afterwards the engine stays at its serving
+                // width.
+                return true;
+            }
+            engine.close();
+            opened = false;
+        }
+        if (!opened) {
+            lanes = std::max(1, want_lanes);
+            capacity = want_capacity;
+            budget = want_budget;
+            if (!engine.open(engine.magpie, lanes, capacity, budget)) {
+                fprintf(stderr, "serve failed to open a %d-lane wave\n", lanes);
+                return false;
+            }
+            opened = true;
+            // Admitting one chunk at a time would spend more on prefills than
+            // the refill saves -- a prefill costs about half a millisecond per
+            // lane it computes however few it opens. So idle lanes accumulate
+            // and fill in one burst.
+            constexpr int kWaveAdmitFraction = 8;
+            admit_threshold = std::max(2, lanes / kWaveAdmitFraction);
+            if (engine.verbose) {
+                fprintf(
+                    stderr, "serve wave: %d lanes, text capacity %d, %d positions\n", lanes,
+                    capacity, budget);
+            }
+        }
+        for (WaveSession* s : queued) {
+            s->status = WaveSession::running;
+            active.push_back(s);
+        }
+        queued.clear();
         return true;
     }
 
@@ -2750,24 +2832,86 @@ stream_magpie_to_audio(
             window_samples, codec_fps);
     }
 
+    // A wave needs the fast CUDA path and a pinned history; anything else
+    // falls through to the sequential loop below, unchanged.
+    const int max_decoder_positions =
+        (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
+    const int wave_width = std::max(1, params.batch_size);
+    // The batched local transformer needs one K/V history per lane, which
+    // only the patched attention cache provides; without this the run would
+    // form group 0 (width 1) and then fail on group 1.
+    const bool wave_attention_ok = magpietts_fused_cached_attention_available(magpie.backend);
+    // The batched sampler carries one EOS floor per lane in its config, which
+    // is a fixed-size array, so that bounds the wave.
+    const bool wave_width_ok = wave_width <= MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS;
+    const bool use_wave = (wave_width > 1) && token_chunks.size() > 1 && use_cuda_sampling &&
+                          params.use_local_transformer && params.use_cfg &&
+                          params.use_kv_cache && params.longform_history_tokens >= 0 &&
+                          wave_attention_ok && wave_width_ok && h.dec_kernel == 1;
+    // Asking for a wave and silently getting sequential decode is the worst
+    // outcome, so say which requirement was not met. A single chunk is not
+    // a failure: there is no wave to form.
+    if (wave_width > 1 && token_chunks.size() > 1 && !use_wave) {
+        const char* why = !use_cuda_sampling              ? "CUDA sampling is not active"
+                          : !params.use_local_transformer ? "the local transformer is disabled"
+                          : !params.use_cfg               ? "classifier-free guidance is off"
+                          : !params.use_kv_cache          ? "the decoder K/V cache is off"
+                          : !wave_attention_ok ? "this build lacks the patched cached attention"
+                          : !wave_width_ok     ? "the batched sampler tops out at 256 lanes"
+                          : h.dec_kernel != 1
+                              ? "this model's decoder feed-forward is a convolution"
+                              : "the long-form history is adaptive";
+        fprintf(
+            stderr, "%s --tts.batch-size %d ignored: %s. Decoding sequentially.\n", label,
+            wave_width, why);
+    }
+
     metrics.begin();
     outputs.metrics = &metrics;
 
-    if (!workspace.beginRequest(
-            params.threads, use_cuda_sampling, h.stacked_audio_codebooks(),
-            std::max(1, params.batch_size))) {
+    // Setup allocates the sampler and captures the local transformer's graphs,
+    // which is device work and cannot run beside the engine. So take the gate
+    // exclusively for it -- which parks the engine -- and only when something
+    // is actually missing. Every field of the shape comes from engine
+    // configuration, so in a server this happens on the first request and never
+    // again.
+    const MagpieStreamingWorkspace::Setup setup{
+        params.threads,
+        h.stacked_audio_codebooks() * std::max(1, params.batch_size),
+        use_cuda_sampling,
+        use_cuda_lt,
+        params.lt_fp32,
+        params.use_cfg,
+        params.use_local_transformer};
+    if (!workspace.preparedFor(setup)) {
+        std::unique_lock<std::shared_mutex> exclusive(workspace.gate);
+        if (!workspace.prepare(setup, params.verbose)) {
+            return false;
+        }
+    }
+
+    // Wave requests share the engine and run together. Everything else drives
+    // the decoder from this thread and runs alone -- which, because a session
+    // only lives while its request holds the shared side, also means with the
+    // engine thread parked.
+    std::shared_lock<std::shared_mutex> shared_gate(workspace.gate, std::defer_lock);
+    std::unique_lock<std::shared_mutex> exclusive_gate(workspace.gate, std::defer_lock);
+    if (use_wave) {
+        shared_gate.lock();
+    } else {
+        exclusive_gate.lock();
+        workspace.resetSequentialCaches();
+    }
+    if (!workspace.preparedFor(setup)) {
+        fprintf(stderr, "%s workspace setup changed under this request\n", label);
         return false;
     }
-    LocalCodebookSampler* local_sampler = nullptr;
-    if (params.use_local_transformer) {
-        local_sampler = workspace.localSampler(use_cuda_lt, params.lt_fp32, params.threads);
-        if (!local_sampler) {
-            return false;
-        }
-        if (!workspace.prewarmLocalTransformer(
-                *local_sampler, use_cuda_lt, params.lt_fp32, params.use_cfg, params.verbose)) {
-            return false;
-        }
+    LocalCodebookSampler* local_sampler =
+        params.use_local_transformer
+            ? workspace.localSampler(use_cuda_lt, params.lt_fp32, params.threads)
+            : nullptr;
+    if (params.use_local_transformer && !local_sampler) {
+        return false;
     }
 
     std::vector<float>& text_cond = workspace.text_cond;
@@ -2818,39 +2962,6 @@ stream_magpie_to_audio(
     {
         const ggml_nvtx::range nvtx_loop("magpietts_stream_generation_loop");
         int absolute_token_offset = 0;
-        // A wave needs the fast CUDA path and a pinned history; anything else
-        // falls through to the sequential loop below, unchanged.
-        const int max_decoder_positions =
-            (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
-        const int wave_width = std::max(1, params.batch_size);
-        // The batched local transformer needs one K/V history per lane, which
-        // only the patched attention cache provides; without this the run would
-        // form group 0 (width 1) and then fail on group 1.
-        const bool wave_attention_ok = magpietts_fused_cached_attention_available(magpie.backend);
-        // The batched sampler carries one EOS floor per lane in its config, which
-        // is a fixed-size array, so that bounds the wave.
-        const bool wave_width_ok = wave_width <= MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS;
-        const bool use_wave = (wave_width > 1) && token_chunks.size() > 1 && use_cuda_sampling &&
-                              params.use_local_transformer && params.use_cfg &&
-                              params.use_kv_cache && params.longform_history_tokens >= 0 &&
-                              wave_attention_ok && wave_width_ok && h.dec_kernel == 1;
-        // Asking for a wave and silently getting sequential decode is the worst
-        // outcome, so say which requirement was not met. A single chunk is not
-        // a failure: there is no wave to form.
-        if (wave_width > 1 && token_chunks.size() > 1 && !use_wave) {
-            const char* why = !use_cuda_sampling              ? "CUDA sampling is not active"
-                              : !params.use_local_transformer ? "the local transformer is disabled"
-                              : !params.use_cfg               ? "classifier-free guidance is off"
-                              : !params.use_kv_cache          ? "the decoder K/V cache is off"
-                              : !wave_attention_ok ? "this build lacks the patched cached attention"
-                              : !wave_width_ok     ? "the batched sampler tops out at 256 lanes"
-                              : h.dec_kernel != 1
-                                  ? "this model's decoder feed-forward is a convolution"
-                                  : "the long-form history is adaptive";
-            fprintf(
-                stderr, "%s --tts.batch-size %d ignored: %s. Decoding sequentially.\n", label,
-                wave_width, why);
-        }
         // ---- Wave scheduler -------------------------------------------------
         // Long-form chunks decoded in lockstep, several at a time through one
         // graph. This needs a pinned history (gated at entry): the adaptive rule
@@ -3482,8 +3593,14 @@ MagpieStreamingRuntime::synthesize(
     stream_audio_outputs outputs;
     outputs.sample_rate = impl_->codec.sampleRate();
     outputs.pcm_callback = pcm_callback;
-    if (!impl_->workspace) {
-        impl_->workspace = std::make_unique<MagpieStreamingWorkspace>(impl_->magpie, impl_->codec);
+    {
+        // Concurrent callers race to be first; only one workspace is built.
+        static std::mutex workspace_mutex;
+        std::lock_guard<std::mutex> lock(workspace_mutex);
+        if (!impl_->workspace) {
+            impl_->workspace =
+                std::make_unique<MagpieStreamingWorkspace>(impl_->magpie, impl_->codec);
+        }
     }
     return stream_magpie_to_audio(
         impl_->magpie, impl_->codec, *impl_->workspace, params, token_chunks, outputs, metrics,
