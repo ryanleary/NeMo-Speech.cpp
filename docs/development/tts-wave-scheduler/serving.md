@@ -247,6 +247,40 @@ alone -- the middle one made things worse by itself:
    buffered at zero and so sorts to the front, which is the same rule that used
    to be spelled "unoccupied sessions first".
 
+### Capping it
+
+`tts.max-sessions` is how many streams the engine will carry; past it a request
+waits for a slot. `tts.max-queued-sessions` refuses past a further point, for
+when the wait itself is the problem. Neither is set by default.
+
+The cap matters because an oversubscribed wave does not fail -- it delivers
+stuttering audio to everyone in it, including streams that were fine before the
+last arrival. 320 streams offered to a 64-lane engine:
+
+| cap | underruns | first audio p50 |
+|---|---|---|
+| none | 112 of 320 | 10247 ms |
+| 224 | 27 of 320 | 10249 ms |
+| 192 | 11 of 320 | 10338 ms |
+| **160** | **0 of 320** | 15376 ms |
+
+Some callers wait rather than all callers stutter, and the wait is visible in
+the p50. Note 224 was clean as a *static* population (below) and is not clean
+under churn: a slot freed by a finishing stream is taken by a new one that needs
+lanes for its opening chunk, which the population it joins has already spent.
+Size the cap against the load's arrival pattern, not against the static number.
+
+**Discovering the cap did not work.** A buffer-level signal was tried in place
+of a count -- hold new requests while any established stream has less than N ms
+buffered -- on the theory that falling buffers are the symptom a count is a
+proxy for. It measured far worse than a fixed count, 78 underruns against 11 on
+the same load, and capping unproven starts alongside it did not rescue it. The
+buffer is a cliff rather than a gradient: streams sit at the delivery cap until
+the engine saturates and then fall together, so a threshold sees nothing until
+it is too late. Discovering the count needs a signal that leads rather than
+lags -- a slow-start ramp against observed underruns would, since it probes
+upward rather than waiting to be told.
+
 ### A slow client stalls every stream
 
 The right question for TTS is not how fast a request finishes but how many
