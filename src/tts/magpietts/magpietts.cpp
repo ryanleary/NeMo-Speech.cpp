@@ -2383,6 +2383,17 @@ struct MagpieWaveService {
     // wave empties -- a wait of one chunk, not of one request.
     bool growing = false;
     int admit_threshold = 2;
+    // How long the engine waits, after being woken with nothing in flight, for
+    // the rest of a burst to land before it admits anything. Requests that
+    // arrive together have to be admitted together: taking the first one alone
+    // lets its own later chunks fill every lane before its neighbours are even
+    // seen, and they then wait a whole chunk for a lane. Same reasoning as the
+    // ASR micro-batcher's window, at a fraction of the size.
+    std::chrono::microseconds admission_window{2000};
+    // ...and how long it will keep extending that wait while the queue is still
+    // growing. A wide wave takes more arrivals to fill, and they take longer to
+    // get here; a fixed window sized for 32 leaves 128 half-admitted.
+    std::chrono::microseconds admission_window_max{20000};
     size_t turn = 0;
 
     std::mutex mu;
@@ -2696,9 +2707,21 @@ struct MagpieWaveService {
         }
         // While the wave is being rebuilt it admits nothing: emptying it is the
         // whole point of the wait.
+        // Someone with nothing in flight is waiting on their first audio, which
+        // is the one case worth a prefill that is not yet full: the burst
+        // threshold exists to amortise prefills across continuation chunks.
+        bool awaiting_first_lane = false;
+        for (WaveSession* s : active) {
+            if (s->next_chunk < s->chunk_ids.size() && !holds_lane(s)) {
+                awaiting_first_lane = true;
+                break;
+            }
+        }
         const std::vector<int> free_lanes =
             growing ? std::vector<int>()
-                    : plan_wave_admission(engine.idle_mask(), pending, admit_threshold);
+                    : plan_wave_admission(
+                          engine.idle_mask(), pending,
+                          awaiting_first_lane ? 1 : admit_threshold);
         if (!free_lanes.empty()) {
             if (!fill(free_lanes)) {
                 return false;
@@ -2746,6 +2769,25 @@ struct MagpieWaveService {
                 wake.wait(lock, [&] { return stopping || !queued.empty() || !active.empty(); });
                 if (stopping) {
                     break;
+                }
+                if (active.empty() && !queued.empty() && admission_window.count() > 0) {
+                    // Only from a standing start. Once the wave is running the
+                    // burst threshold does this job, and waiting again would
+                    // just add latency. Keep extending while the queue is still
+                    // filling, so the wait matches the size of the burst rather
+                    // than a guess at it.
+                    std::chrono::microseconds waited{0};
+                    for (;;) {
+                        const size_t before = queued.size();
+                        wake.wait_for(lock, admission_window, [&] { return stopping; });
+                        waited += admission_window;
+                        if (stopping || queued.size() == before || waited >= admission_window_max) {
+                            break;
+                        }
+                    }
+                    if (stopping) {
+                        break;
+                    }
                 }
             }
             bool progressed = false;

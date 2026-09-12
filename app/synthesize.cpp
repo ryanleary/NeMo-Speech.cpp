@@ -277,7 +277,12 @@ command_synthesize(int argc, char** argv) {
                 nemo_speech::tts::SynthesisResult result;
                 std::string error;
             };
-          for (int round = 0; round < std::max(1, rounds); ++round) {
+          // A warm-up burst first: the codec builds a graph per channel on its
+          // first use, and those land on the first burst's first audio. Its
+          // numbers are discarded.
+          const int total_rounds = std::max(1, rounds) + (warmup ? 1 : 0);
+          for (int round = (warmup ? -1 : 0); round < total_rounds - (warmup ? 1 : 0);
+               ++round) {
             std::vector<load_result> runs((size_t)concurrency);
             std::vector<std::thread> threads;
             const auto load_start = std::chrono::steady_clock::now();
@@ -364,9 +369,10 @@ command_synthesize(int argc, char** argv) {
                 }
                 std::fprintf(
                     stderr,
-                    "round %d: %d concurrent requests, %d failed: %.1f s of audio in %.2f s = "
+                    "%s: %d concurrent requests, %d failed: %.1f s of audio in %.2f s = "
                     "%.1fx realtime; first audio min/median/max %.0f/%.0f/%.0f ms\n",
-                    round + 1, concurrency, failures, audio_s, load_wall_s,
+                    round < 0 ? "warmup" : ("round " + std::to_string(round + 1)).c_str(),
+                    concurrency, failures, audio_s, load_wall_s,
                     load_wall_s > 0.0 ? audio_s / load_wall_s : 0.0,
                     ttfa.empty() ? 0.0 : ttfa.front(),
                     ttfa.empty() ? 0.0 : ttfa[ttfa.size() / 2],
