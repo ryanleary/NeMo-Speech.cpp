@@ -98,8 +98,9 @@ that and 207x is everything else in the end-to-end path.
    requests are ~160 chunks queueing for 32 lanes. Admission already serves
    sessions with nothing in flight first (`plan_session_admission`), which is
    what keeps the minimum at ~340 ms rather than the median.
-3. **The steady-state TTFA tail.** ~1.4 s worst case against a 350 ms median,
-   with no session that should be waiting. See above.
+3. **First audio in a wide wave.** 718 ms at 128 lanes against 243 ms at 32,
+   because a step costs time proportional to lane count. Narrowing the wave
+   when demand falls is the same lever as (1).
 
 4. **Cancellation beyond the callback.** A client hanging up is handled: the
    run returns its audio so far with `cancelled` set, gRPC answers CANCELLED
@@ -125,20 +126,31 @@ un-admitted, but a session can stop being fed: those already admitted keep their
 place and carry on once the wider wave is up. Worst case fell to 979 ms with
 median and throughput unchanged.
 
-What is left of the tail is not the barrier. Repeating the same burst in one
-process (`--rounds`) separates the first-burst costs from steady state:
+The rest of the tail was not the barrier either. The first request to arrive
+woke the engine and was admitted alone into every idle lane -- and since
+`plan_session_admission` gives a session one lane before round-robining the
+rest, that one request's *continuation* chunks took the other 31. Its
+neighbours, milliseconds behind, found nothing free and waited a whole chunk.
 
-| round | aggregate | TTFA min/median/max |
-|---|---|---|
-| 1 | 167.8x | 236/844/979 ms |
-| 2 | 180.0x | 245/351/1439 ms |
-| 3 | 181.6x | 253/357/1377 ms |
+So the engine now waits ~2 ms from a standing start for the rest of the burst,
+extending while the queue is still growing and capped at 20 ms; and while anyone
+is waiting on their first lane, the burst threshold drops to one. Steady state,
+same burst:
 
-Round 1 carries the per-channel codec graph builds -- ~145 ms on the median,
-paid once per process because channels are pooled. The steady-state median is
-350 ms. The steady-state **max** of ~1.4 s is unexplained: by round 2 the wave
-is already at full width, all 32 sessions are admitted in the opening burst, and
-no session should wait. It is the next thing to chase.
+| width / requests | before | after | throughput |
+|---|---|---|---|
+| 32 | 245/351/1439 ms | 243/348/445 ms | 180 -> 189x |
+| 128 | 736/2170/4145 ms | 718/1238/1548 ms | 213 -> 214x |
+
+Throughput is not paid for it: admitting a full burst at once is fewer prefills,
+not more. `--rounds` runs a discarded warm-up burst first, so the per-channel
+codec graph builds (~145 ms on the first burst's median, once per process
+because channels are pooled) do not land on a measured round.
+
+What remains at 128 lanes is the floor, not a queue: a step costs time
+proportional to lane count, so the `chunk_frames` steps before first audio cost
+more in a wide wave. 718 ms is the minimum any request sees there, and the
+median is within 2x of it.
 
 Smaller codec chunks cut the minimum but not the median, which is consistent
 with the tail being elsewhere:
