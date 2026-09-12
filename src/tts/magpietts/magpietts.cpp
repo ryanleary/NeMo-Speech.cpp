@@ -269,11 +269,22 @@ plan_session_admission(
     }
     size_t filled = 0;
 
-    // Anything with nothing in flight, in index order, one chunk each: enough to
-    // get a lane, not enough to take the wave.
-    for (size_t i = 0; i < sessions.size() && filled < lanes.size(); ++i) {
-        if (sessions[i].occupied || left[i] == 0) {
-            continue;
+    // Anything with nothing in flight, one chunk each: enough to get a lane,
+    // not enough to take the wave. Least-buffered first, so the session closest
+    // to running dry is served before one that is comfortably ahead -- which is
+    // also what puts a brand-new request, buffered at zero, at the front.
+    std::vector<size_t> idle_first;
+    for (size_t i = 0; i < sessions.size(); ++i) {
+        if (!sessions[i].occupied && left[i] > 0) {
+            idle_first.push_back(i);
+        }
+    }
+    std::stable_sort(idle_first.begin(), idle_first.end(), [&](size_t a, size_t b) {
+        return sessions[a].buffered_s < sessions[b].buffered_s;
+    });
+    for (size_t i : idle_first) {
+        if (filled >= lanes.size()) {
+            break;
         }
         owner[filled++] = (int)i;
         --left[i];
@@ -1020,6 +1031,15 @@ struct stream_audio_outputs {
         return queued_bytes >= max_queued_bytes;
     }
 
+    // Audio handed to the caller that it has not played yet.
+    double queued_seconds() {
+        if (!delivering || sample_rate <= 0) {
+            return 0.0;
+        }
+        std::lock_guard<std::mutex> lock(deliver_mutex);
+        return (double)(queued_bytes / 2) / (double)sample_rate;
+    }
+
     bool deliver(const std::vector<uint8_t>& bytes) {
         if (!delivering) {
             return !pcm_callback || pcm_callback(bytes);
@@ -1329,6 +1349,12 @@ struct codec_stream_worker {
     bool stopping = false;
     bool worker_failed = false;
     size_t cursor = 0;
+    // Set when the only channels with work were skipped because their callers
+    // were behind. Nothing signals this worker when a delivery buffer drains --
+    // that happens on the request's own thread, which knows nothing about the
+    // codec -- so when it is set the worker looks again shortly rather than
+    // parking until the next frame arrives.
+    bool waiting_on_callers = false;
 
     codec_stream_worker(
         const nc::NanoCodecModel& codec_, nc::NanoCodecDecoder& decoder_, codec_channel_pool& pool_,
@@ -1602,6 +1628,7 @@ struct codec_stream_worker {
     // Round robin over the channels, so one session with a deep queue cannot
     // starve another's first chunk.
     bool pick_locked(codec_work& out) {
+        waiting_on_callers = false;
         const size_t n = pool.channels.size();
         for (size_t k = 0; k < n; ++k) {
             const size_t idx = (cursor + k) % n;
@@ -1613,6 +1640,7 @@ struct codec_stream_worker {
             // nobody is listening to and take the worker from a session whose
             // caller is waiting.
             if (ch.outputs && ch.outputs->backlogged()) {
+                waiting_on_callers = true;
                 continue;
             }
             codec_work::kind what = codec_work::none;
@@ -1645,8 +1673,19 @@ struct codec_stream_worker {
     bool next_work(codec_work& out) {
         const ggml_nvtx::range nvtx_range("magpietts_stream_worker_next_work");
         std::unique_lock<std::mutex> lock(mutex);
-        has_work.wait(lock, [&] { return stopping || pick_locked(out); });
-        return !stopping;
+        for (;;) {
+            if (stopping) {
+                return false;
+            }
+            if (pick_locked(out)) {
+                return true;
+            }
+            if (waiting_on_callers) {
+                has_work.wait_for(lock, std::chrono::milliseconds(5));
+            } else {
+                has_work.wait(lock);
+            }
+        }
     }
 
     // Build the fixed-size graph and push one throwaway chunk through it before any real
@@ -1812,6 +1851,14 @@ struct codec_sink {
         return worker->write_frame(*channel, frame);
     }
     bool has_room() const { return worker->has_room_for(*channel); }
+    // The caller is far enough ahead that more audio would only sit in a
+    // buffer. Nothing is wrong; it simply does not need a lane right now.
+    bool backlogged() const {
+        return channel && channel->outputs && channel->outputs->backlogged();
+    }
+    double buffered_seconds() const {
+        return channel && channel->outputs ? channel->outputs->queued_seconds() : 0.0;
+    }
     std::vector<int32_t> silence_frame() const { return worker->silence_frame(); }
     void finish_tokens() { worker->finish_tokens(*channel); }
     bool wait() { return worker->wait_channel(*channel); }
@@ -2136,6 +2183,14 @@ struct WaveSession {
     }
 
     bool finished() const { return next_drain >= chunk_ids.size(); }
+
+    // Chunks this session wants a lane for. A session whose caller is already
+    // several seconds ahead wants none: decoding further would buy buffer
+    // nobody is waiting on, with a lane somebody is waiting for.
+    size_t lane_demand() const {
+        return sink.backlogged() ? 0 : chunk_ids.size() - next_chunk;
+    }
+    double buffered_seconds() const { return sink.buffered_seconds(); }
 
     // What the engine has to ask a session rather than decide for itself. Once a
     // wave carries chunks from several requests these differ lane by lane, so
@@ -2716,7 +2771,8 @@ struct MagpieWaveService {
     bool fill(const std::vector<int>& free_lanes) {
         std::vector<MagpieSessionDemand> demand(active.size());
         for (size_t i = 0; i < active.size(); ++i) {
-            demand[i].pending = active[i]->chunk_ids.size() - active[i]->next_chunk;
+            demand[i].pending = active[i]->lane_demand();
+            demand[i].buffered_s = active[i]->buffered_seconds();
         }
         for (int l = 0; l < lanes; ++l) {
             const WaveLane& held = engine.lane[(size_t)l];
@@ -2801,7 +2857,7 @@ struct MagpieWaveService {
         }
         size_t pending = 0;
         for (WaveSession* s : active) {
-            pending += s->chunk_ids.size() - s->next_chunk;
+            pending += s->lane_demand();
         }
         // While the wave is being rebuilt it admits nothing: emptying it is the
         // whole point of the wait.
@@ -2810,7 +2866,7 @@ struct MagpieWaveService {
         // threshold exists to amortise prefills across continuation chunks.
         bool awaiting_first_lane = false;
         for (WaveSession* s : active) {
-            if (s->next_chunk < s->chunk_ids.size() && !holds_lane(s)) {
+            if (s->lane_demand() > 0 && !holds_lane(s)) {
                 awaiting_first_lane = true;
                 break;
             }

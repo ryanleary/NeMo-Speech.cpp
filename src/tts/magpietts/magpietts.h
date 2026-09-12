@@ -191,6 +191,11 @@ struct MagpieSessionDemand {
     // none is either brand new or has gone quiet waiting for a lane, and in
     // either case has nothing in flight to hide the wait behind.
     bool occupied = false;
+    // Seconds of audio it has already handed the caller but the caller has not
+    // played yet. This is how close it is to silence, and so the order in which
+    // lanes should be given out: a session with nothing buffered is about to
+    // run dry, and one several seconds ahead can wait.
+    double buffered_s = 0.0;
 };
 
 // Which session fills each idle lane. Pure: no model state, no device work.
