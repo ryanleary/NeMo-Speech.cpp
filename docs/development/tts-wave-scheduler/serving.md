@@ -57,6 +57,22 @@ across every row above. The spread is the lane-dependent arithmetic continuous
 batching already documents -- greedy sampling moves a code, and a chunk ends a
 frame earlier or later.
 
+Those requests all arrive at once, which is the worst arrival pattern there is
+and not what a server sees. At a rate, 32 requests of the same size, 32 lanes:
+
+| arrival | aggregate | TTFA median | TTFA min/max |
+|---|---|---|---|
+| all at once | 174.6x | 504 ms | 339/1403 ms |
+| 50 ms apart | 167.5x | 571 ms | 127/942 ms |
+| 150 ms apart | 136.4x | 243 ms | 120/517 ms |
+| 400 ms apart | 63.0x | 153 ms | 113/726 ms |
+
+So first audio is 150-250 ms at a sustainable offered load, not the 862 ms the
+thundering herd suggests, and the curve is the ordinary one: the fuller the
+wave, the better it amortises and the longer a new arrival waits for a lane.
+The last row is not a ceiling -- 32 arrivals 400 ms apart span 12.4 s on their
+own, so the engine is simply not being offered enough work.
+
 Chunk size barely moves it at 128 requests — 167x at 16 frames, 207x at 32,
 219x at 64, 203x at 128 — so the codec is no longer what bounds this. The
 decode-only probe reaches 376x at 128 sessions, so roughly half the gap between
@@ -64,19 +80,25 @@ that and 207x is everything else in the end-to-end path.
 
 ## What is left
 
-1. **Shrinking the wave.** It only grows. It is sized from everything queued and
+1. **The frontends.** Only `--concurrency` exercises any of this. The HTTP
+   server's `TtsPreemptionCoordinator` (`server/http/http_server.cpp:327`) still
+   serializes synthesis and cancels older requests, on the stated premise that
+   "Magpie owns one mutable streaming workspace, so synthesis is serialized by
+   the runtime" -- which is no longer true. It is opt-in, so the default path is
+   already concurrent, but the coordinator and its reason should both go.
+2. **Shrinking the wave.** It only grows. It is sized from everything queued and
    running when it opens, and growing means rebuilding the captured graph, which
    needs the wave empty — so a burst that arrives while a narrow wave is busy
    waits for it to drain, once. A wave that has widened for load never narrows
    again, which costs a later lone request the wide steps it does not need.
    This is the other half of "size the wave to demand".
-2. **TTFA under load.** 71 ms alone against 862 ms at 32 concurrent requests.
+3. **TTFA under load.** 71 ms alone against 243 ms at a sustained rate.
    Two causes, both structural: a step costs time proportional to lane count, so
    the `chunk_frames` steps before first audio cost more in a wide wave; and 32
    requests are ~160 chunks queueing for 32 lanes. Admission already serves
    sessions with nothing in flight first (`plan_session_admission`), which is
    what keeps the minimum at ~340 ms rather than the median.
-3. **Cancellation.** Still pre-existing and load-critical.
+4. **Cancellation.** Still pre-existing and load-critical.
    `SynthesisResult::cancelled` is dead code — `synthesizer.cpp:218` sets it but
    `runtime.cpp:214` throws first, so `speech_translator.cpp:108`'s branch is
    unreachable. gRPC maps a client cancel to `INTERNAL` because `map_exception`
@@ -84,21 +106,25 @@ that and 207x is everything else in the end-to-end path.
    `fail_reason`, which is the seam to hang a proper terminal state on; model
    the fan-out on `MicroBatcher`'s `promise.set_exception` in
    `src/asr/batching.h`.
-4. **`TtsPreemptionCoordinator`** (`http_server.cpp:326`) exists only because
-   synthesis was serialized — its own comment says so. It should be
-   reconsidered now that it is not.
 5. **Deterministic concurrency tests.** `MagpieWaveService::drive_once` is
    already the single-threaded drive mode this needs; what is missing is a test
    that can run it without a model.
 
-## An intermittent failure, now reportable
+## The failure that was silent
 
-8 of 128 concurrent requests failed once at `chunk-frames 16`, with no
-diagnostic beyond "MagpieTTS synthesis failed": the engine thread is shared, so
-the thread that hits an error is never the one that reports it. A session now
-carries the reason and the request prints it. Not reproduced in five runs since.
-If it returns it will say which of the two ways a session can leave the engine
-it took.
+8 of 128 concurrent requests failed at `chunk-frames 16` with no diagnostic at
+all. The cause was not in the sessions. The codec worker and the wave service
+are built on first use, from a request thread holding only the shared side of
+the gate, so the first burst all found the pointer null, all built one, and the
+losing assignment destroyed the winner's -- whose `stop()` failed every session
+already inside it. Both accessors are guarded now, and a service that is serving
+refuses to be rebuilt rather than being stopped under the requests in it.
+
+Two lessons worth keeping. Lazy initialisation is a writer, so it belongs on the
+exclusive side of a gate or behind its own lock; the shared side is exactly
+where it looks safe and is not. And an error with no reason cost far more to
+find than the fix was worth -- a session now carries a `fail_reason`, because
+the thread that hits an error on a shared engine is never the one reporting it.
 
 ## Gotchas
 
