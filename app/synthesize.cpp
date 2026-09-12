@@ -88,6 +88,7 @@ print_synthesize_help(const char* program) {
         "  --tts.KEY VALUE           Override any C++ TTS setting\n"
         "  --concurrency N           Fire N identical requests at once and report the\n"
         "                            aggregate realtime factor and first-audio spread\n"
+        "  --arrival-ms N            Stagger those requests N ms apart instead\n"
         "  --no-warmup               Skip warmup\n"
         "  --force                   Replace an existing WAV\n",
         program);
@@ -118,6 +119,7 @@ command_synthesize(int argc, char** argv) {
         std::string text, input_path, output_path = "speech.wav", language, voice;
         std::string format = "wav";
         int concurrency = 1;
+        int arrival_ms = 0;
         bool force = false;
         bool warmup = true;
         int output_rate = 0;
@@ -136,6 +138,8 @@ command_synthesize(int argc, char** argv) {
                 ++i;
             else if (arg == "--concurrency")
                 concurrency = std::stoi(value(i, arg));
+            else if (arg == "--arrival-ms")
+                arrival_ms = std::stoi(value(i, arg));
             else if (arg == "--magpie-model")
                 parsed.runtime.magpie_model = value(i, arg);
             else if (arg == "--codec-model")
@@ -271,6 +275,11 @@ command_synthesize(int argc, char** argv) {
             for (int i = 0; i < concurrency; ++i) {
                 threads.emplace_back([&, i] {
                     load_result& run = runs[(size_t)i];
+                    // Requests arriving at a rate, rather than all at once.
+                    // Time to first audio is measured from this request's own
+                    // arrival, not from the start of the run.
+                    if (arrival_ms > 0)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(arrival_ms * i));
                     const auto started = std::chrono::steady_clock::now();
                     try {
                         run.result = synthesizer->synthesize(
