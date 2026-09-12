@@ -1978,43 +1978,89 @@ stream_magpie_to_audio(
                         stderr, "%s wave scheduler: %zu chunks, %d lanes, pinned history %d\n",
                         label, chunk_ids.size(), wave_lanes, params.longform_history_tokens);
                 }
+                // Admitting one chunk at a time would be ~118 prefills on a
+                // 150-chunk script, and a prefill is ~10 ms almost regardless of
+                // how many lanes it opens -- that would eat the whole saving. So
+                // idle lanes accumulate and are filled in one burst. The right
+                // fraction is an empirical question; a quarter of the lanes is
+                // the starting point, and the verbose trace below is what makes
+                // it measurable.
+                constexpr int kWaveAdmitFraction = 4;
+                const int admit_threshold = std::max(1, wave_lanes / kWaveAdmitFraction);
                 size_t next_chunk = 1;
-                while (next_chunk < chunk_ids.size()) {
-                    // A cohort at a time: every lane is refilled once the whole
-                    // group it held has finished. Continuous batching turns this
-                    // into "once enough of them have".
+                int64_t idle_lane_steps = 0;
+                int bursts = 0;
+
+                // Fill every lane to start with, then keep them full.
+                auto admit_into = [&](const std::vector<int>& free_lanes) -> bool {
                     std::vector<size_t> chunks;
                     std::vector<int> into;
-                    for (int l = 0; l < wave_lanes && next_chunk < chunk_ids.size(); ++l) {
-                        if (!prepare_chunk(next_chunk)) {
-                            return cancel_worker();
-                        }
-                        chunks.push_back(next_chunk++);
-                        into.push_back(l);
-                    }
-                    if (!admit_chunks(wave_lanes, chunks, into) || !drain_in_order()) {
-                        return cancel_worker();
-                    }
-                    for (;;) {
-                        bool any_live = false;
-                        for (int l = 0; l < wave_lanes; ++l) {
-                            retire_if_exhausted(lane_of[(size_t)l]);
-                            if (lane_of[(size_t)l] && !lane_of[(size_t)l]->done) {
-                                any_live = true;
-                                break;
-                            }
-                        }
-                        if (!any_live) {
+                    for (int lane : free_lanes) {
+                        if (next_chunk >= chunk_ids.size()) {
                             break;
                         }
-                        if (codec_worker.is_failed()) {
-                            codec_worker.join();
+                        if (!prepare_chunk(next_chunk)) {
                             return false;
                         }
-                        if (!wave_step(wave_lanes) || !drain_in_order()) {
-                            return cancel_worker();
+                        chunks.push_back(next_chunk++);
+                        into.push_back(lane);
+                    }
+                    if (chunks.empty()) {
+                        return true;
+                    }
+                    ++bursts;
+                    return admit_chunks(wave_lanes, chunks, into) && drain_in_order();
+                };
+                {
+                    std::vector<int> all_lanes(wave_lanes);
+                    for (int l = 0; l < wave_lanes; ++l) {
+                        all_lanes[(size_t)l] = l;
+                    }
+                    if (!admit_into(all_lanes)) {
+                        return cancel_worker();
+                    }
+                }
+
+                for (;;) {
+                    // A lane whose chunk has finished is idle: the chunk keeps
+                    // the lane, and its frames keep their place in the drain
+                    // order, but it is decoding nothing anyone will hear.
+                    std::vector<int> idle;
+                    int live = 0;
+                    for (int l = 0; l < wave_lanes; ++l) {
+                        retire_if_exhausted(lane_of[(size_t)l]);
+                        if (lane_of[(size_t)l]->done) {
+                            idle.push_back(l);
+                        } else {
+                            ++live;
                         }
                     }
+                    const bool more_chunks = next_chunk < chunk_ids.size();
+                    // Refill on the burst threshold, or as soon as the wave would
+                    // otherwise stall with work left.
+                    if (more_chunks && ((int)idle.size() >= admit_threshold || live == 0)) {
+                        if (!admit_into(idle)) {
+                            return cancel_worker();
+                        }
+                        continue;
+                    }
+                    if (live == 0 && !more_chunks) {
+                        break;
+                    }
+                    if (codec_worker.is_failed()) {
+                        codec_worker.join();
+                        return false;
+                    }
+                    idle_lane_steps += (int64_t)idle.size();
+                    if (!wave_step(wave_lanes) || !drain_in_order()) {
+                        return cancel_worker();
+                    }
+                }
+                if (params.verbose) {
+                    fprintf(
+                        stderr, "%s wave admission: %d bursts, threshold %d/%d lanes, %lld idle "
+                                "lane-steps\n",
+                        label, bursts, admit_threshold, wave_lanes, (long long)idle_lane_steps);
                 }
                 decoder.resetWave();
             }
