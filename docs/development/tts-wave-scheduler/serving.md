@@ -427,6 +427,44 @@ the graph width and refreshes its caches from the padded input, so a short
 opening chunk poisons the convolution state for everything after it. That is the
 piece to solve, and it is worth more than either of the other two.
 
+### The projection is wrong, and the spike says why
+
+`MAGPIE_FIRST_CODEC_CHUNK` (inert unless set) lets a stream's opening codec
+reads be shorter than the graph's chunk, doubling until they reach it. At low
+utilisation it behaves exactly as projected -- 64 requests into 64 lanes, read
+as fast as the engine produces:
+
+| config | capacity | first audio |
+|---|---|---|
+| cf=64 alone | 210.0x | 907 ms |
+| cf=64, opening 16 | 204.6x | 660 ms |
+| cf=64, opening 8 | 204.1x | 615 ms |
+| cf=8 throughout | 113.7x | 439 ms |
+
+Capacity of the large chunk with most of the latency of the small one, for 3%.
+
+Under load it fails. At cap 160 with streams consumed at 1x, plain cf=64 has **0
+of 320** underrunning; cf=64 with an 8-frame opening has **159 of 320**. The
+ramp does not rescue it. A control run says the steady chunk is not at fault:
+cf=32 and cf=64 both underrun nothing on their own.
+
+First audio is at fault, and the mechanism is general enough to be worth
+stating: **delivering first audio earlier starts the caller's playback clock
+earlier**, and the stream must then sustain 1x from that earlier moment with a
+buffer it has not had time to build. At 64 streams a lane runs at 3.1x realtime
+and can absorb it; at 160 it runs at 1.28x and cannot.
+
+So first-chunk size and capacity are **not independent under pacing**, which the
+projection above assumed in treating them as separate terms. Latency bought this
+way is paid for out of the same margin that high utilisation needs. The
+projected ~188 streams at ~535 ms is not reachable by this route, and the
+earlier frontier -- 180 streams at ~1.5 s, or ~100 streams at ~640 ms -- stands
+until something changes the per-stream rate rather than the delivery schedule.
+
+That also downgrades interlacing. It removes the queueing term, which is real
+and worth 3181 -> ~1190 ms at 160 streams, but it does not raise per-stream rate
+either, so it cannot buy back the margin a short opening chunk spends.
+
 ### Two modes, and why they are not a scheduler setting
 
 "Finish every request as fast as possible" and "deliver just in time with as
