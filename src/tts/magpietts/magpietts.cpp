@@ -1569,8 +1569,40 @@ struct codec_stream_worker {
         channel_retired.notify_all();
     }
 
+    // SPIKE (MAGPIE_FIRST_CODEC_CHUNK): let a stream's opening read be shorter
+    // than the graph's chunk, so first audio costs the small chunk while
+    // capacity keeps the large one. This is a measurement hack, not a design:
+    // NanoCodec zero-pads a short chunk to the graph width and refreshes its
+    // caches from the padded input, so every chunk after this one continues
+    // from a state that heard silence. The timing is representative; the audio
+    // is not. See docs/development/tts-wave-scheduler/serving.md.
+    int opening_chunk() const {
+        static const int configured = [] {
+            const char* raw = getenv("MAGPIE_FIRST_CODEC_CHUNK");
+            return raw ? std::max(1, atoi(raw)) : 0;
+        }();
+        return configured;
+    }
+
+    // A step from a tiny opening chunk straight to the full one starves the
+    // stream: it has the opening chunk's audio buffered and must wait a full
+    // chunk for more. Double each time instead, so the buffer grows as fast as
+    // the codec becomes efficient.
+    int ramped_chunk(int chunks_done) const {
+        const int opening = opening_chunk();
+        if (opening <= 0) {
+            return chunk_size;
+        }
+        int want = opening;
+        for (int i = 0; i < chunks_done && want < chunk_size; ++i) {
+            want *= 2;
+        }
+        return std::min(want, chunk_size);
+    }
+
     bool has_tokens_locked(const codec_channel& ch) const {
         const int diff = ch.write_idx - ch.read_idx;
+        const int want = ramped_chunk(ch.chunks_done);
         if (true_stateful) {
             if (diff <= 0) {
                 return false;
@@ -1578,7 +1610,7 @@ struct codec_stream_worker {
             if (ch.is_last_token_in || ch.input_closed) {
                 return true;
             }
-            return diff >= chunk_size;
+            return diff >= want;
         }
         if (diff <= future_size) {
             return false;
@@ -1598,11 +1630,12 @@ struct codec_stream_worker {
     codec_read_result read_tokens_locked(codec_channel& ch) {
         codec_read_result out;
         const int end = ch.write_idx;
+        const int take = ramped_chunk(ch.chunks_done);
         if (true_stateful) {
             if (end <= ch.read_idx) {
                 return out;
             }
-            const int chunk_end = std::min(end, ch.read_idx + chunk_size);
+            const int chunk_end = std::min(end, ch.read_idx + take);
             out.history_frames = 0;
             out.chunk_index = ch.chunks_done;
             out.final_read = ch.is_last_token_in && ch.last_token_id <= chunk_end;
