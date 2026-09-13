@@ -270,6 +270,19 @@ under churn: a slot freed by a finishing stream is taken by a new one that needs
 lanes for its opening chunk, which the population it joins has already spent.
 Size the cap against the load's arrival pattern, not against the static number.
 
+`tts.max-queued-sessions` then chooses between waiting and shedding. 0 means
+nobody waits -- a full engine refuses at once -- and -1, the default, queues
+without limit. Same engine, same 320 streams:
+
+| queue | admitted | refused | underruns | first audio p50 |
+|---|---|---|---|---|
+| unbounded | 320 | 0 | 0 | 15376 ms |
+| 0 | 160 | 160 | 0 | **3713 ms** |
+
+Queue everyone and they all wait; turn half away and the half you took get first
+audio in a fifth of the time. Which is right depends on whether a router can
+place the refused request somewhere else.
+
 **Discovering the cap did not work.** A buffer-level signal was tried in place
 of a count -- hold new requests while any established stream has less than N ms
 buffered -- on the theory that falling buffers are the symptom a count is a
