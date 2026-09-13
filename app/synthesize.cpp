@@ -311,11 +311,15 @@ command_synthesize(int argc, char** argv) {
                             break;
                     }
                     std::uniform_int_distribution<size_t> pick(0, sizes.size() - 1);
+                    std::uniform_int_distribution<size_t> where(0, sentences.size() - 1);
                     for (int i = 0; i < concurrency; ++i) {
                         const int want = std::max(1, sizes[pick(mix_rng)]);
+                        // From a random point in the corpus, so two requests of
+                        // the same length are not the same text.
+                        const size_t from = where(mix_rng);
                         std::string built;
                         for (int k = 0; k < want; ++k)
-                            built += sentences[(size_t)k % sentences.size()];
+                            built += sentences[(from + (size_t)k) % sentences.size()];
                         texts[(size_t)i] = built;
                     }
                 }

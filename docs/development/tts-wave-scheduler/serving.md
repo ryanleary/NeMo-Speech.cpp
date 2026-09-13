@@ -308,14 +308,29 @@ everything past that is spent on a queue that was never the constraint. First
 audio is 15 s and meaningless here: in batch mode every request queues by
 design.
 
+Repeated on real prose -- 320 requests of 1 to 30 sentences drawn at random
+positions from the 12298-sentence Gutenberg pool, 9 hours of audio:
+
+| in flight | aggregate |
+|---|---|
+| 64 | 196.6x |
+| 128 | 197.2x |
+| 256 | 196.3x |
+
+**~197x**, and just as flat. The 217x above is a synthetic corpus of one
+repeated paragraph shape; real mixed-length prose costs 9% of it, which is what
+should be used for planning. The cost is per-request rather than per-second --
+short requests carry a session, a prefill and a codec channel over very little
+audio -- so a workload of mostly short requests will sit lower still.
+
 Two things follow. This is the hardware ceiling for this model on this machine,
 so it is the number any scheduling change is measured against -- and the wave
 hits it at its narrowest useful width, which is what the graph-node bound
 predicts (step cost grows with lanes, so aggregate plateaus).
 
 And streaming is closer to it than it looked. ~190 concurrent realtime streams
-is ~190x of delivered audio against a 217x ceiling: **87%**. The scheduler is
-not where the remaining throughput is. Raising 217x is.
+is ~190x of delivered audio against a ~197x realistic ceiling: **96%**. The
+scheduler is not where the remaining throughput is. Raising the ceiling is.
 
 ### What actually sets each number
 
