@@ -374,6 +374,59 @@ improves throughput rather than costing it, and needs no decoder change: chunks
 come from sentence splitting in `Synthesizer::prepare`. Do that first and
 re-measure; interlacing is worth building only for the remainder.
 
+### Projecting chunk size and interlacing together
+
+Capacity against codec chunk, unpaced, 64 requests into 64 lanes -- the ceiling
+each setting allows:
+
+| chunk_frames | capacity | first audio (unpaced) |
+|---|---|---|
+| 8 | 113.7x | 439 ms |
+| 16 | 163.4x | 516 ms |
+| 32 | 200.5x | 656 ms |
+| 64 | 209.1x | 911 ms |
+
+The same model fits all four, with a fixed ~0.22 s of prefill, codec and
+scheduling overhead:
+
+    TTFA = (chunk_frames / 21.5) x streams / capacity  +  0.22 s
+
+Interlacing removes the queueing term, so a fully interlaced engine sits at
+streams = u x capacity, and the projection collapses to
+`TTFA ≈ (chunk_frames / 21.5) x u + 0.22`:
+
+| chunk_frames | streams (u=0.9) | projected TTFA |
+|---|---|---|
+| 8 | 102 | 535 ms |
+| 16 | 147 | 870 ms |
+| 32 | 180 | 1540 ms |
+| 64 | 188 | 2879 ms |
+
+**Chunk size and interlacing together do not reach ~180 streams at ~640 ms.**
+They trade along one curve: the chunk that makes first audio cheap is the chunk
+that makes the codec inefficient, and capacity falls with it. 180 streams lands
+at 1540 ms; 640 ms lands at ~100 streams.
+
+The combination that does reach it needs a third ingredient -- a **small first
+codec chunk with a large steady-state chunk**. Capacity is then set by the
+steady-state chunk and first audio by the opening one:
+
+| first / steady | streams (u=0.9) | projected TTFA |
+|---|---|---|
+| 8 / 64 | 188 | 535 ms |
+| 8 / 32 | 180 | 535 ms |
+| 16 / 64 | 188 | 870 ms |
+
+So ~188 streams at ~535 ms, which clears the target. All three are needed:
+interlacing to remove queueing, a large steady-state chunk for capacity, and a
+small opening chunk for first audio. Dropping any one falls back to the curve
+above.
+
+The blocker is the one already recorded: NanoCodec zero-pads a short chunk to
+the graph width and refreshes its caches from the padded input, so a short
+opening chunk poisons the convolution state for everything after it. That is the
+piece to solve, and it is worth more than either of the other two.
+
 ### Two modes, and why they are not a scheduler setting
 
 "Finish every request as fast as possible" and "deliver just in time with as
