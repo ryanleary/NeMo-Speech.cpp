@@ -59,6 +59,12 @@ struct MagpieRuntimeConfig {
     // which is what keeps latency low for the streams it did admit. -1 is an
     // unbounded queue, and is the default.
     int max_queued_sessions = -1;
+    // How far ahead of playback a stream may be produced. This is what a stream
+    // spends while it waits for a lane, so it sets how long a lane round trip
+    // may take before the stream falls silent -- capacity is bounded by this
+    // long before it is bounded by throughput. It costs memory, not latency:
+    // first audio leaves as soon as the first chunk is decoded either way.
+    int delivery_buffer_ms = 5000;
     int admission_window_ms = 2;
     int admission_window_max_ms = 20;
     int codec_queue_depth = 4;

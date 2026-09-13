@@ -156,6 +156,10 @@ register_runtime_config(common::ParameterParser& p, MagpieRuntimeConfig& c) {
         "Requests allowed to wait once the engine is full; 0 refuses immediately, "
         "-1 queues without limit");
     p.Register(
+        "delivery-buffer-ms", &c.delivery_buffer_ms,
+        "How far ahead of playback a stream may be produced; the slack a stream has "
+        "to win a lane back before it falls silent");
+    p.Register(
         "admission-window-ms", &c.admission_window_ms,
         "How long the wave waits, from idle, for a burst of requests to finish arriving "
         "before it admits any of them; 0 admits the first arrival immediately");
@@ -274,6 +278,10 @@ register_stream_params(common::ParameterParser& p, magpie_stream_params& c) {
         "max-queued-sessions", &c.max_queued_sessions,
         "Requests allowed to wait once the engine is full; 0 refuses immediately, "
         "-1 queues without limit");
+    p.Register(
+        "delivery-buffer-ms", &c.delivery_buffer_ms,
+        "How far ahead of playback a stream may be produced; the slack a stream has "
+        "to win a lane back before it falls silent");
     p.Register(
         "admission-window-ms", &c.admission_window_ms,
         "How long the wave waits, from idle, for a burst of requests to finish arriving "

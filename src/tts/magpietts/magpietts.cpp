@@ -3291,13 +3291,13 @@ stream_magpie_to_audio(
 
     metrics.begin();
     outputs.metrics = &metrics;
-    // Five seconds of audio: enough that an ordinary consumer never stalls the
-    // codec, small enough that a slow one stops being decoded for promptly.
     struct delivery_guard {
         stream_audio_outputs& outputs;
         ~delivery_guard() { outputs.finish_delivery(); }
     } delivery{outputs};
-    outputs.start_delivery((size_t)codec.sampleRate() * 2 * 5);
+    outputs.start_delivery(
+        (size_t)((int64_t)codec.sampleRate() * 2 * std::max(500, params.delivery_buffer_ms) /
+                 1000));
 
     // Setup allocates the sampler and captures the local transformer's graphs,
     // which is device work and cannot run beside the engine. So take the gate
