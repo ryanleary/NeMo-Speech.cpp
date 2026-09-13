@@ -287,6 +287,36 @@ Queue everyone and they all wait; turn half away and the half you took get first
 audio in a fifth of the time. Which is right depends on whether a router can
 place the refused request somewhere else.
 
+### Greedy batch: the machine's ceiling
+
+Competing-consumer mode -- a queue of work, N requests in flight, each decoded
+as fast as the wave can, nobody pacing. 320 paragraph requests queued:
+
+| lanes | in flight | aggregate |
+|---|---|---|
+| 64 | 64 | 216.5x |
+| 64 | 128 | 217.1x |
+| 64 | 192 | 217.3x |
+| 64 | 256 | 217.7x |
+| 128 | 128 | 217.9x |
+| 128 | 192 | 221.0x |
+| 128 | 256 | 218.8x |
+
+**~217x, and nothing moves it.** Not the number in flight over a 4x range, not
+doubling the lanes. 64 lanes with 64 requests in flight already reaches it, so
+everything past that is spent on a queue that was never the constraint. First
+audio is 15 s and meaningless here: in batch mode every request queues by
+design.
+
+Two things follow. This is the hardware ceiling for this model on this machine,
+so it is the number any scheduling change is measured against -- and the wave
+hits it at its narrowest useful width, which is what the graph-node bound
+predicts (step cost grows with lanes, so aggregate plateaus).
+
+And streaming is closer to it than it looked. ~190 concurrent realtime streams
+is ~190x of delivered audio against a 217x ceiling: **87%**. The scheduler is
+not where the remaining throughput is. Raising 217x is.
+
 ### What actually sets each number
 
 Two quantities, two different bounds, and conflating them wastes time:
