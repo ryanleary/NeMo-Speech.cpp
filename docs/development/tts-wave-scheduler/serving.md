@@ -323,6 +323,31 @@ today, with no size control, so this is a code change rather than a setting. It
 is the one lever identified that would put herd first-audio near the ~600 ms a
 request sees when a lane is free for it.
 
+### Two modes, and why they are not a scheduler setting
+
+"Finish every request as fast as possible" and "deliver just in time with as
+much throughput as will not underrun" are genuinely different objectives. They
+are not, however, separable by a scheduler policy. A flag was added to switch
+between them and measured identically in every regime:
+
+| policy | cap | aggregate | first audio p50 |
+|---|---|---|---|
+| throughput | 96 | 83.1x | 1604 ms |
+| latency | 96 | 82.5x | 1609 ms |
+| throughput | 160 | 127.1x | 3735 ms |
+| latency | 160 | 126.7x | 3701 ms |
+
+The mechanism that would separate them cannot act. Yielding a lane withholds
+only a session's *next* chunk, and with at least as many sessions as lanes no
+session is offered a second chunk anyway; below that, the delivery buffer bounds
+how far ahead a stream may run whatever the policy says. The flag was removed.
+
+What actually selects between the two is the caller's consumption rate and
+`tts.max-sessions`. A client that reads as fast as the engine produces gets
+throughput mode -- ~216x, requests finishing as early as they can. A client that
+consumes at playback rate gets just-in-time delivery, and the cap then picks the
+point on the curve above: low cap for first audio, high cap for aggregate.
+
 **Discovering the cap did not work.** A buffer-level signal was tried in place
 of a count -- hold new requests while any established stream has less than N ms
 buffered -- on the theory that falling buffers are the symptom a count is a
