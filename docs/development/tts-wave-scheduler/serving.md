@@ -338,6 +338,42 @@ today, with no size control, so this is a code change rather than a setting. It
 is the one lever identified that would put herd first-audio near the ~600 ms a
 request sees when a lane is free for it.
 
+### Interlacing: what it would buy, measured without building it
+
+A lane is held for a whole chunk, so a stream arriving into a busy wave waits a
+chunk-decode. The obvious fix is to interlace -- park several contexts per lane
+and switch between them every few steps. The decoder is closer to this than it
+looks: `fa_mask` is already `[cache_len, pad, 1, lanes]` with "every lane its own
+live-slot set", and `ring_heads_`, `valid_tokens_` and `n_tokens_` are already
+per-item arrays. Contexts could co-reside in one lane's ring at different
+offsets and switch by mask plus ring head, which costs 0.21% of a step. What is
+missing is that `cache_len` is sized for one chunk and the per-item arrays are
+sized `lanes`, not `lanes x contexts`.
+
+Before writing that, the hypothesis was tested by varying lane-hold time
+directly -- same load, same total audio, chunks of different length. 160 streams
+into 64 lanes:
+
+| chunk | chunks/request | aggregate | first audio p50 |
+|---|---|---|---|
+| ~5.0 s | 5 | 110.8x | 3181 ms |
+| ~1.9 s | 13 | **127.6x** | **1904 ms** |
+
+Finer chunks are better on *both* axes: 15% more throughput and 40% less first
+audio. That also confirms the model. First audio decomposes into a fair-share
+floor plus a queueing term proportional to chunk duration:
+
+    TTFA  =  first_chunk_audio x streams / aggregate   +   queueing
+    5.0 s chunks:  1.19 s + 1.99 s  =  3.18 s   (measured 3.181 s)
+    1.9 s chunks:  1.19 s + 0.76 s  =  1.95 s   (measured 1.904 s)
+
+Within 3% at both points. So interlacing, which drives the queueing term to
+zero, is worth 3181 -> ~1190 ms at this load -- real, and the largest single
+win left. But finer text chunking captures about two thirds of it for nothing,
+improves throughput rather than costing it, and needs no decoder change: chunks
+come from sentence splitting in `Synthesizer::prepare`. Do that first and
+re-measure; interlacing is worth building only for the remainder.
+
 ### Two modes, and why they are not a scheduler setting
 
 "Finish every request as fast as possible" and "deliver just in time with as
