@@ -29,13 +29,19 @@ add_executable(test_magpietts_contiguity_helpers test_magpietts_contiguity_helpe
 target_link_libraries(test_magpietts_contiguity_helpers PRIVATE nemo_speech_tts_magpietts)
 add_test(NAME magpietts_contiguity_helpers COMMAND test_magpietts_contiguity_helpers)
 
-add_executable(test_magpietts_asr test_magpietts_asr.cpp)
-target_link_libraries(test_magpietts_asr PRIVATE
-    tests_cpp_wer
-    nemo_speech_tts_magpietts
-    nemo_speech_tts_tokenizer
-    nemo_speech_asr
-)
+# Needs the ASR recognizer, so it cannot be built in a TTS-only configuration.
+# Left unguarded it does not merely skip -- it fails the whole build after the
+# TTS targets have been made but before they are relinked, which leaves a stale
+# binary behind and makes the next benchmark measure the previous build.
+if(NEMO_SPEECH_BUILD_ASR)
+    add_executable(test_magpietts_asr test_magpietts_asr.cpp)
+    target_link_libraries(test_magpietts_asr PRIVATE
+        tests_cpp_wer
+        nemo_speech_tts_magpietts
+        nemo_speech_tts_tokenizer
+        nemo_speech_asr
+    )
+endif()
 
 # C ABI tests. tts_c_smoke is compiled as C (proves include/nemo_speech/tts.h
 # is valid C) and links the unified TTS library; tts_c_dlopen loads it at runtime.
