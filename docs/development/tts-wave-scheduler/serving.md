@@ -264,6 +264,10 @@ last arrival. 320 streams offered to a 64-lane engine:
 | 192 | 11 of 320 | 10338 ms |
 | **160** | **0 of 320** | 15376 ms |
 
+(First-audio figures in this table were measured without a warm-up round and
+carry roughly 600 ms of first-burst codec graph building. The comparison between
+rows is sound; the absolute values are not. See the corrected table below.)
+
 Some callers wait rather than all callers stutter, and the wait is visible in
 the p50. Note 224 was clean as a *static* population (below) and is not clean
 under churn: a slot freed by a finishing stream is taken by a new one that needs
@@ -299,15 +303,26 @@ at about 3% of streams underrunning.
 so a stream arriving when every lane is busy waits a chunk-decode, and one
 arriving two cohorts deep waits two. At 64 lanes with 320 offered:
 
-| cap | streams per lane | aggregate | first audio p50 |
+| cap | streams per lane | aggregate | first audio p50/p95/p99 |
 |---|---|---|---|
-| 64 | 1.0 | 60.8x | 1258 ms |
-| 96 | 1.5 | 82.7x | 1610 ms |
-| 128 | 2.0 | 105.4x | 3683 ms |
-| 160 | 2.5 | 127.3x | 3705 ms |
+| 64 | 1.0 | 61.5x | 652/803/814 ms |
+| 96 | 1.5 | 84.9x | 747/3472/3496 ms |
+| 128 | 2.0 | 82.4x | 3068/3452/3477 ms |
+| 160 | 2.5 | 129.4x | 3186/5944/5992 ms |
 
-That is the whole trade, and it is why the two cannot both be maximised by
-tuning: throughput wants many streams per lane, first audio wants one.
+At one stream per lane, first audio is 652 ms -- the same 641 ms an unpaced
+client sees at the same width. Consuming at playback rate costs nothing; what
+costs is queueing for a lane, and that starts above about 1.5 streams per lane.
+
+Aggregate here is demand, not capacity: N streams consuming at 1x cannot ask for
+more than Nx however fast the engine is. "More throughput" in this mode means
+"more concurrent streams", and that is the trade against first audio -- 64
+streams at 650 ms, or 160 at 3.2 s.
+
+Arrival pattern decides whether the trade binds at all. The same 192 streams
+arriving Poisson at 100 ms see 410 ms, because no queue forms: a lane is free
+when each one arrives. The table above is a herd, where by construction it is
+not.
 
 Widening the wave does not escape it. More lanes means each lane advances
 slower -- per-lane rate is aggregate/lanes -- and below about 2x realtime per

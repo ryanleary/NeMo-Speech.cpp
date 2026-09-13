@@ -497,7 +497,10 @@ command_synthesize(int argc, char** argv) {
                     load_wall_s > 0.0 ? audio_s / load_wall_s : 0.0, pct(0.50), pct(0.95),
                     pct(0.99));
             }
-            if (failures > 0)
+            // A warm-up round exists to prime graphs, not to be judged. With an
+            // admission cap its refusals are the expected outcome, and aborting
+            // on them would mean the measured round never runs.
+            if (failures > 0 && round >= 0)
                 throw std::runtime_error("one or more concurrent requests failed");
             pcm = std::move(runs.front().pcm);
             result = runs.front().result;
