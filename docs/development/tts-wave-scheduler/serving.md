@@ -283,6 +283,46 @@ Queue everyone and they all wait; turn half away and the half you took get first
 audio in a fifth of the time. Which is right depends on whether a router can
 place the refused request somewhere else.
 
+### What actually sets each number
+
+Two quantities, two different bounds, and conflating them wastes time:
+
+**Capacity is throughput.** A stream consumes 1x, so the engine holds about as
+many as its aggregate realtime factor, ~200. It is not bounded by buffer depth:
+at 320 streams, delivery buffers of 5 / 15 / 30 s give 109 / 114 / 118
+underruns, because 320 streams want 320x from a ~200x engine and slack cannot
+invent the difference. Note the corollary -- at cap 160 the engine reports only
+127x, so a cap set for safety leaves real throughput unused. 192 buys that back
+at about 3% of streams underrunning.
+
+**First audio is admitted-streams-per-lane.** A lane is held for a whole chunk,
+so a stream arriving when every lane is busy waits a chunk-decode, and one
+arriving two cohorts deep waits two. At 64 lanes with 320 offered:
+
+| cap | streams per lane | aggregate | first audio p50 |
+|---|---|---|---|
+| 64 | 1.0 | 60.8x | 1258 ms |
+| 96 | 1.5 | 82.7x | 1610 ms |
+| 128 | 2.0 | 105.4x | 3683 ms |
+| 160 | 2.5 | 127.3x | 3705 ms |
+
+That is the whole trade, and it is why the two cannot both be maximised by
+tuning: throughput wants many streams per lane, first audio wants one.
+
+Widening the wave does not escape it. More lanes means each lane advances
+slower -- per-lane rate is aggregate/lanes -- and below about 2x realtime per
+lane streams start falling behind. At 128 lanes with 160 streams: 80 underruns
+and 70x, against 0 and 127x at 64 lanes. Useful lanes top out near half the
+aggregate realtime factor.
+
+What *would* break the trade is a shorter opening chunk. Lane hold time is chunk
+decode time, so first audio in a herd scales with it directly, and only the
+first chunk of a request need be short -- the rest can stay full size, leaving
+throughput alone. Chunks come from sentence splitting in `Synthesizer::prepare`
+today, with no size control, so this is a code change rather than a setting. It
+is the one lever identified that would put herd first-audio near the ~600 ms a
+request sees when a lane is free for it.
+
 **Discovering the cap did not work.** A buffer-level signal was tried in place
 of a count -- hold new requests while any established stream has less than N ms
 buffered -- on the theory that falling buffers are the symptom a count is a
