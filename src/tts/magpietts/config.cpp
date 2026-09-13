@@ -153,7 +153,8 @@ register_runtime_config(common::ParameterParser& p, MagpieRuntimeConfig& c) {
         "Streams carried at once; further requests wait for a slot. 0 is unlimited");
     p.Register(
         "max-queued-sessions", &c.max_queued_sessions,
-        "Requests allowed to wait for a slot before one is refused. 0 is unlimited");
+        "Requests allowed to wait once the engine is full; 0 refuses immediately, "
+        "-1 queues without limit");
     p.Register(
         "admission-window-ms", &c.admission_window_ms,
         "How long the wave waits, from idle, for a burst of requests to finish arriving "
@@ -271,7 +272,8 @@ register_stream_params(common::ParameterParser& p, magpie_stream_params& c) {
         "Streams carried at once; further requests wait for a slot. 0 is unlimited");
     p.Register(
         "max-queued-sessions", &c.max_queued_sessions,
-        "Requests allowed to wait for a slot before one is refused. 0 is unlimited");
+        "Requests allowed to wait once the engine is full; 0 refuses immediately, "
+        "-1 queues without limit");
     p.Register(
         "admission-window-ms", &c.admission_window_ms,
         "How long the wave waits, from idle, for a burst of requests to finish arriving "

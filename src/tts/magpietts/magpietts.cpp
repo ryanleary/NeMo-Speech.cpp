@@ -2546,7 +2546,7 @@ struct MagpieWaveService {
     // and the buffer level below which it stops taking new ones. All read per
     // request, so they can be retuned without restarting.
     int max_sessions = 0;
-    int max_queued_sessions = 0;
+    int max_queued_sessions = -1;
     std::chrono::microseconds admission_window{2000};
     // ...and how long it will keep extending that wait while the queue is still
     // growing. A wide wave takes more arrivals to fill, and they take longer to
@@ -2640,17 +2640,23 @@ struct MagpieWaveService {
                 session.status = WaveSession::failed;
                 return false;
             }
-            if (max_queued_sessions > 0 && (int)waiting_for_slot >= max_queued_sessions) {
-                // Shedding rather than queueing: past here the wait itself is
-                // the problem, and a caller is better told now.
-                session.fail_reason = "the engine is at capacity and its admission queue is full";
-                session.status = WaveSession::failed;
-                return false;
-            }
             // Wait for a slot rather than join a wave that cannot carry us. An
             // over-full wave does not fail; it delivers stuttering audio to
             // every stream in it, including the ones already running.
+            //
+            // The queue limit is only consulted once the engine is actually
+            // full: a bound on how many may wait says nothing about a request
+            // that does not have to.
             if (at_capacity_locked()) {
+                if (max_queued_sessions >= 0 &&
+                    (int)waiting_for_slot >= max_queued_sessions) {
+                    // Shedding rather than queueing: past here the wait itself
+                    // is the problem, and a caller is better told now.
+                    session.fail_reason =
+                        "the engine is at capacity and its admission queue is full";
+                    session.status = WaveSession::failed;
+                    return false;
+                }
                 ++waiting_for_slot;
                 settled.wait_for(lock, std::chrono::seconds(30), [&] {
                     return stopping || draining || !at_capacity_locked() ||
@@ -3113,7 +3119,7 @@ MagpieStreamingWorkspace::waveService(
     // Tunable between requests: the window is read by the engine thread each
     // time it parks, not baked into the graph like the width is.
     wave_service->max_sessions = std::max(0, params.max_sessions);
-    wave_service->max_queued_sessions = std::max(0, params.max_queued_sessions);
+    wave_service->max_queued_sessions = std::max(-1, params.max_queued_sessions);
     wave_service->admission_window =
         std::chrono::microseconds(std::max(0, params.admission_window_ms) * 1000);
     wave_service->admission_window_max = std::chrono::microseconds(

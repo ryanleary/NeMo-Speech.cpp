@@ -53,9 +53,12 @@ struct MagpieRuntimeConfig {
     // not fail -- it delivers stuttering audio to everyone in it. 0 is
     // unlimited.
     int max_sessions = 0;
-    // Requests allowed to wait for a slot. Past this one is refused outright,
-    // which is load shedding rather than backpressure. 0 is unlimited.
-    int max_queued_sessions = 0;
+    // Requests allowed to wait for a slot once the engine is full. Past this
+    // one is refused outright, which is load shedding rather than
+    // backpressure. 0 means none may wait -- a full engine refuses immediately,
+    // which is what keeps latency low for the streams it did admit. -1 is an
+    // unbounded queue, and is the default.
+    int max_queued_sessions = -1;
     int admission_window_ms = 2;
     int admission_window_max_ms = 20;
     int codec_queue_depth = 4;
