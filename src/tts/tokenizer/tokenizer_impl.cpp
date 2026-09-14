@@ -763,6 +763,25 @@ cjk_terminal_size_at(const std::string& text, size_t position) {
     return 0;
 }
 
+// A quoted sentence ends at the quote, not at the punctuation inside it: the
+// terminal mark is followed by a closing quote or bracket before the space.
+// NeMo allows the same run (its sentence regex is
+// `(?<=[.!?...])["'\u201d\u2019\u00bb)\]}\u300d\u300f]*\s+`). Without this, dialogue
+// never ends a sentence, chunks grow until the comma splitter has to cut them,
+// and the cut lands mid-sentence -- an unnatural pause where no pause belongs.
+static size_t
+closing_quote_size_at(const std::string& text, size_t i) {
+    static const char* closers[] = {"\"", "'", ")", "]", "}",
+                                    "\u201d", "\u2019", "\u00bb", "\u300d", "\u300f"};
+    for (const char* closer : closers) {
+        const size_t n = std::strlen(closer);
+        if (text.compare(i, n, closer) == 0) {
+            return n;
+        }
+    }
+    return 0;
+}
+
 // Titles are always followed by a name, so the period after one ends a word and
 // not a sentence. NeMo carries the same list (tts_dataset_utils.py,
 // _TITLE_ABBREVIATIONS) and refuses to split there; without it "My dear Mr.
@@ -822,21 +841,31 @@ split_sentences(std::string paragraph) {
     for (size_t i = 0; i < paragraph.size(); ++i) {
         const char c = paragraph[i];
         const char next = i + 1 < paragraph.size() ? paragraph[i + 1] : '\0';
-        bool ascii_boundary = (c == '.' || c == '?' || c == '!') && next == ' ';
+        size_t closers = 0;
+        if (c == '.' || c == '?' || c == '!') {
+            size_t k = i + 1;
+            while (const size_t n = closing_quote_size_at(paragraph, k)) {
+                k += n;
+            }
+            closers = k - (i + 1);
+        }
+        const size_t after_closers = i + 1 + closers;
+        bool ascii_boundary = (c == '.' || c == '?' || c == '!') &&
+                              after_closers < paragraph.size() && paragraph[after_closers] == ' ';
         if (ascii_boundary && c == '.' &&
             is_title_abbreviation(word_before_period(paragraph, start, i))) {
             ascii_boundary = false;
         }
         const size_t cjk_terminal_size = cjk_terminal_size_at(paragraph, i);
         if (ascii_boundary || cjk_terminal_size != 0) {
-            size_t end = i + (ascii_boundary ? 1 : cjk_terminal_size);
+            size_t end = ascii_boundary ? after_closers : i + cjk_terminal_size;
             if (cjk_terminal_size != 0) {
                 while (const size_t next_terminal_size = cjk_terminal_size_at(paragraph, end)) {
                     end += next_terminal_size;
                 }
             }
             std::string sent = paragraph.substr(start, end - start);
-            start = ascii_boundary ? i + 2 : end;
+            start = ascii_boundary ? end + 1 : end;
             const auto first = sent.find_first_not_of(" \t\r\n");
             const auto last = sent.find_last_not_of(" \t\r\n");
             if (first != std::string::npos) {
