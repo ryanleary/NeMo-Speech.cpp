@@ -1071,6 +1071,19 @@ causal_shift(ggml_context* ctx, ggml_tensor* x, int shift) {
     if (shift == 0) {
         return x;
     }
+    const int64_t n_time = x->ne[1];
+    if (shift >= n_time || -shift >= n_time) {
+        return ggml_scale(ctx, x, 0.0f);
+    }
+    if (shift < 0) {
+        // Look-ahead: drop the leading `advance` frames and zero-fill the tail.
+        // Only a bidirectional stack asks for this.
+        const int advance = -shift;
+        ggml_tensor* tail = ggml_cont(
+            ctx, ggml_view_2d(
+                     ctx, x, x->ne[0], n_time - advance, x->nb[1], (size_t)advance * x->nb[1]));
+        return ggml_pad(ctx, tail, 0, advance, 0, 0);
+    }
     ggml_tensor* padded = ggml_pad(ctx, x, 0, shift, 0, 0);
     ggml_tensor* zeros = ggml_scale(ctx, padded, 0.0f);
     ggml_tensor* shifted = ggml_acc(
@@ -1079,15 +1092,25 @@ causal_shift(ggml_context* ctx, ggml_tensor* x, int shift) {
 }
 
 ggml_tensor*
-causal_conv1d(ggml_context* ctx, ggml_tensor* x, const std::vector<ggml_tensor*>& kernels) {
+conv1d(
+    ggml_context* ctx, ggml_tensor* x, const std::vector<ggml_tensor*>& kernels, bool causal) {
     ggml_tensor* y = nullptr;
     const int kernel = (int)kernels.size();
+    // A causal stack pads entirely on the left; a bidirectional one centres the
+    // window. Getting this wrong does not fail -- it shifts every output by half
+    // a kernel and quietly changes the result.
+    const int pad = causal ? kernel - 1 : (kernel - 1) / 2;
     for (int k = 0; k < kernel; ++k) {
-        ggml_tensor* xs = causal_shift(ctx, x, kernel - 1 - k);
+        ggml_tensor* xs = causal_shift(ctx, x, pad - k);
         ggml_tensor* part = ggml_mul_mat(ctx, kernels[k], xs);
         y = y ? ggml_add(ctx, y, part) : part;
     }
     return y;
+}
+
+ggml_tensor*
+causal_conv1d(ggml_context* ctx, ggml_tensor* x, const std::vector<ggml_tensor*>& kernels) {
+    return conv1d(ctx, x, kernels, true);
 }
 
 static ggml_tensor*
@@ -1341,9 +1364,9 @@ transformer_forward(
 
         residual = x;
         cur = layer_norm(ctx, x, layer.norm_ff);
-        cur = causal_conv1d(ctx, cur, layer.ff_proj);
+        cur = conv1d(ctx, cur, layer.ff_proj, tr.causal);
         cur = ggml_gelu(ctx, cur);
-        cur = causal_conv1d(ctx, cur, layer.ff_out);
+        cur = conv1d(ctx, cur, layer.ff_out, tr.causal);
         x = ggml_add(ctx, residual, cur);
     }
 
@@ -1395,9 +1418,9 @@ transformer_forward_cached(
 
         residual = x;
         cur = layer_norm(ctx, x, layer.norm_ff);
-        cur = causal_conv1d(ctx, cur, layer.ff_proj);
+        cur = conv1d(ctx, cur, layer.ff_proj, tr.causal);
         cur = ggml_gelu(ctx, cur);
-        cur = causal_conv1d(ctx, cur, layer.ff_out);
+        cur = conv1d(ctx, cur, layer.ff_out, tr.causal);
         x = ggml_add(ctx, residual, cur);
     }
 

@@ -259,8 +259,13 @@ command_synthesize(int argc, char** argv) {
                 throw std::invalid_argument("TEXT and --input cannot be used together");
             text = read_text_file(input_path);
         }
-        if (text.empty())
+        // --tokens-file supplies the tokens directly, which is the whole point of
+        // it: a checkpoint whose text vocabulary differs from the packaged
+        // tokenizer's has no text path to take.
+        if (text.empty() && tokens_path.empty())
             throw std::invalid_argument("TEXT is required");
+        if (!text.empty() && !tokens_path.empty())
+            throw std::invalid_argument("TEXT and --tokens-file cannot be used together");
         if (format != "wav" && format != "pcm")
             throw std::invalid_argument("--format must be wav or pcm");
         if (cli_json() && output_path == "-")
@@ -270,9 +275,15 @@ command_synthesize(int argc, char** argv) {
             resolve_model_file(parsed.runtime.magpie_model, "tts", "MagpieTTS model").string();
         parsed.runtime.codec_model =
             resolve_model_file(parsed.runtime.codec_model, "codec", "NanoCodec model").string();
-        parsed.tokenizer_model_dir =
-            resolve_model_directory(parsed.tokenizer_model_dir, "tokenizer", "tokenizer model")
-                .string();
+        // Pre-tokenized input needs no tokenizer, and resolving one anyway pulls
+        // in the packaged default -- whose vocabulary a custom checkpoint's
+        // generally does not match, which is the reason --tokens-file exists.
+        if (tokens_path.empty())
+            parsed.tokenizer_model_dir =
+                resolve_model_directory(parsed.tokenizer_model_dir, "tokenizer", "tokenizer model")
+                    .string();
+        else
+            parsed.tokenizer_model_dir.clear();
         if (!parsed.tn_model_dir.empty())
             parsed.tn_model_dir =
                 require_model_directory(parsed.tn_model_dir, "text normalization model").string();
