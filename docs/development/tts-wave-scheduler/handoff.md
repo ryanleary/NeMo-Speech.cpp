@@ -16,15 +16,15 @@ together). Default `batch-size 1` leaves the sequential path bit-identical.
 Reference hashes for the sequential path:
 
     line       0afc4e3a87b69463
-    paragraph  a847a56f29e14f41
-    script     faf5f0a0be4ba831
+    paragraph  d22e3346015f5391
+    script     b75ec1bc76c55ff6
 
 These are a change-detector against our own top-of-tree, not a reference
 oracle. They have been re-baselined four times on purpose: when the decoder
 took flash attention, when the local transformer did, when the long-form
 attention prior took NeMo's weights, when the pause between long-form
 chunks became a fixed 200 ms, and when that pause became digital silence
-instead of a decoded codec frame. `line` is a single chunk and has never moved --
+across which the codec's state is reset. `line` is a single chunk and has never moved --
 the last two only shape multi-chunk runs, so it is the control that says a
 re-baseline was the seam and nothing else.
 

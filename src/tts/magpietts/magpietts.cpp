@@ -1591,9 +1591,21 @@ struct codec_stream_worker {
             return true;
         }
         const std::vector<float> silence((size_t)owed, 0.0f);
-        return ch.audio_pp.writeDecodedAudio(
-            silence, 0, false,
-            [&](const std::vector<float>& processed) { return ch.outputs->write_audio(processed); });
+        if (!ch.audio_pp.writeDecodedAudio(
+                silence, 0, false, [&](const std::vector<float>& processed) {
+                    return ch.outputs->write_audio(processed);
+                })) {
+            return false;
+        }
+        // The next chunk opens on a clean decoder. Carrying the convolution
+        // state across a pause means its first sample is produced from a cache
+        // still full of the previous utterance, so the audio starts at speech
+        // level instead of rising out of the silence -- a step of 652 against
+        // the 7 the reference implementation starts from, and audible as a click
+        // on the first phoneme. NeMo decodes each chunk independently, which is
+        // the same thing.
+        ch.stream_state.clear();
+        return true;
     }
 
     // Room for one more frame without waiting. The engine thread drives every
