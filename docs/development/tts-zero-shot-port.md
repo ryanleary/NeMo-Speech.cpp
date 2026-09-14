@@ -222,3 +222,146 @@ up -- the wave hashes were unaffected, so it is narrow.
 Until then zero-shot falls back to sequential decode, which on the 12.5 h book
 is roughly 5x slower than the wave: the fallback is a real cost, not a
 formality.
+
+---
+
+# Handoff: zero-shot at parity, for the Pride and Prejudice demo
+
+Everything above is background. This section is the task.
+
+## The goal
+
+`nemo-speech synthesize -i pride.txt --tts.context-audio <voice>.wav` renders
+the whole novel in a cloned voice, with the same UX and the same speed as the
+baked checkpoint already manages: **12 h 31 m of audio in 3 m 30 s, 216x
+realtime**.
+
+Today that command works and produces correct audio, but decodes sequentially
+at roughly a fifth of the speed, and needs a hand-built tokenizer directory.
+
+## Gap 1 — zero-shot cannot use the wave (the 5x)
+
+**This is the whole demo.** Everything else is polish.
+
+`use_wave` requires `wave_conditioning_ok`, i.e. a baked checkpoint
+(`magpietts.cpp`, search `wave_conditioning_ok`). Lift it and a context-encoder
+checkpoint batches like any other.
+
+A full attempt was made and reverted; reproduce it from the "Batching zero-shot"
+section above. What it established:
+
+- The per-item design is right and the seam is one line: `slot.context =
+  owner.context_prefix()` beside `slot.speaker = owner.speaker()`.
+- The prefill must build a `[n_embd, context_len, items]` block from each lane's
+  prefix instead of `ggml_get_rows(baked_context, speaker_in)`, and must not
+  feed `magpietts_prefill_speaker` when it does.
+- `context_len_` has to be carried on the wave runtime. Two ring checks use
+  `h.baked_context_length` directly and are wrong for a computed prefix.
+- This checkpoint has `apply_attention_prior = false`. The wave prefill and the
+  wave step both feed a prior tensor unconditionally; the graph does not build
+  one, and the input lookup fails. Guard both.
+
+Two things still to solve:
+
+1. **The step fails before it runs.** `wave_runtime_` is already null when
+   `MagpieDecoder::evalWave` is entered, so the first failure is upstream.
+   Prime suspect is `sample()`: this checkpoint stacks 2 frames and emits 16
+   codebooks, where every wave measured so far emitted 8. Check
+   `MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS` and the batched sampler's per-slot layout
+   against `emit_codebooks` rather than `audio_codebooks`.
+2. **Something in that diff moves the sequential path.** The attempt changed the
+   *sequential* baked hashes (`0afc4e3a...` to `60ec3ca8...`) while leaving the
+   wave hashes untouched. Find that before anything else: it is narrow, and it
+   is why the work was reverted rather than committed behind the guard.
+
+Definition of done: the six wave hashes and three sequential hashes unchanged,
+and the book renders in roughly 3-4 minutes.
+
+## Gap 2 — the tokenizer has to be hand-built
+
+`~/nemo-bench-assets/tokenizer-v2607` exists and works, but a user cannot be
+asked to construct it. Two ways out, in order of preference:
+
+1. **Embed the tokenizer in the GGUF**, as the ASR models do (base64 blobs).
+   Self-describing checkpoints, and the whole mismatch class disappears --
+   including `NEMO_SPEECH_TOKENIZER_PROFILE`, which exists only because the
+   profile is a proxy for "which dictionaries". Note the TTS side is 15
+   tokenizers with IPA dictionaries, not one SentencePiece model, so decide
+   whether to embed all of them or only those the checkpoint's
+   `language_to_tokenizer_mapping` reaches.
+2. **Register a profile** for this tokenizer layout, so no override is needed.
+   Cheaper, but leaves the assets out of band.
+
+## Gap 3 — conversion needs an override
+
+`NEMO_SPEECH_TOKENIZER_PROFILE=v2607` is required, because this checkpoint's
+pt-BR tokenizer omits `locale_specific_punct` (NeMo defaults it true; the public
+v2607 sets it false). The difference is real and Portuguese-only. Gap 2 dissolves
+this.
+
+## Gap 4 — context window selection
+
+The runtime takes the **leading** `context_duration_max` seconds of the
+reference. NeMo takes a random window. For a 38 s file the leading 10 s may be
+an intro or near-silence, and the model gets one shot at the speaker from it.
+
+Not a correctness bug, and deliberately out of scope so far. Cheapest
+improvement is picking the window by energy; `--context-offset SECONDS` is the
+smaller version. Note `context_duration_min == max == 10.0`, so *more* reference
+audio cannot help without retraining -- only a better ten seconds can.
+
+## Reproducing what exists
+
+```bash
+# 1. convert (both need the server's weights)
+W=~/devel/magpie-tts-server/magpie_tts_weights
+NEMO_SPEECH_TOKENIZER_PROFILE=v2607 python convert_model.py \
+    $W/Magpie-TTS--val_cer_gt=0.3605-step=1200.ckpt \
+    --config-yaml $W/config_v3_nostress_fixed.local.yaml \
+    --outfile magpie-zs.f16.gguf --outtype f16
+python convert_model.py $W/21fps_causal_codecmodel.nemo \
+    --with-codec-encoder --outfile nanocodec-enc.f16.gguf --outtype f16
+
+# 2. the reference must be mono at the codec rate; the runtime refuses to
+#    resample, because a resampler that differs from NeMo's changes the codes
+#    silently. The server's own cached conversion is the safest source:
+#    ~/devel/magpie-tts-server/var/ctx_cache/default.wav
+
+# 3. synthesize
+nemo-speech synthesize -i pride.txt --device cuda --no-warmup \
+    --tts.magpie-model magpie-zs.f16.gguf \
+    --tts.codec-model nanocodec-enc.f16.gguf \
+    --tts.tokenizer-model-dir ~/nemo-bench-assets/tokenizer-v2607 \
+    --tts.context-audio ~/devel/magpie-tts-server/var/ctx_cache/default.wav \
+    --tts.batch-size 64 --tts.longform-history-tokens 20 --tts.chunk-frames 32
+```
+
+## Verifying conditioning, if you touch it
+
+```bash
+# capture NeMo's own prefix and codes
+cd ~/devel/magpie-tts-server && ./.venv/bin/python3 \
+    <repo>/scripts/tts/capture-magpie-reference.py --out /tmp/ref
+
+# ours, from the reference's own window
+MAGPIETTS_CONTEXT_DUMP=/tmp/cpp.bin nemo-speech synthesize \
+    --tokens-file /tmp/ref/text-tokens.txt --tts.context-codes /tmp/ref/context-codes.txt ...
+<repo>/scripts/tts/compare-context-prefix.py /tmp/ref/prefix.npy /tmp/cpp.bin
+# expect cosine 0.99999851
+```
+
+Compare via `--context-codes`, never `--context-audio`: NeMo's capture used a
+random window of the reference, so the audio route legitimately disagrees. That
+mistake cost most of a session. `MAGPIETTS_CONTEXT_CODES_DUMP` dumps our codes
+if you need to compare those instead.
+
+## Traps
+
+- Measure both arms of any comparison **on the same build**. Comparing the codes
+  route before a fix against the audio route after it produced a confident and
+  entirely wrong diagnosis.
+- Listening and the metric can both be right. A cloned voice sounded correct
+  while the prefix cosine was 0.63: different windows of the same speaker.
+- A full `cmake --build` that fails late can leave a stale `nemo-speech` behind,
+  and the next benchmark silently measures the previous build. Fixed for the ASR
+  test, but check the binary's timestamp when a result surprises you.
