@@ -127,8 +127,7 @@ struct MagpieChunkDecodeState {
     int steps_past_chunk_end = 0;
     // Steps of audio still owed after a non-final EOS. EOS fires on any of the
     // emitted codebooks, so it can land a frame or two before the sound it ends
-    // has actually decayed; cutting there chops the last phoneme. Counted down
-    // before suppression starts.
+    // has decayed. Counted down before suppression starts.
     int eos_tail_steps = 0;
 };
 
@@ -482,13 +481,12 @@ struct codec_channel {
 
     std::vector<std::vector<int32_t>> audio_codes;
     // Pauses owed between chunks, as (frames written before it, samples of
-    // silence). A pause is digital silence, not a decoded frame: pushing a
-    // "silence" code through a stateful decoder that still holds the preceding
-    // speech rings for about 50 ms before it settles, which is audible as a
-    // click at the end of every utterance.
+    // silence). A pause is digital silence rather than a decoded frame: a
+    // "silence" code pushed through a stateful decoder that still holds the
+    // preceding speech rings for about 50 ms before it settles.
     std::deque<std::pair<int, int>> gaps;
-    // Quiet samples the last decoded chunk already ends with; the next pause is
-    // reduced by this much.
+    // Quiet samples the last decoded chunk already ends with. The next pause is
+    // reduced by this much, so the gap is a target rather than an addition.
     int trailing_quiet_samples = 0;
     int read_idx = 0;
     int write_idx = 0;
@@ -998,10 +996,10 @@ struct stream_audio_outputs {
 
     // Hand finished audio to the caller from a thread of this request's own.
     //
-    // The callback used to run on the codec worker, which serves every session.
-    // A client that paces its reads -- through TCP flow control, a blocking
-    // write, or a jitter buffer -- would then hold that one thread and stall
-    // audio for every other session. Delivery is buffered here instead, and
+    // Running it on the codec worker, which serves every session, would let a
+    // client that paces its reads -- through TCP flow control, a blocking
+    // write, or a jitter buffer -- hold that one thread and stall audio for
+    // every other session. Delivery is buffered here instead, and
     // when the buffer fills the codec simply stops choosing this channel, so
     // the backpressure reaches the engine as an idle lane rather than as a
     // stopped thread.
@@ -1373,9 +1371,8 @@ decode_and_stream_chunk(
     }
     if (trailing_quiet_samples) {
         // How much of this chunk's tail is already quiet. The pause between
-        // chunks tops that up rather than adding to it: a chunk ends on a decay
-        // it has already paid for, and adding a full pause on top is what makes
-        // a seam sound twice as long as the model's own sentence breaks.
+        // chunks tops that up rather than adding to it, so a seam is no longer
+        // than one of the model's own sentence breaks.
         constexpr float kQuiet = 0.002f;
         int quiet = 0;
         for (size_t i = audio.size(); i-- > 0;) {
@@ -1581,19 +1578,15 @@ struct codec_stream_worker {
     }
 
     // Digital silence, through the same post-processor the decoded audio takes
-    // so the two cannot get out of order. Nothing here touches the decoder: its
-    // convolution state stays where the last real frame left it, which is what
-    // makes the pause silent instead of a decaying ring.
+    // so the two cannot get out of order. The decoder is not invoked.
     bool emit_gap(codec_channel& ch, int samples) {
         const int owed = samples - ch.trailing_quiet_samples;
         ch.trailing_quiet_samples = 0;
         if (!ch.outputs) {
             return true;
         }
-        // Even a pause that needs no silence is still a boundary: the state
-        // reset below has to happen either way, or a chunk whose tail was
-        // already quiet enough opens the next one on the previous chunk's
-        // decoder and the click comes back at exactly those seams.
+        // A pause that needs no silence is still a boundary, and the state reset
+        // below has to happen for it too.
         if (owed > 0) {
             const std::vector<float> silence((size_t)owed, 0.0f);
             if (!ch.audio_pp.writeDecodedAudio(
@@ -1603,13 +1596,10 @@ struct codec_stream_worker {
                 return false;
             }
         }
-        // The next chunk opens on a clean decoder. Carrying the convolution
-        // state across a pause means its first sample is produced from a cache
-        // still full of the previous utterance, so the audio starts at speech
-        // level instead of rising out of the silence -- a step of 652 against
-        // the 7 the reference implementation starts from, and audible as a click
-        // on the first phoneme. NeMo decodes each chunk independently, which is
-        // the same thing.
+        // The next chunk opens on a clean decoder, the way an independently
+        // decoded chunk does. A cache still holding the previous utterance makes
+        // the first sample come out at speech level instead of rising from
+        // silence, which is heard as a click on the first phoneme.
         ch.stream_state.clear();
         return true;
     }
@@ -2142,9 +2132,8 @@ struct WaveSession {
     MagpiePinnedHostScratch& text_context_staging;
     int& frames_generated;
     int& decoder_frames_generated;
-    // The pause between this request's chunks, in samples. Fixed, not drawn:
-    // NeMo's servers put a constant gap between utterances, and a random one
-    // only makes the seam harder to reason about.
+    // The pause between this request's chunks, in samples. Constant, matching
+    // the fixed gap the reference servers put between utterances.
     int boundary_gap_samples;
 
     // Owned.
@@ -3441,9 +3430,9 @@ stream_magpie_to_audio(
     const double codec_fps = codec.samplesPerFrame() > 0
                                  ? (double)codec.sampleRate() / (double)codec.samplesPerFrame()
                                  : 0.0;
-    // magpie_serve's chunk_gap: a fixed pause between utterances. Each chunk is
-    // cut at the frame where it ended and carries almost no trailing silence of
-    // its own, so this is what puts the breath back.
+    // magpie_serve's chunk_gap. A chunk is cut at the frame where it ended and
+    // carries little trailing silence of its own, so this is the breath between
+    // utterances.
     const int boundary_gap_samples = std::max(
         0, (int)std::lround((double)params.chunk_gap_ms / 1000.0 * (double)codec.sampleRate()));
     const int window_samples = (int)((int64_t)codec.sampleRate() * params.window_ms / 1000);

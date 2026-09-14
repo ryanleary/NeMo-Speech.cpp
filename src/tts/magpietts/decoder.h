@@ -90,8 +90,8 @@ struct MagpieWavePrefillItem {
     int speaker = 0;
     // The chunk's own conditioning prefix, for checkpoints that compute one from
     // reference audio instead of looking a speaker up in a table. Null means the
-    // baked table; a computed prefix is per lane for the same reason `speaker`
-    // is, and lands in the ring at the same moment.
+    // baked table. Per lane for the same reason `speaker` is, and lands in the
+    // ring at the same moment.
     const magpietts_context_prefix* context = nullptr;
     const std::vector<std::vector<int32_t>>* audio_codes = nullptr;
     DecoderCrossKvCache* cross_kv = nullptr;

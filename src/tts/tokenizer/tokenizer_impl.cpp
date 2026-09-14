@@ -688,10 +688,9 @@ split_words_by_limit(const std::string& text, int max_words) {
 
 static std::vector<std::string>
 split_long_sentence_by_commas(const std::string& sentence) {
-    // magpie_serve packs chunks to max_chunk_chars = 300 and only splits a
-    // sentence on its commas when it is longer than that. 35 words is about 200
-    // characters, so we were cutting ordinary sentences in half and putting a
-    // chunk seam -- and a pause -- where the author put a comma.
+    // About 300 characters, matching the max_chunk_chars magpie_serve packs to
+    // before it reaches for a sentence's commas. Splitting earlier puts a chunk
+    // seam, and a pause, where the author only put a comma.
     constexpr int kMaxWordsPerPhrase = 50;
     if (count_ascii_space_words(sentence) <= kMaxWordsPerPhrase) {
         return {sentence};
@@ -769,10 +768,7 @@ cjk_terminal_size_at(const std::string& text, size_t position) {
 
 // A quoted sentence ends at the quote, not at the punctuation inside it: the
 // terminal mark is followed by a closing quote or bracket before the space.
-// NeMo allows the same run (its sentence regex is
-// `(?<=[.!?...])["'\u201d\u2019\u00bb)\]}\u300d\u300f]*\s+`). Without this, dialogue
-// never ends a sentence, chunks grow until the comma splitter has to cut them,
-// and the cut lands mid-sentence -- an unnatural pause where no pause belongs.
+// Matches the run NeMo's sentence regex allows.
 static size_t
 closing_quote_size_at(const std::string& text, size_t i) {
     static const char* closers[] = {"\"", "'", ")", "]", "}",
@@ -787,10 +783,7 @@ closing_quote_size_at(const std::string& text, size_t i) {
 }
 
 // Titles are always followed by a name, so the period after one ends a word and
-// not a sentence. NeMo carries the same list (tts_dataset_utils.py,
-// _TITLE_ABBREVIATIONS) and refuses to split there; without it "My dear Mr.
-// Bennet" becomes two chunks, the second opening on a bare surname, and the
-// model stumbles over the seam.
+// not a sentence. Same list as _TITLE_ABBREVIATIONS in tts_dataset_utils.py.
 static bool
 is_title_abbreviation(const std::string& word) {
     static const std::set<std::string> titles = {"capt", "col",  "dr",   "gen", "gov",
@@ -800,9 +793,8 @@ is_title_abbreviation(const std::string& word) {
 }
 
 // The word a period follows, lowercased, with anything that is not an ASCII
-// letter trimmed off both ends. NeMo compares the raw whitespace-delimited token
-// instead, which misses an opening quote -- `"Mr.` reads as `"mr` there and
-// splits. Trimming can only ever prevent a split, never introduce one.
+// letter trimmed off both ends. The trim is deliberate: without it an opening
+// quote defeats the lookup, and it can only ever prevent a split.
 static std::string
 word_before_period(const std::string& text, size_t sentence_start, size_t period) {
     size_t end = period;

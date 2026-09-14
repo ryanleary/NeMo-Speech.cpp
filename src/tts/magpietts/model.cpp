@@ -1761,10 +1761,10 @@ MagpieLongformAttentionPriorState::beginChunk(
     buildInitialChunkPrior(h);
 }
 
-// NeMo's ChunkedInferenceConfig, which the checkpoints do not carry and its
-// servers do not override: short_sentence_threshold, prior_weights_init (seven
-// flat positions opening a chunk), and prior_weights read as
-// (history, current, +1 .. +6).
+// ChunkedInferenceConfig: short_sentence_threshold, prior_weights_init (seven
+// flat positions opening a chunk), and prior_weights, read as
+// (history, current, +1 .. +6). Checkpoints do not carry these and the servers
+// do not override them, so they are constants here too.
 static constexpr int kMagpieShortSentenceThreshold = 35;
 static constexpr int kMagpiePriorWeightsInit = 7;
 static constexpr float kMagpiePriorWeights[] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.2f, 0.2f};
@@ -1786,9 +1786,9 @@ MagpieLongformAttentionPriorState::buildInitialChunkPrior(const magpietts_hparam
         return;
     }
 
-    // NeMo's _initialize_chunk_attention_prior: the spliced history is
-    // suppressed hard, the new chunk's opening window is flat, and everything
-    // past it keeps the plain epsilon the fill above left.
+    // _initialize_chunk_attention_prior: the spliced history is suppressed hard,
+    // the new chunk's opening window is flat, and everything past it keeps the
+    // plain epsilon the fill above left.
     const int current_start = std::max(0, text_len_ - current_chunk_len_);
     std::fill(prior_.begin(), prior_.begin() + (size_t)current_start, eps * eps);
     for (int offset = 0; offset < kMagpiePriorWeightsInit; ++offset) {
@@ -1825,13 +1825,9 @@ MagpieLongformAttentionPriorState::buildPrior(const magpietts_hparams& h) {
     } else if (text_len_ <= kMagpieShortSentenceThreshold) {
         std::fill(prior_.begin(), prior_.end(), 1.0f);
     } else {
-        // NeMo's _set_prior_weights_around_position, read straight off
-        // ChunkedInferenceConfig.prior_weights as (history, current, +1 .. +6).
-        // The window is flat out to +4 rather than a decaying ramp: under-
-        // weighting the lookahead leaves the decoder short of anywhere to go and
-        // it dithers, and under-weighting the history cell -- NeMo's comment
-        // there is "slight exposure to history for better pronunciation" --
-        // slurs the first syllable of a chunk.
+        // _set_prior_weights_around_position. The window is flat out to +4 so
+        // the decoder always has somewhere to go, and the history cell carries
+        // full weight because a chunk's first syllable is pronounced against it.
         const int history_end = std::max(1, rel - 1);
         if (history_end < text_len_) {
             prior_[(size_t)history_end] = kMagpiePriorWeights[0];
@@ -1847,12 +1843,9 @@ MagpieLongformAttentionPriorState::buildPrior(const magpietts_hparams& h) {
         // Everything from +7 on is suppressed; the fill above already did it.
     }
 
-    // NeMo's _penalize_attention_sinks with its attention_sink_threshold of 3:
-    // everything up to AND INCLUDING an over-attended position is suppressed, so
-    // a decoder stuck on one token is pushed off it. Ours ran at a threshold of
-    // 10 -- our own field, not upstream -- and stopped short of the position
-    // actually being attended, so the token it was stuck on kept its full weight
-    // and nothing ever moved.
+    // _penalize_attention_sinks: everything up to and including an over-attended
+    // position is suppressed, so a decoder that has settled on one token is
+    // pushed off it instead of holding it at full weight.
     constexpr int kMagpieAttentionSinkThreshold = 3;
     for (int absolute = left_offset_ + 1; absolute < left_offset_ + text_len_; ++absolute) {
         if (absolute >= 0 && absolute < (int)attended_counts_.size() &&
@@ -1879,12 +1872,9 @@ MagpieLongformAttentionPriorState::update(
     const int previous_abs =
         std::max(left_offset_, std::min(last_attended_absolute_, left_offset_ + text_len_ - 1));
     const int previous_rel = std::max(0, std::min(previous_abs - left_offset_, text_len_ - 1));
-    // NeMo's get_most_attended_text_timestep, including the constant it hardcodes
-    // there: a position attended four times is taken to be a sink and the search
-    // starts one past it. This used to be a configurable
-    // attention_prior_advance_threshold defaulting to 8, which is ours and not
-    // upstream -- and at 8 a stuck decoder crawls one text token per eight steps,
-    // emitting quiet frames the whole way.
+    // A position attended this many times is a sink, so the search starts one
+    // past it rather than letting the decoder settle on a token it has already
+    // spoken. get_most_attended_text_timestep hardcodes the same constant.
     constexpr int kMagpieAttendedSinkAdvance = 4;
     int search_start_abs = previous_abs;
     if (previous_abs >= 0 && previous_abs < (int)attended_counts_.size() &&
@@ -1897,9 +1887,9 @@ MagpieLongformAttentionPriorState::update(
     const int search_end =
         std::min(last_rel + std::max(0, h.attention_prior_lookahead_window), text_len_ - 3);
     if (search_end <= last_rel) {
-        // NeMo reads an empty slice here and takes it to mean the sentence has
-        // ended, jumping to the last token. We used to stay where we were, which
-        // is a decoder that never reaches its chunk end and keeps generating.
+        // An empty window means attention has run past the last token worth
+        // searching, which is what the end of a sentence looks like; jump to the
+        // end so the chunk can finish.
         attended_rel = text_len_ - 1;
     } else {
         attended_rel = last_rel;

@@ -1219,7 +1219,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
         // The graph runs at the width of the set being opened, not the runtime's.
         // A prefill costs about half a millisecond per lane it computes and
         // nothing per lane it opens, so opening sixteen lanes of a hundred and
-        // twenty-eight used to do eight times the work it needed.
+        // twenty-eight at the runtime's width would do eight times the work.
         //
         // What the narrowing costs is a view: cross-attention indexes items along
         // ne3 from the start of what it is handed, and a scattered set of lanes
