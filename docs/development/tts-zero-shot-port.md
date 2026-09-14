@@ -4,10 +4,10 @@ Standalone by convention: zero-shot support stays in its own commits, and the
 general development notes do not link here. Nothing in
 `docs/development/README.md` should point at this file.
 
-Status: **landed**, except for one piece. Zero-shot checkpoints run, and clone
-from a reference WAV, on the sequential path. The wave refuses them with a
-diagnostic rather than running them, because its conditioning is still
-decoder-wide. See "What is left" at the end.
+Status: **landed**. Zero-shot checkpoints run, clone from a reference WAV, and
+batch through the wave at the same rate the baked checkpoint manages -- the
+whole novel in four minutes. What remains is packaging, not capability: see
+"What is still missing" at the end.
 
 ## What to port
 
@@ -68,8 +68,9 @@ owner.speaker()` per admission, next to `WaveSession::speaker()`. A context
 prefix goes beside it as `owner.context_prefix()`, with the cross-attention
 arena machinery already proving that per-item conditioning slices work.
 
-Without this, zero-shot runs only on the sequential path — which is to say, not
-with batching, which is the whole of this branch.
+That is what landed, and the seam was the one line it looked like. See
+"Batching zero-shot through the wave" below for what had to follow the prefix
+through, and what it is gated on.
 
 ## Assets for verification
 
@@ -99,43 +100,9 @@ share filenames with the public checkpoint's but differ in content.
   original port recorded 0.99969.
 - Per-session voices: two concurrent requests with different reference WAVs in
   one wave, each matching its own solo run. This is the case the original
-  commits never had to consider and the one most likely to be wrong.
-
-
-## What is left
-
-`MagpieWavePrefillItem` carries `speaker` per item, and its comment says why
-that is enough: "A step never re-supplies it -- the baked context lands in this
-lane's K/V ring here and stays -- so voices only have to be separable at
-admission." The same is true of a computed prefix, which makes this a
-prefill-only change rather than a step-loop one.
-
-What the wave prefill does today is read conditioning straight out of the baked
-table, `ggml_get_rows(model_.baked_context, speaker_in)`, one row per lane. A
-context-encoder checkpoint has no such table -- `model.baked_context` is null --
-and its conditioning is a computed prefix held on `MagpieDecoder`, one for the
-whole engine. Lanes from different requests would all get whichever prefix was
-set last.
-
-So the wave now refuses a context-encoder checkpoint and says so, rather than
-faulting on the null table or, worse, handing one request another's voice.
-
-To lift it:
-
-1. Give `MagpieWavePrefillItem` a `const magpietts_context_prefix* context`
-   beside `speaker`.
-2. In the wave prefill graph, when the checkpoint conditions on a context
-   encoder, build the `[n_embd, ctx_len, items]` conditioning block from each
-   item's prefix instead of the baked row lookup. Every item in one prefill
-   burst already opens at the same length, which is the constraint this needs.
-3. `WaveSession` gains `context_prefix()` the way it has `speaker()`, and
-   `WaveEngine::admit` sets `slot.context = owner.context_prefix()`.
-4. Drop `wave_conditioning_ok`.
-
-The test that matters is the one neither original commit had to consider: two
-concurrent requests with different reference WAVs in one wave, each matching its
-own solo run.
-
+  commits never had to consider and the one most likely to be wrong. **Still not
+  run**, and not because of the wave -- nothing can yet name a voice per
+  request. See Gap 2.
 
 ## Validation, and where it actually stands
 
@@ -198,86 +165,91 @@ were overridden.
 Embedding the tokenizer in the GGUF, as the ASR models do, would remove this
 whole directory and the mismatch class with it.
 
-## Batching zero-shot: attempted, reverted
+## Batching zero-shot through the wave
 
-Per-item conditioning was plumbed end to end -- `MagpieWavePrefillItem::context`,
-a `[n_embd, len, items]` conditioning block built from each lane's prefix
-instead of the baked table's row lookup, `WaveSession::context_prefix()`, and
-`context_len_` carried on the runtime so the ring arithmetic uses the real
-length. Two further gaps surfaced and were fixed: this checkpoint has
-`apply_attention_prior = false`, so both the wave prefill and the wave step fed
-a prior tensor the graph never built.
+Conditioning is now per lane, which is what `speaker` always was and for the
+same reason: a step never re-supplies it, so it only has to be separable at
+admission. `MagpieWavePrefillItem` carries the lane's prefix,
+`WaveSession::context_prefix()` answers with the request's, and the prefill
+builds an `[n_embd, context_len, items]` block from them where it used to do
+`ggml_get_rows(baked_context, speaker_in)`.
 
-It still failed before the first decode step, and informatively: by the time
-`MagpieDecoder::evalWave` runs, `wave_runtime_` is already null, so the first
-failure is upstream of the step -- most likely `sample()`, since this checkpoint
-stacks 2 frames and emits 16 codebooks where every wave measured so far emitted
-8.
+Three things had to follow the prefix through:
 
-The work was reverted rather than committed: it moved the **sequential** baked
-hashes (`0afc4e3a...` to `60ec3ca8...`), so something in it changes the
-non-wave path too. That regression is the thing to find first when picking this
-up -- the wave hashes were unaffected, so it is narrow.
+- **The ring is sized and stepped from the prefix length**, not from
+  `hparams.baked_context_length`. Those are the same number on a baked
+  checkpoint and are not on a zero-shot one: the context encoder pads to a
+  duration-derived length, 217 positions here against the table's 110. The
+  runtime carries `context_len_` and the three `total_len` computations read it.
+  The sequential path takes the same argument, which is why it can now hold a
+  persistent runtime at all -- its length check had been failing every step and
+  silently falling back to the rebuilt-graph path.
+- **`apply_attention_prior` is false on this checkpoint.** The wave prefill
+  declared the prior as a graph input unconditionally; nothing read it, ggml
+  pruned it, and `compute_graph` then failed to bind it by name. Declare it only
+  where a layer applies it. (The step needed no guard: its prior is a session
+  tensor, which exists whether or not the graph reads it.)
+- **Lanes that disagree on conditioning length are refused**, since one ring
+  serves them all. In practice they cannot disagree -- the length is the
+  checkpoint's, not the request's -- but the runtime is sized to it, so the
+  check belongs where the runtime is opened.
 
-Until then zero-shot falls back to sequential decode, which on the 12.5 h book
-is roughly 5x slower than the wave: the fallback is a real cost, not a
-formality.
+### What gates it
+
+The six wave hashes and the three sequential hashes are unchanged, and
+`ctest -R magpietts` passes. That is the baked path; for the zero-shot path
+byte-identity against sequential is unavailable for the usual reason (batched
+matmul numerics, and the wave's lane assignment), so the check is **step 0**:
+
+```
+sequential  216 148 386 813 232 1088 1041 789
+wave w=8    216 148 386 813 232 1088 1041 789
+```
+
+Frame 0 is sampled straight off the prefill, so it is exactly the frame that
+says whether the lane's conditioning arrived intact. It matches byte for byte,
+and frames 1 onward diverge -- which is what the baked checkpoint does too, on
+the same test.
+
+### The book, in a cloned voice
+
+Pride and Prejudice (Gutenberg 1342), same text as the baked run, one request,
+128 lanes, `--tts.context-audio` pointing at the server's cached `default.wav`:
+
+| | baked | zero-shot |
+|---|---|---|
+| conditioning positions | 110 (table row) | 217 (context encoder) |
+| chunks | -- | 7,072 |
+| output | 12 h 31 m | **15 h 35 m** (1,236,879,360 samples) |
+| wall clock | 3 m 29.7 s | **3 m 58.8 s** |
+| realtime factor | 216.3x | **234.9x** |
+| decoder / codec alone | -- | 451.6x / 277.3x |
+| first audio | -- | 867 ms |
+| peak RSS | 24.9 GB | 26.5 GB |
+| FLAC | 873 MB (44%) | 1.28 GB (52%) |
+
+The cloned voice reads the same book 25% longer -- it is a slower speaker, not a
+slower decoder -- so realtime factor is the number to compare, and it is
+slightly *above* the baked run. Nothing about the conditioning route costs
+throughput; the 5x gap was entirely the wave being switched off.
+
+Levels sampled at 60 s, 22,000 s, 44,000 s and 55,000 s: mean -21 to -23 dB,
+peak -3.5 to -4.1 dB. Consistent across the whole book, no silence, no clipping.
+
+Run to run the sample count moves by about 0.5% (1.2427 G against 1.2369 G on
+two runs of the same command). That is the documented lane dependence: which
+lane a chunk lands in depends on admission timing, and the arithmetic depends on
+the lane.
 
 ---
 
-# Handoff: zero-shot at parity, for the Pride and Prejudice demo
+# What is still missing
 
-Everything above is background. This section is the task.
+The demo works: `synthesize -i pride.txt --tts.context-audio <voice>.wav`
+renders the novel in a cloned voice at 234.9x. Three things stand between that
+and a checkpoint anyone can run.
 
-## The goal
-
-`nemo-speech synthesize -i pride.txt --tts.context-audio <voice>.wav` renders
-the whole novel in a cloned voice, with the same UX and the same speed as the
-baked checkpoint already manages: **12 h 31 m of audio in 3 m 30 s, 216x
-realtime**.
-
-Today that command works and produces correct audio, but decodes sequentially
-at roughly a fifth of the speed, and needs a hand-built tokenizer directory.
-
-## Gap 1 — zero-shot cannot use the wave (the 5x)
-
-**This is the whole demo.** Everything else is polish.
-
-`use_wave` requires `wave_conditioning_ok`, i.e. a baked checkpoint
-(`magpietts.cpp`, search `wave_conditioning_ok`). Lift it and a context-encoder
-checkpoint batches like any other.
-
-A full attempt was made and reverted; reproduce it from the "Batching zero-shot"
-section above. What it established:
-
-- The per-item design is right and the seam is one line: `slot.context =
-  owner.context_prefix()` beside `slot.speaker = owner.speaker()`.
-- The prefill must build a `[n_embd, context_len, items]` block from each lane's
-  prefix instead of `ggml_get_rows(baked_context, speaker_in)`, and must not
-  feed `magpietts_prefill_speaker` when it does.
-- `context_len_` has to be carried on the wave runtime. Two ring checks use
-  `h.baked_context_length` directly and are wrong for a computed prefix.
-- This checkpoint has `apply_attention_prior = false`. The wave prefill and the
-  wave step both feed a prior tensor unconditionally; the graph does not build
-  one, and the input lookup fails. Guard both.
-
-Two things still to solve:
-
-1. **The step fails before it runs.** `wave_runtime_` is already null when
-   `MagpieDecoder::evalWave` is entered, so the first failure is upstream.
-   Prime suspect is `sample()`: this checkpoint stacks 2 frames and emits 16
-   codebooks, where every wave measured so far emitted 8. Check
-   `MAGPIETTS_CUDA_MAX_SAMPLE_SLOTS` and the batched sampler's per-slot layout
-   against `emit_codebooks` rather than `audio_codebooks`.
-2. **Something in that diff moves the sequential path.** The attempt changed the
-   *sequential* baked hashes (`0afc4e3a...` to `60ec3ca8...`) while leaving the
-   wave hashes untouched. Find that before anything else: it is narrow, and it
-   is why the work was reverted rather than committed behind the guard.
-
-Definition of done: the six wave hashes and three sequential hashes unchanged,
-and the book renders in roughly 3-4 minutes.
-
-## Gap 2 — the tokenizer has to be hand-built
+## Gap 1 -- the tokenizer has to be hand-built
 
 `~/nemo-bench-assets/tokenizer-v2607` exists and works, but a user cannot be
 asked to construct it. Two ways out, in order of preference:
@@ -292,14 +264,33 @@ asked to construct it. Two ways out, in order of preference:
 2. **Register a profile** for this tokenizer layout, so no override is needed.
    Cheaper, but leaves the assets out of band.
 
-## Gap 3 — conversion needs an override
+This is now the only thing keeping the demo from being reproducible by someone
+who did not build the assets.
+
+## Gap 2 -- the voice is per process, not per request
+
+The wave carries conditioning per lane, and two lanes may hold different
+voices. Nothing can currently supply two: `context_audio_file` lives on
+`MagpieRuntimeConfig`, is copied into every request's params, and
+`MagpieSynthesisOptions` has no context field at all. So one server serves one
+cloned voice, and the per-lane plumbing is exercised only with every lane
+holding the same prefix.
+
+What it needs: a reference on the request (audio or codes, or a handle to a
+voice the server has already encoded), a cache keyed on it so a repeated voice
+is encoded once rather than per request, and then the test this whole design
+exists for -- **two concurrent requests with different reference WAVs in one
+wave, each matching its own solo run**. That test has never been run, because
+until this it could not be.
+
+## Gap 3 -- conversion needs an override
 
 `NEMO_SPEECH_TOKENIZER_PROFILE=v2607` is required, because this checkpoint's
 pt-BR tokenizer omits `locale_specific_punct` (NeMo defaults it true; the public
-v2607 sets it false). The difference is real and Portuguese-only. Gap 2 dissolves
-this.
+v2607 sets it false). The difference is real and Portuguese-only. Gap 1
+dissolves this.
 
-## Gap 4 — context window selection
+## Gap 4 -- context window selection
 
 The runtime takes the **leading** `context_duration_max` seconds of the
 reference. NeMo takes a random window. For a 38 s file the leading 10 s may be
@@ -329,12 +320,17 @@ python convert_model.py $W/21fps_causal_codecmodel.nemo \
 
 # 3. synthesize
 nemo-speech synthesize -i pride.txt --device cuda --no-warmup \
+    -o - --format pcm \
     --tts.magpie-model magpie-zs.f16.gguf \
     --tts.codec-model nanocodec-enc.f16.gguf \
     --tts.tokenizer-model-dir ~/nemo-bench-assets/tokenizer-v2607 \
     --tts.context-audio ~/devel/magpie-tts-server/var/ctx_cache/default.wav \
-    --tts.batch-size 64 --tts.longform-history-tokens 20 --tts.chunk-frames 32
+    --tts.batch-size 128 --tts.longform-history-tokens 20 --tts.chunk-frames 32 \
+  | ffmpeg -f s16le -ar 22050 -ac 1 -i - -c:a flac -y pride-zeroshot.flac
 ```
+
+`-o -` does not stream: the CLI still accumulates the whole output before
+writing it, so the pipe saves the 2.5 GB WAV on disk but not the 26 GB of RSS.
 
 ## Verifying conditioning, if you touch it
 
