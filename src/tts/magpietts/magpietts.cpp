@@ -481,6 +481,15 @@ struct codec_channel {
     const char* run_label = "stream";
 
     std::vector<std::vector<int32_t>> audio_codes;
+    // Pauses owed between chunks, as (frames written before it, samples of
+    // silence). A pause is digital silence, not a decoded frame: pushing a
+    // "silence" code through a stateful decoder that still holds the preceding
+    // speech rings for about 50 ms before it settles, which is audible as a
+    // click at the end of every utterance.
+    std::deque<std::pair<int, int>> gaps;
+    // Quiet samples the last decoded chunk already ends with; the next pause is
+    // reduced by this much.
+    int trailing_quiet_samples = 0;
     int read_idx = 0;
     int write_idx = 0;
     int last_token_id = -1;
@@ -509,6 +518,8 @@ struct codec_channel {
         run_label = label ? label : "stream";
         audio_pp = AudioPostProcessor(pp_samples_per_frame, pp_future_frames, pp_window_samples);
         audio_codes.clear();
+        gaps.clear();
+        trailing_quiet_samples = 0;
         read_idx = 0;
         write_idx = 0;
         last_token_id = -1;
@@ -1305,7 +1316,8 @@ decode_and_stream_chunk(
     nc::NanoCodecStreamState* stream_state, nc::NanoCodecStreamGraph* stream_graph,
     const std::vector<std::vector<int32_t>>& chunk, int threads, stream_audio_outputs& outputs,
     AudioPostProcessor& audio_pp, stream_run_metrics* metrics, const char* run_label,
-    int chunk_index, int history_frames, bool final_chunk, bool verbose) {
+    int chunk_index, int history_frames, bool final_chunk, bool verbose,
+    int* trailing_quiet_samples = nullptr) {
     const ggml_nvtx::range nvtx_range("magpietts_stream_decode_and_write_chunk");
     if (chunk.empty()) {
         return true;
@@ -1359,6 +1371,21 @@ decode_and_stream_chunk(
     if (metrics) {
         metrics->add_codec_work(elapsed_s, audio_s);
     }
+    if (trailing_quiet_samples) {
+        // How much of this chunk's tail is already quiet. The pause between
+        // chunks tops that up rather than adding to it: a chunk ends on a decay
+        // it has already paid for, and adding a full pause on top is what makes
+        // a seam sound twice as long as the model's own sentence breaks.
+        constexpr float kQuiet = 0.002f;
+        int quiet = 0;
+        for (size_t i = audio.size(); i-- > 0;) {
+            if (std::fabs(audio[i]) > kQuiet) {
+                break;
+            }
+            ++quiet;
+        }
+        *trailing_quiet_samples = quiet;
+    }
     if (!audio_pp.writeDecodedAudio(
             audio, history_frames, final_chunk,
             [&](const std::vector<float>& processed) { return outputs.write_audio(processed); })) {
@@ -1397,6 +1424,8 @@ decode_and_stream_chunk(
 
 struct codec_read_result {
     std::vector<std::vector<int32_t>> frames;
+    // Silence to emit after these frames, in samples. Never decoded.
+    int gap_samples = 0;
     int history_frames = 0;
     int chunk_index = 0;
     bool final_read = false;
@@ -1532,6 +1561,41 @@ struct codec_stream_worker {
         return true;
     }
 
+    // Owe this channel a pause after everything written so far. Costs no queue
+    // slot and never blocks: it is a note to the worker, not a frame.
+    bool write_gap(codec_channel& ch, int samples) {
+        if (samples <= 0) {
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        if (ch.failed || ch.abort_requested || ch.input_closed || stopping) {
+            return false;
+        }
+        if (!ch.gaps.empty() && ch.gaps.back().first == ch.write_idx) {
+            ch.gaps.back().second += samples;
+        } else {
+            ch.gaps.emplace_back(ch.write_idx, samples);
+        }
+        has_work.notify_one();
+        return true;
+    }
+
+    // Digital silence, through the same post-processor the decoded audio takes
+    // so the two cannot get out of order. Nothing here touches the decoder: its
+    // convolution state stays where the last real frame left it, which is what
+    // makes the pause silent instead of a decaying ring.
+    bool emit_gap(codec_channel& ch, int samples) {
+        const int owed = samples - ch.trailing_quiet_samples;
+        ch.trailing_quiet_samples = 0;
+        if (owed <= 0 || !ch.outputs) {
+            return true;
+        }
+        const std::vector<float> silence((size_t)owed, 0.0f);
+        return ch.audio_pp.writeDecodedAudio(
+            silence, 0, false,
+            [&](const std::vector<float>& processed) { return ch.outputs->write_audio(processed); });
+    }
+
     // Room for one more frame without waiting. The engine thread drives every
     // lane in the wave, so it must never block on one session's backpressure.
     bool has_room_for(codec_channel& ch) {
@@ -1549,19 +1613,6 @@ struct codec_stream_worker {
         std::vector<int32_t> frame(codec.numCodebooks(), 0);
         for (int c = 0; c < codec.numCodebooks(); ++c) {
             int32_t token = c < 8 ? nemo_eos[c] : 0;
-            if (token < 0 || token >= codec.codebookSize()) {
-                token = 0;
-            }
-            frame[c] = token;
-        }
-        return frame;
-    }
-
-    std::vector<int32_t> silence_frame() const {
-        static const int32_t nemo_silence[8] = {621, 1455, 1184, 1038, 463, 377, 1536, 1742};
-        std::vector<int32_t> frame(codec.numCodebooks(), 0);
-        for (int c = 0; c < codec.numCodebooks(); ++c) {
-            int32_t token = c < 8 ? nemo_silence[c] : 0;
             if (token < 0 || token >= codec.codebookSize()) {
                 token = 0;
             }
@@ -1717,6 +1768,9 @@ struct codec_stream_worker {
         if (ch.is_last_token_in && diff > future_size) {
             return true;
         }
+        if (!ch.gaps.empty() && ch.gaps.front().first <= ch.read_idx) {
+            return true;
+        }
         return diff >= chunk_size;
     }
 
@@ -1728,7 +1782,14 @@ struct codec_stream_worker {
             if (end <= ch.read_idx) {
                 return out;
             }
-            const int chunk_end = std::min(end, ch.read_idx + take);
+            int chunk_end = std::min(end, ch.read_idx + take);
+            // A pause belongs after the frames written before it, so the decode
+            // stops there and the silence is emitted between the two.
+            if (!ch.gaps.empty() && ch.gaps.front().first <= chunk_end) {
+                chunk_end = std::max(ch.read_idx, ch.gaps.front().first);
+                out.gap_samples = ch.gaps.front().second;
+                ch.gaps.pop_front();
+            }
             out.history_frames = 0;
             out.chunk_index = ch.chunks_done;
             out.final_read = ch.is_last_token_in && ch.last_token_id <= chunk_end;
@@ -1747,6 +1808,10 @@ struct codec_stream_worker {
         out.final_read = ch.is_last_token_in && ch.last_token_id <= end;
         out.frames.assign(ch.audio_codes.begin() + start, ch.audio_codes.begin() + end);
         ch.read_idx = end - future_size;
+        if (!ch.gaps.empty() && ch.gaps.front().first <= end) {
+            out.gap_samples = ch.gaps.front().second;
+            ch.gaps.pop_front();
+        }
         has_room.notify_all();
         return out;
     }
@@ -1774,7 +1839,7 @@ struct codec_stream_worker {
                 what = codec_work::prewarm;
             } else if (has_tokens_locked(ch)) {
                 out.item = read_tokens_locked(ch);
-                if (out.item.frames.empty()) {
+                if (out.item.frames.empty() && out.item.gap_samples == 0) {
                     continue;
                 }
                 what = codec_work::decode;
@@ -1911,11 +1976,17 @@ struct codec_stream_worker {
                 // Reads are capped at chunk_size and a short final chunk is zero-padded by
                 // the decoder, so one graph serves the whole stream.
                 nc::NanoCodecStreamGraph* graph = true_stateful ? &ch.stream_graph : nullptr;
+                if (work.item.frames.empty() && work.item.gap_samples > 0) {
+                    if (!emit_gap(ch, work.item.gap_samples)) {
+                        set_failed(ch, "failed to write the pause between chunks");
+                    }
+                    continue;
+                }
                 if (!decode_and_stream_chunk(
                         codec, decoder, true_stateful ? &ch.stream_state : nullptr, graph,
                         work.item.frames, threads, *ch.outputs, ch.audio_pp, ch.metrics,
                         ch.run_label, work.item.chunk_index, work.item.history_frames,
-                        work.item.final_read, verbose)) {
+                        work.item.final_read, verbose, &ch.trailing_quiet_samples)) {
                     if (ch.metrics && ch.metrics->cancelled) {
                         // The caller stopped reading mid-chunk. Retire the
                         // stream quietly -- there is nobody left to give it to.
@@ -1923,6 +1994,10 @@ struct codec_stream_worker {
                     } else {
                         set_failed(ch, "decode or audio output failed");
                     }
+                    continue;
+                }
+                if (work.item.gap_samples > 0 && !emit_gap(ch, work.item.gap_samples)) {
+                    set_failed(ch, "failed to write the pause between chunks");
                     continue;
                 }
                 ++ch.chunks_done;
@@ -1985,7 +2060,7 @@ struct codec_sink {
     double buffered_seconds() const {
         return channel && channel->outputs ? channel->outputs->queued_seconds() : 0.0;
     }
-    std::vector<int32_t> silence_frame() const { return worker->silence_frame(); }
+    bool write_gap(int samples) { return worker->write_gap(*channel, samples); }
     void finish_tokens() { worker->finish_tokens(*channel); }
     bool wait() { return worker->wait_channel(*channel); }
     void cancel() {
@@ -2049,10 +2124,10 @@ struct WaveSession {
     MagpiePinnedHostScratch& text_context_staging;
     int& frames_generated;
     int& decoder_frames_generated;
-    // The pause between this request's chunks, in codec frames. Fixed, not
-    // drawn: NeMo's servers put a constant gap between utterances, and a random
-    // one only makes the seam harder to reason about.
-    int boundary_silence_frames;
+    // The pause between this request's chunks, in samples. Fixed, not drawn:
+    // NeMo's servers put a constant gap between utterances, and a random one
+    // only makes the seam harder to reason about.
+    int boundary_gap_samples;
 
     // Owned.
     std::vector<size_t> chunk_ids;
@@ -2277,12 +2352,8 @@ struct WaveSession {
                     stderr, "%s wave flush chunk %zu: %zu frames pending (suppressed %d)\n", label,
                     item.chunk_index, item.frames.size(), item.chunk.suppressed_nonfinal_frames);
             }
-            if (!discard_audio && !last_chunk) {
-                const int silence_frames = boundary_silence_frames;
-                const std::vector<int32_t> silence = sink.silence_frame();
-                for (int i = 0; i < silence_frames; ++i) {
-                    item.frames.push_back(silence);
-                }
+            if (!discard_audio && !last_chunk && !sink.write_gap(boundary_gap_samples)) {
+                return false;
             }
             item.boundary_queued = true;
         }
@@ -3355,8 +3426,8 @@ stream_magpie_to_audio(
     // magpie_serve's chunk_gap: a fixed pause between utterances. Each chunk is
     // cut at the frame where it ended and carries almost no trailing silence of
     // its own, so this is what puts the breath back.
-    const int boundary_silence_frames = std::max(
-        0, (int)std::lround((double)params.chunk_gap_ms / 1000.0 * codec_fps));
+    const int boundary_gap_samples = std::max(
+        0, (int)std::lround((double)params.chunk_gap_ms / 1000.0 * (double)codec.sampleRate()));
     const int window_samples = (int)((int64_t)codec.sampleRate() * params.window_ms / 1000);
     const char* label = run_label ? run_label : "stream";
     const char* logit_dump_path = std::getenv("MAGPIETTS_LOGIT_DUMP");
@@ -3639,7 +3710,7 @@ stream_magpie_to_audio(
                     magpie, workspace.encoder, h, params, token_chunks, label,
                     *session_metrics.back(), code_writer, codec_sink{}, *session_staging.back(),
                     session_frames[(size_t)i], session_frames[(size_t)i],
-                    boundary_silence_frames}));
+                    boundary_gap_samples}));
                 sessions.back()->discard_audio = true;
                 sessions.back()->request_context =
                     request_prefix.computed() ? &request_prefix : nullptr;
@@ -3787,7 +3858,7 @@ stream_magpie_to_audio(
                                 text_context_staging,
                                 frames_generated,
                                 decoder_frames_generated,
-                                boundary_silence_frames};
+                                boundary_gap_samples};
             session.request_context = request_prefix.computed() ? &request_prefix : nullptr;
             if (!session.plan_chunks()) {
                 return end_run();
@@ -4147,22 +4218,13 @@ stream_magpie_to_audio(
             }
 
             if (longform_active && !final_text_chunk) {
-
-                const std::vector<int32_t> silence = codec_out.silence_frame();
-                for (int i = 0; i < boundary_silence_frames; ++i) {
-                    if (!code_writer.write_frame(silence)) {
-                        fprintf(stderr, "failed to write streamed silence codec frame\n");
-                        return end_run();
-                    }
-                    ++frames_generated;
-                    if (!codec_out.write_frame(silence)) {
-                        return end_run();
-                    }
+                if (!codec_out.write_gap(boundary_gap_samples)) {
+                    return end_run();
                 }
                 if (params.verbose) {
                     fprintf(
-                        stderr, "%s inserted %d silence codec frames after text chunk %zu/%zu\n",
-                        label, boundary_silence_frames, chunk_index + 1, token_chunks.size());
+                        stderr, "%s inserted a %d-sample pause after text chunk %zu/%zu\n", label,
+                        boundary_gap_samples, chunk_index + 1, token_chunks.size());
                 }
             }
 
