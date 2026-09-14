@@ -823,6 +823,9 @@ magpietts_model_load_impl(
     h.start_prior_after_n_audio_steps = gguf_i32(
         model.gguf, "magpietts.inference.start_prior_after_n_audio_steps",
         h.start_prior_after_n_audio_steps);
+    h.forceful_chunk_end_threshold = gguf_i32(
+        model.gguf, "magpietts.inference.forceful_chunk_end_threshold",
+        h.forceful_chunk_end_threshold);
     h.attention_prior_advance_threshold = gguf_i32(
         model.gguf, "magpietts.inference.attention_prior_advance_threshold",
         h.attention_prior_advance_threshold);

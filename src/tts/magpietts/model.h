@@ -122,6 +122,11 @@ struct magpietts_hparams {
     float attention_prior_epsilon = 0.1f;
     int32_t attention_prior_lookahead_window = 5;
     int32_t start_prior_after_n_audio_steps = 0;
+    // Steps a chunk may keep speaking after attention has reached its last text
+    // token. NeMo's ChunkedInferenceConfig default is 1, which ends the chunk on
+    // that very step and cuts the final phoneme mid-sound; its own servers raise
+    // it. Only multi-chunk runs have a chunk to end early.
+    int32_t forceful_chunk_end_threshold = 1;
     int32_t attention_prior_advance_threshold = 8;
     int32_t attention_prior_decay_threshold = 10;
     std::vector<int32_t> estimate_alignment_from_layers;

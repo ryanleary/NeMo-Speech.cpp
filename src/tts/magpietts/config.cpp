@@ -172,6 +172,9 @@ register_runtime_config(common::ParameterParser& p, MagpieRuntimeConfig& c) {
     p.Register(
         "admission-window-max-ms", &c.admission_window_max_ms,
         "Cap on extending that wait while requests are still arriving");
+    p.Register(
+        "chunk-gap-ms", &c.chunk_gap_ms,
+        "Pause inserted between long-form chunks, in milliseconds");
     p.Register("codec-queue-depth", &c.codec_queue_depth, "Codec worker queue depth");
     p.Register("codec-history-frames", &c.codec_history_frames, "Rolling codec history frames");
     p.Register("codec-future-frames", &c.codec_future_frames, "Rolling codec future frames");
@@ -301,6 +304,9 @@ register_stream_params(common::ParameterParser& p, magpie_stream_params& c) {
     p.Register(
         "admission-window-max-ms", &c.admission_window_max_ms,
         "Cap on extending that wait while requests are still arriving");
+    p.Register(
+        "chunk-gap-ms", &c.chunk_gap_ms,
+        "Pause inserted between long-form chunks, in milliseconds");
     p.Register("codec-queue-depth", &c.codec_queue_depth, "Codec worker queue depth");
     p.Register("codec-history-frames", &c.codec_history_frames, "Rolling codec history frames");
     p.Register("codec-future-frames", &c.codec_future_frames, "Rolling codec future frames");

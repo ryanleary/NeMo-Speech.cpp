@@ -413,6 +413,11 @@ def add_metadata(
     )
     add_i32(
         writer,
+        "magpietts.inference.forceful_chunk_end_threshold",
+        inf.get("forceful_chunk_end_threshold", 1),
+    )
+    add_i32(
+        writer,
         "magpietts.inference.attention_prior_advance_threshold",
         inf.get("attention_prior_advance_threshold", 8),
     )

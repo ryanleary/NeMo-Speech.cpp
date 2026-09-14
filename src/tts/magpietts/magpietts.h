@@ -90,6 +90,10 @@ struct magpie_stream_params {
     int delivery_buffer_ms = 5000;
     int admission_window_ms = 2;
     int admission_window_max_ms = 20;
+    // Pause inserted between long-form chunks. A chunk is cut at the frame where
+    // it ended and carries almost no trailing silence of its own, so without
+    // this the sentences run into each other. 0 joins them seamlessly.
+    int chunk_gap_ms = 200;
     int codec_queue_depth = 4;
     int codec_history_frames = -1;
     int codec_future_frames = 1;

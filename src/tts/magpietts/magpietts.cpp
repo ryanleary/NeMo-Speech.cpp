@@ -121,6 +121,15 @@ struct MagpieChunkDecodeState {
     int near_end_frames = 0;
     bool suppress_nonfinal_codec_output = false;
     int suppressed_nonfinal_frames = 0;
+    // Steps taken since attention reached the end of this chunk's text. The
+    // chunk is held open for forceful_chunk_end_threshold of them so its last
+    // phoneme finishes rather than being cut where the attention landed.
+    int steps_past_chunk_end = 0;
+    // Steps of audio still owed after a non-final EOS. EOS fires on any of the
+    // emitted codebooks, so it can land a frame or two before the sound it ends
+    // has actually decayed; cutting there chops the last phoneme. Counted down
+    // before suppression starts.
+    int eos_tail_steps = 0;
 };
 
 // What one decoder step did to one chunk.
@@ -170,7 +179,9 @@ advance_chunk_state(
                 chunk.near_end_frames >= 1 &&
                 chunk.chunk_frames_generated >= h.min_generated_frames) {
                 if (reached_chunk_end) {
-                    end_chunk_after_frame = true;
+                    ++chunk.steps_past_chunk_end;
+                    end_chunk_after_frame =
+                        chunk.steps_past_chunk_end >= std::max(1, h.forceful_chunk_end_threshold);
                 } else {
                     start_suppressing_after_frame = true;
                 }
@@ -197,14 +208,15 @@ advance_chunk_state(
         if (final_chunk || reached_chunk_end || !can_catch_up_nonfinal) {
             out.stop = true;
         }
-        if (!chunk.suppress_nonfinal_codec_output) {
-            chunk.suppress_nonfinal_codec_output = true;
+        if (!chunk.suppress_nonfinal_codec_output && chunk.eos_tail_steps == 0) {
+            chunk.eos_tail_steps = std::max(1, h.forceful_chunk_end_threshold);
             if (params.verbose) {
                 fprintf(
                     stderr,
-                    "%s suppressing codec output for text chunk %zu/%zu after non-final EOS "
-                    "until attention reaches chunk end (relative=%d text_len=%d)\n",
-                    label, chunk_index + 1, chunk_count, prior.lastAttendedRelative(), text_len);
+                    "%s codec output for text chunk %zu/%zu ends %d step(s) after non-final EOS, "
+                    "then waits for attention to reach chunk end (relative=%d text_len=%d)\n",
+                    label, chunk_index + 1, chunk_count, chunk.eos_tail_steps,
+                    prior.lastAttendedRelative(), text_len);
             }
         }
     }
@@ -224,6 +236,11 @@ advance_chunk_state(
         chunk.chunk_frames_generated += frames_to_emit;
     } else {
         chunk.suppressed_nonfinal_frames += frames_to_emit;
+    }
+    if (chunk.eos_tail_steps > 0 && !chunk.suppress_nonfinal_codec_output) {
+        if (--chunk.eos_tail_steps == 0) {
+            start_suppressing_after_frame = true;
+        }
     }
     if (start_suppressing_after_frame) {
         chunk.suppress_nonfinal_codec_output = true;
@@ -2032,8 +2049,10 @@ struct WaveSession {
     MagpiePinnedHostScratch& text_context_staging;
     int& frames_generated;
     int& decoder_frames_generated;
-    std::mt19937& boundary_silence_rng;
-    std::uniform_int_distribution<int>& boundary_silence_dist;
+    // The pause between this request's chunks, in codec frames. Fixed, not
+    // drawn: NeMo's servers put a constant gap between utterances, and a random
+    // one only makes the seam harder to reason about.
+    int boundary_silence_frames;
 
     // Owned.
     std::vector<size_t> chunk_ids;
@@ -2259,7 +2278,7 @@ struct WaveSession {
                     item.chunk_index, item.frames.size(), item.chunk.suppressed_nonfinal_frames);
             }
             if (!discard_audio && !last_chunk) {
-                const int silence_frames = boundary_silence_dist(boundary_silence_rng);
+                const int silence_frames = boundary_silence_frames;
                 const std::vector<int32_t> silence = sink.silence_frame();
                 for (int i = 0; i < silence_frames; ++i) {
                     item.frames.push_back(silence);
@@ -3308,8 +3327,6 @@ stream_magpie_to_audio(
     }
 
     std::mt19937 rng((uint32_t)params.seed);
-    std::mt19937 boundary_silence_rng((uint32_t)params.seed ^ 0x9E3779B9u);
-    std::uniform_int_distribution<int> boundary_silence_dist(6, 10);
     bool use_cuda_lt = false;
     if (params.use_local_transformer &&
         !magpietts_resolve_lt_backend(magpie, params.lt_backend, use_cuda_lt)) {
@@ -3335,6 +3352,11 @@ stream_magpie_to_audio(
     const double codec_fps = codec.samplesPerFrame() > 0
                                  ? (double)codec.sampleRate() / (double)codec.samplesPerFrame()
                                  : 0.0;
+    // magpie_serve's chunk_gap: a fixed pause between utterances. Each chunk is
+    // cut at the frame where it ended and carries almost no trailing silence of
+    // its own, so this is what puts the breath back.
+    const int boundary_silence_frames = std::max(
+        0, (int)std::lround((double)params.chunk_gap_ms / 1000.0 * codec_fps));
     const int window_samples = (int)((int64_t)codec.sampleRate() * params.window_ms / 1000);
     const char* label = run_label ? run_label : "stream";
     const char* logit_dump_path = std::getenv("MAGPIETTS_LOGIT_DUMP");
@@ -3616,8 +3638,8 @@ stream_magpie_to_audio(
                 sessions.push_back(std::unique_ptr<WaveSession>(new WaveSession{
                     magpie, workspace.encoder, h, params, token_chunks, label,
                     *session_metrics.back(), code_writer, codec_sink{}, *session_staging.back(),
-                    session_frames[(size_t)i], session_frames[(size_t)i], boundary_silence_rng,
-                    boundary_silence_dist}));
+                    session_frames[(size_t)i], session_frames[(size_t)i],
+                    boundary_silence_frames}));
                 sessions.back()->discard_audio = true;
                 sessions.back()->request_context =
                     request_prefix.computed() ? &request_prefix : nullptr;
@@ -3765,8 +3787,7 @@ stream_magpie_to_audio(
                                 text_context_staging,
                                 frames_generated,
                                 decoder_frames_generated,
-                                boundary_silence_rng,
-                                boundary_silence_dist};
+                                boundary_silence_frames};
             session.request_context = request_prefix.computed() ? &request_prefix : nullptr;
             if (!session.plan_chunks()) {
                 return end_run();
@@ -4126,7 +4147,7 @@ stream_magpie_to_audio(
             }
 
             if (longform_active && !final_text_chunk) {
-                const int boundary_silence_frames = boundary_silence_dist(boundary_silence_rng);
+
                 const std::vector<int32_t> silence = codec_out.silence_frame();
                 for (int i = 0; i < boundary_silence_frames; ++i) {
                     if (!code_writer.write_frame(silence)) {

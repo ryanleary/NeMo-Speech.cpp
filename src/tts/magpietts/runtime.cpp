@@ -186,6 +186,7 @@ class MagpieTtsRuntime::Impl {
         params.delivery_buffer_ms = config_.delivery_buffer_ms;
         params.admission_window_ms = config_.admission_window_ms;
         params.admission_window_max_ms = config_.admission_window_max_ms;
+        params.chunk_gap_ms = config_.chunk_gap_ms;
         params.codec_queue_depth = config_.codec_queue_depth;
         params.codec_history_frames = config_.codec_history_frames;
         params.codec_future_frames = config_.codec_future_frames;
