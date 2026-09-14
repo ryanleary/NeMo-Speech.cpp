@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import Any
 
 TOKENIZER_ORDERS = {
@@ -126,6 +128,32 @@ V2607_LANGUAGE_MAPPING = {
 
 
 def tokenizer_profile(cfg: dict[str, Any], text_vocab: int, frame_stacking: int) -> str:
+    # Escape hatch for one-off checkpoints. The checks below exist because a
+    # tokenizer layout that differs from the profile the runtime assumes shifts
+    # token offsets and produces confidently wrong phonemes rather than an
+    # error, so they are not relaxed. But an early-release checkpoint can differ
+    # in a field whose scope the operator knows -- pre-release zero-shot weights
+    # omit the pt-BR locale_specific_punct override, which moves nothing outside
+    # Portuguese -- and forcing a profile is how to say so out loud.
+    forced = os.environ.get("NEMO_SPEECH_TOKENIZER_PROFILE")
+    if forced:
+        if forced not in TOKENIZER_PROFILE_DIMENSIONS:
+            raise ValueError(
+                f"unknown forced tokenizer profile {forced!r}; "
+                f"expected one of {sorted(TOKENIZER_PROFILE_DIMENSIONS)}"
+            )
+        expected_vocab, expected_stacking = TOKENIZER_PROFILE_DIMENSIONS[forced]
+        if (text_vocab, frame_stacking) != (expected_vocab, expected_stacking):
+            raise ValueError(
+                f"forced tokenizer profile {forced} requires text_vocab_size={expected_vocab} "
+                f"and frame_stacking_factor={expected_stacking}, but this checkpoint has "
+                f"{text_vocab} and {frame_stacking}"
+            )
+        print(
+            f"warning: forcing tokenizer profile {forced}; its layout was not verified",
+            file=sys.stderr,
+        )
+        return forced
     tokenizers = cfg.get("text_tokenizers")
     if not isinstance(tokenizers, dict):
         raise ValueError("Magpie config has no text_tokenizers mapping")
