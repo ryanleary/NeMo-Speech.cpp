@@ -175,3 +175,50 @@ survives decoding. An earlier reading of the same numbers concluded the opposite
 that the context encoder was at fault, because the two routes were measured
 either side of the padding fix rather than together. Measure both arms after
 every change, or the comparison says nothing.
+
+## Running a zero-shot checkpoint from text
+
+The runtime needs a tokenizer directory matching the checkpoint's profile. One
+for the pre-release zero-shot weights is built at `~/nemo-bench-assets/tokenizer-v2607`
+from `magpie_tts_weights/config_v3_nostress_fixed.local.yaml` plus
+`assets/tts_dataset_files/`. Six things it has to get right:
+
+1. Asset paths rewritten to `nemo:<basename>`, the files copied in beside the config
+2. `language_to_tokenizer_mapping` added -- the checkpoint omits it, NeMo defaults it
+3. ...written list-valued, `en: [english_phoneme]`, which the parser requires
+4. Block-style YAML; flow style silently collapses 8 of the 15 tokenizers
+5. Three `charset_version: 1` fields the checkpoint omits
+6. Hindi's two-entry `phoneme_dict` list collapsed to a scalar
+
+Two deviations are recorded in `LIMITATIONS.txt` beside it, neither reachable by
+English: pt-BR `locale_specific_punct` pinned false, and Hindi losing its
+cmudict fallback. Only fields the checkpoint *omits* were filled; none it sets
+were overridden.
+
+Embedding the tokenizer in the GGUF, as the ASR models do, would remove this
+whole directory and the mismatch class with it.
+
+## Batching zero-shot: attempted, reverted
+
+Per-item conditioning was plumbed end to end -- `MagpieWavePrefillItem::context`,
+a `[n_embd, len, items]` conditioning block built from each lane's prefix
+instead of the baked table's row lookup, `WaveSession::context_prefix()`, and
+`context_len_` carried on the runtime so the ring arithmetic uses the real
+length. Two further gaps surfaced and were fixed: this checkpoint has
+`apply_attention_prior = false`, so both the wave prefill and the wave step fed
+a prior tensor the graph never built.
+
+It still failed before the first decode step, and informatively: by the time
+`MagpieDecoder::evalWave` runs, `wave_runtime_` is already null, so the first
+failure is upstream of the step -- most likely `sample()`, since this checkpoint
+stacks 2 frames and emits 16 codebooks where every wave measured so far emitted
+8.
+
+The work was reverted rather than committed: it moved the **sequential** baked
+hashes (`0afc4e3a...` to `60ec3ca8...`), so something in it changes the
+non-wave path too. That regression is the thing to find first when picking this
+up -- the wave hashes were unaffected, so it is narrow.
+
+Until then zero-shot falls back to sequential decode, which on the 12.5 h book
+is roughly 5x slower than the wave: the fallback is a real cost, not a
+formality.

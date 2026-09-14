@@ -339,8 +339,39 @@ command_synthesize(int argc, char** argv) {
             // vocabulary generally differs from the packaged tokenizer's, so
             // this is how to drive one whose assets are not in .nemo form, and
             // how to compare token-for-token against a reference implementation.
-            result = synthesizer->synthesize_tokens(
-                read_token_ids(tokens_path), request_options, output_rate, append);
+            //
+            // One line per chunk. A single line is one utterance; several lines
+            // are long-form chunks, which is the only way to drive a book
+            // through a checkpoint whose tokenizer we cannot load.
+            std::vector<std::vector<int32_t>> chunks;
+            {
+                std::ifstream in(tokens_path);
+                if (!in)
+                    throw std::runtime_error("failed to open token file: " + tokens_path);
+                std::string line;
+                while (std::getline(in, line)) {
+                    std::istringstream fields(line);
+                    std::vector<int32_t> chunk;
+                    long value = 0;
+                    while (fields >> value)
+                        chunk.push_back((int32_t)value);
+                    if (!chunk.empty())
+                        chunks.push_back(std::move(chunk));
+                }
+            }
+            if (chunks.empty())
+                throw std::runtime_error("token file contained no tokens: " + tokens_path);
+            nemo_speech::tts::PreparedSynthesis prepared;
+            prepared.options = request_options;
+            prepared.metadata.sample_rate =
+                output_rate ? output_rate : synthesizer->sample_rate();
+            prepared.metadata.speaker = request_options.speaker >= 0 ? request_options.speaker : 0;
+            prepared.token_chunks = std::move(chunks);
+            for (const auto& c : prepared.token_chunks)
+                prepared.tokens.insert(prepared.tokens.end(), c.begin(), c.end());
+            prepared.metadata.token_count = prepared.tokens.size();
+            prepared.metadata.chunk_count = prepared.token_chunks.size();
+            result = synthesizer->synthesize(prepared, append);
         } else if (concurrency > 1) {
             // Fire the same request from N threads at one synthesizer. What it
             // measures is whether they share the wave: aggregate realtime
