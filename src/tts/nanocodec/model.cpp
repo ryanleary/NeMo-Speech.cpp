@@ -1036,10 +1036,21 @@ encode_eval(
         return false;
     }
 
-    // AudioCodecModel.encode_audio zero-pads so the last frame is full; without
-    // this the encoder drops the trailing partial frame.
-    const int n_frames_expected =
-        ((int)audio.size() + h.samples_per_frame - 1) / h.samples_per_frame;
+    // NeMo carries the encoded length alongside the tensor and narrows it at
+    // every stage: `encoded_len = encoded_len // down_sample_rate`. That cascade
+    // of integer divisions is not the same as one division by samples_per_frame,
+    // and it is what decides how many frames survive. Rounding up instead keeps
+    // a trailing frame built from padding that NeMo never emits -- 216 against
+    // its 215 for a 10 s reference.
+    int n_frames_expected = (int)audio.size();
+    for (const int rate : h.down_rates) {
+        n_frames_expected /= rate > 0 ? rate : 1;
+    }
+    if (n_frames_expected < 1) {
+        fprintf(
+            stderr, "audio is shorter than one codec frame (%zu samples)\n", audio.size());
+        return false;
+    }
     std::vector<float> padded_audio(audio);
     padded_audio.resize((size_t)n_frames_expected * (size_t)h.samples_per_frame, 0.0f);
     const int n_samples = (int)padded_audio.size();
