@@ -1,0 +1,99 @@
+# Porting zero-shot voice cloning onto the serving branch
+
+Standalone by convention: zero-shot support stays in its own commits, and the
+general development notes do not link here. Nothing in
+`docs/development/README.md` should point at this file.
+
+Status: analysed, not started. `perf/continuous-batching` is unchanged.
+
+## What to port
+
+Two commits on `tts/zero-shot-cloning`, which branched from `4f96762` and has
+since diverged by ~104 commits:
+
+| commit | |
+|---|---|
+| `61c8ddb` | `feat(tts): support zero-shot MagpieTTS checkpoints` — the conditioning path, 28 files, +2053/-165 |
+| `bf3126c` | `feat(tts): clone a voice from a reference WAV` — the codec encoder wired in, 9 files, +193/-47 |
+
+The other ~100 commits on that branch are general perf and docs work and are
+**not** wanted here.
+
+## What is already present
+
+Frame stacking landed on this branch separately:
+`stacked_audio_codebooks()`, `magpietts_frames_to_emit`, and
+`tests/cpp/tts/test_magpietts_frame_stacking.cpp` all exist.
+
+Missing: `context.cpp` / `context.h`, `emit_codebooks`, `context_prefix`,
+`context_duration_max`, `has_context_encoder`, and the conversion changes.
+
+## What the merge actually costs
+
+`git cherry-pick -n 61c8ddb` gives 18 files clean and 10 conflicted, 53 markers.
+The taxonomy matters more than the count:
+
+- **~46 markers are one mechanical rename.** Their `h.emit_codebooks` against
+  our `h.stacked_audio_codebooks()`. Both mean codebooks x stacking; theirs is
+  read from the weights and is authoritative for a zero-shot checkpoint, ours is
+  computed. Take theirs, and make the loader fall back to
+  `audio_codebooks * frame_stacking_factor` when the GGUF lacks the key, so
+  existing GGUFs keep working. A script that normalises the two spellings and
+  takes theirs where that is the only difference resolves 18 of the 24 in
+  `decoder.cpp` unattended.
+- **4 markers are the real integration**, and they are exactly where the
+  voice-cloning notes said they would be: our `h.baked_context_length` against
+  their `context_prefix_length(h, prefix)` plus a `context_prefix_valid` guard.
+  Keep our `audio_len` (ours is post-stacking, theirs is not) and take their
+  prefix call.
+- **1 marker** is a forward declaration against a signature change; keep both.
+
+## The part that is not a cherry-pick
+
+`61c8ddb` touches **zero** wave entry points — `git show 61c8ddb --
+src/tts/magpietts/decoder.cpp | grep -c 'prefillWave\|evalWave'` is 0. Its
+design puts the context prefix on `MagpieDecoder` because it "is constant for a
+request".
+
+That is false on this branch. Lanes carry chunks from unrelated requests, so two
+sessions can want different reference voices in the same wave, and a
+decoder-wide prefix would give one of them the other's voice. The prefix has to
+become per-item, threaded through `prefillWave` the way `speaker` already is.
+
+The seam exists and is one line: `magpietts.cpp` sets `slot.speaker =
+owner.speaker()` per admission, next to `WaveSession::speaker()`. A context
+prefix goes beside it as `owner.context_prefix()`, with the cross-attention
+arena machinery already proving that per-item conditioning slices work.
+
+Without this, zero-shot runs only on the sequential path — which is to say, not
+with batching, which is the whole of this branch.
+
+## Assets for verification
+
+All present on this machine, under `~/devel/magpie-tts-server`:
+
+- `magpie_tts_weights/Magpie-TTS--val_cer_gt=0.3605-step=1200.ckpt` — the
+  zero-shot checkpoint
+- `magpie_tts_weights/21fps_causal_codecmodel.nemo` — convert with
+  `--with-codec-encoder`; the codec GGUF in the model cache is decoder-only and
+  cannot clone from a WAV
+- `magpie_tts_weights/config_v3_nostress_fixed.local.yaml` — the sidecar config
+  `61c8ddb` takes via `--config-yaml`
+- `voices/` — reference audio
+- a working Python implementation to compare against
+
+Note the tokenizer warning in `notes/voice-cloning-status.md` on the source
+branch: `--tokenizer-dir` must hold **this checkpoint's** dictionaries, which
+share filenames with the public checkpoint's but differ in content.
+
+## Verification
+
+- Baked path unchanged: the six wave hashes and three sequential hashes, which
+  is what proves the `emit_codebooks` rename did not move any arithmetic.
+- Zero-shot prefix against the reference: `scripts/tts/compare-context-prefix.py`
+  on the source branch checks the conditioning prefix built from natively
+  encoded audio against the Python implementation's, and reports cosine. The
+  original port recorded 0.99969.
+- Per-session voices: two concurrent requests with different reference WAVs in
+  one wave, each matching its own solo run. This is the case the original
+  commits never had to consider and the one most likely to be wrong.
