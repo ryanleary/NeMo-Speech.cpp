@@ -26,6 +26,7 @@
 #include <utility>
 
 #include "audio_pp.h"
+#include "audio_file.h"
 #include "context.h"
 #include "decoder.h"
 #include "encoder.h"
@@ -1167,6 +1168,82 @@ load_code_frames(
             return false;
         }
         frames.push_back(std::move(frame));
+    }
+    return true;
+}
+
+// Encode reference audio to codec codes on-device, the alternative to being
+// handed codes directly.
+//
+// The wav must already be at the codec's sample rate: resampling here would not
+// match the reference implementation's, and the codes would silently differ.
+static bool
+load_context_audio_frames(
+    const std::string& path, const nc::NanoCodecModel& codec, const magpietts_hparams& h,
+    int threads, bool verbose, std::vector<std::vector<int32_t>>& frames_out) {
+    frames_out.clear();
+    if (!codec.hasEncoder()) {
+        fprintf(
+            stderr,
+            "--context-audio needs a NanoCodec GGUF with an audio encoder; reconvert the codec "
+            "with --with-codec-encoder, or pass --context-codes instead\n");
+        return false;
+    }
+
+    nemo_speech::audio::AudioFile audio;
+    try {
+        audio = nemo_speech::audio::load_wav_file(path);
+    }
+    catch (const std::exception& error) {
+        fprintf(stderr, "failed to read reference audio: %s\n", error.what());
+        return false;
+    }
+    if (audio.sample_rate != codec.sampleRate()) {
+        fprintf(
+            stderr,
+            "reference audio is %d Hz but the codec expects %d Hz; resample it first\n",
+            audio.sample_rate, codec.sampleRate());
+        return false;
+    }
+
+    // The model was trained on a fixed-duration context window, so anything
+    // past it is not just wasted work - the conditioning prefix has no room
+    // for it. Take the leading window, which keeps the result deterministic.
+    if (h.ctx_enc_max_duration_s > 0.0f) {
+        const size_t limit =
+            (size_t)((double)h.ctx_enc_max_duration_s * (double)audio.sample_rate);
+        if (audio.samples.size() > limit) {
+            audio.samples.resize(limit);
+        }
+    }
+
+    nc::NanoCodecFrames frames;
+    nc::NanoCodecEncoder encoder(codec);
+    if (!encoder.encode(audio.samples, threads, frames)) {
+        return false;
+    }
+    frames_out.reserve(frames.size());
+    for (const auto& frame : frames) {
+        frames_out.emplace_back(frame.begin(), frame.begin() + h.audio_codebooks);
+    }
+    if (verbose) {
+        fprintf(
+            stderr, "encoded %.2fs of reference audio to %zu codec frames\n",
+            (double)audio.samples.size() / (double)audio.sample_rate, frames_out.size());
+    }
+    // Debug hook for encoder parity against the reference implementation.
+    if (const char* dump = std::getenv("MAGPIETTS_CONTEXT_CODES_DUMP")) {
+        if (dump[0]) {
+            if (FILE* fh = fopen(dump, "w")) {
+                for (const auto& frame : frames_out) {
+                    for (size_t c = 0; c < frame.size(); ++c) {
+                        fprintf(fh, c ? " %d" : "%d", frame[c]);
+                    }
+                    fputc('\n', fh);
+                }
+                fclose(fh);
+            }
+        }
     }
     return true;
 }
@@ -3393,19 +3470,26 @@ stream_magpie_to_audio(
     std::vector<float> context_prefix;
     decoder.clearContextPrefix();
     if (h.conditioning == MAGPIETTS_CONDITIONING_CONTEXT_ENCODER) {
-        if (params.context_codes_file.empty()) {
+        if (params.context_audio_file.empty() && params.context_codes_file.empty()) {
             fprintf(
                 stderr,
-                "this checkpoint clones a voice from reference audio; pass --context-codes\n");
+                "this checkpoint clones a voice from reference audio; pass --context-audio "
+                "(or --context-codes)\n");
             return false;
         }
         std::vector<std::vector<int32_t>> context_frames;
-        if (!load_code_frames(
-                params.context_codes_file.c_str(), h.audio_codebooks, context_frames)) {
+        if (!params.context_audio_file.empty()) {
+            if (!load_context_audio_frames(
+                    params.context_audio_file, codec, h, params.threads, params.verbose,
+                    context_frames)) {
+                return false;
+            }
+        } else if (!load_code_frames(
+                       params.context_codes_file.c_str(), h.audio_codebooks, context_frames)) {
             return false;
         }
         if (context_frames.empty()) {
-            fprintf(stderr, "context code file is empty: %s\n", params.context_codes_file.c_str());
+            fprintf(stderr, "reference audio produced no codec frames\n");
             return false;
         }
         std::vector<std::vector<int32_t>> context_codes(

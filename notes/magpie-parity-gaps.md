@@ -26,8 +26,8 @@ Our stack:
 | # | Gap | Severity | Status |
 |---|---|---|---|
 | 1 | Zero-shot context encoder unimplemented | **Blocker** | **Closed** |
-| 2 | NanoCodec *encoder* never converted | **Blocker** | Open — deferred to phase 3 |
-| 3 | No reference-audio input surface | **Blocker** | **Closed** (codes; wav needs 2) |
+| 2 | NanoCodec *encoder* never converted | **Blocker** | **Closed** |
+| 3 | No reference-audio input surface | **Blocker** | **Closed** (`--context-audio`) |
 | 4 | `frame_stacking_factor: 2` rejected | Blocker **+ ~2x perf** | **Closed** |
 | 5 | `local_transformer_in_projection` assumed present | Blocker | **Closed** |
 | 6 | Converter guards on `has_baked_context_embedding` | Cosmetic once 1–5 land | **Closed** |
@@ -36,15 +36,18 @@ Our stack:
 | 9 | Decoder stack not graph-replayed; 116 GPU syncs per step | perf, not a blocker | Open |
 | 10 | Non-causal conv was causally padded | **Was a silent correctness bug** | **Closed** |
 | 11 | Context sequence not padded to the fixed config length | **Was a silent correctness bug** | **Closed** |
-| 12 | This checkpoint's tokenizer is not packaged (vocab 3359 vs 2362), and `eos_id` is hard-coded to the public model's 2361 | Workaround: `--tokens-file` | Open |
+| 12 | `eos_id` hard-coded to the public model's 2361 | Was a silent correctness bug | **Closed** |
+| 13 | Non-English tokenizer offsets are per-checkpoint | Limitation, English unaffected | Open |
 | — | Codec decoder conversion | — | **Works today** |
 
-**Our checkpoint now works**: it converts, loads, and synthesizes correct speech
-in a cloned voice from reference codes. The context prefix matches NeMo at
-cosine 0.99999863 and the first decoder step is bit-identical. What remains for
-full parity is gap 2 — encoding a wav to those codes natively instead of
-dumping them from Python once per voice — plus packaging this checkpoint's
-tokenizer. See [voice-cloning-status.md](voice-cloning-status.md).
+**Our checkpoint runs end to end with no Python in the loop**: plain text in,
+`--context-audio reference.wav` for the voice, correct speech out. See
+[voice-cloning-status.md](voice-cloning-status.md).
+
+The one remaining limitation is gap 13: the runtime's per-language token offsets
+are the public checkpoint's. English happens to agree (both put
+`english_phoneme` at offset 0), so English is exact; other languages would need
+the offsets to come from the checkpoint.
 
 Gaps 6 and 7 are one-line guards. Gaps 1–3 are the real work: they are the
 difference between "speaks in one of five stock voices" and "speaks in yours".

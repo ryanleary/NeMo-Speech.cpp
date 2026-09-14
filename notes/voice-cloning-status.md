@@ -3,26 +3,33 @@
 Implementation of [voice-cloning-plan.md](voice-cloning-plan.md), phases 0-2
 (1 and 2 merged, as the plan warned they would have to be).
 
-**Status: working.** Our checkpoint converts, loads, and synthesizes correct
-speech in a cloned voice from reference-audio codec codes.
+**Status: working, with no Python in the loop.** Plain text in,
+`--context-audio reference.wav` for the voice, correct speech out.
 
 ```bash
-# once per voice, from the magpie-tts-server checkout
-.venv/bin/python ~/devel/NeMo-Speech.cpp/scripts/tts/dump-magpie-reference.py \
-    voices/default.wav --out /tmp/ref
-
-# convert once
+# convert the token generator and a codec that includes the audio encoder
 python convert_model.py magpie_tts_weights/Magpie-TTS--val_cer_gt=0.3605-step=1200.ckpt \
     --config-yaml magpie_tts_weights/config_v3_nostress_fixed.local.yaml \
     --outfile magpie-zs.f16.gguf --outtype f16
+python convert_model.py magpie_tts_weights/21fps_causal_codecmodel.nemo \
+    --with-codec-encoder --outfile nanocodec.f16.gguf --outtype f16
 
 nemo-speech synthesize "Magpie is a text to speech model." \
     --magpie-model magpie-zs.f16.gguf \
-    --codec-model nemo_nano_codec_...decoder.f16.gguf \
-    --tokenizer-dir <extracted .nemo dir> \
-    --context-codes /tmp/ref/context-codes.txt \
+    --codec-model nanocodec.f16.gguf \
+    --tokenizer-dir <public magpie tokenizer dir> \
+    --context-audio reference.wav \
     --device cuda -o out.wav
 ```
+
+The reference WAV must be mono at the codec's sample rate (22050 Hz); the
+runtime refuses anything else rather than resampling, because a resampler that
+differs from the reference implementation's changes the codes silently. Only the
+leading `context_duration_max` seconds (10 s here) are used, which is the window
+the model was trained on.
+
+`--context-codes` still accepts codes directly, which is how the encoder itself
+is validated.
 
 ## Verification
 
@@ -68,6 +75,28 @@ structural check that matters.
 
 Neither f32 weights nor disabling the KV cache moves the divergence point, which
 rules out weight storage and the incremental-decode path as causes.
+
+### On the codec encoder
+
+Encoding the same 10 s reference natively and with NeMo gives the same 216
+frames and 98.84% identical codes; every one of the 20 differences is a single
+FSQ level step, the smallest possible. The resulting conditioning prefixes agree
+at cosine 0.99969.
+
+Two things had to match exactly to get there, and neither is guessable from the
+module definition:
+
+* **Audio is zero-padded so the last frame is full** before encoding
+  (`AudioCodecModel.encode_audio`). Without it the trailing partial frame is
+  dropped and the frame count is one short.
+* **Convolutions pad on both sides in `replicate` mode**, not zeros — the
+  decoder is causal and zero-padded, the encoder is neither.
+
+The residue is not weight precision: an f32 codec produces byte-identical codes
+to the f16 one, and switching the FSQ rounding from round-half-away to
+round-half-to-even (matching `torch.round`) does not move it either. It is
+near-ties in the convolution arithmetic landing either side of a rounding
+boundary. For a conditioning embedding that is immaterial.
 
 ## Reproducing the checks
 
@@ -135,17 +164,19 @@ gives a 109-row prefix whose content is also wrong, and produces fluent
 gibberish. `magpietts.context_encoder.max_duration_s` now carries the duration
 so the runtime can reproduce the length from the codec's frame rate.
 
-### 3. A missing text-EOS token, in my own tooling
+### 3. The text EOS was hard-coded to one checkpoint's vocabulary
 
-Not a runtime bug, but it produced a convincing symptom: `s3` came out as
-"...in C plus plus **plus**". The model appends a text EOS
-(`text_vocab_size - 1` = 3358, one of two embedding rows past the tokenizer's
-3357-token vocabulary) and my token dump omitted it, so the model was never told
-the text had ended and kept going. Adding it made all three test sentences
-transcribe exactly.
+Symptom: `s3` came out as "...in C plus plus **plus**". The model appends a text
+EOS at `text_vocab_size - 1` — 3358 for our checkpoint, one of two embedding
+rows past the tokenizer's 3357-token vocabulary. Without it the model is never
+told the text ended and keeps going.
 
-The lesson is the same as below: capture the tokens the working implementation
-actually feeds the model, rather than re-deriving them by calling the tokenizer.
+It surfaced first in my own token dump, but the runtime had the same bug more
+permanently: `tokenizer_impl.cpp` declared `int eos_id = 2361;` — the *public*
+checkpoint's last token — and never assigned it from anywhere. It is now derived
+from the loaded model's text embedding table, which is what made
+`--tokenizer-dir` work for our checkpoint and retired the `--tokens-file`
+workaround.
 
 ### How the oracle hid it
 
@@ -199,19 +230,16 @@ at the same RTF.
 ## Not done
 
 - **Correct audio from our checkpoint.** See [Where it stands](#where-it-stands).
-- **Gap 2, the native codec encoder** (plan phase 3). Context codes still come
-  from Python, once per voice. `--context-audio ref.wav` does not exist yet.
+- **Non-English tokenization for this checkpoint** (gap 13). The runtime's
+  per-language token offsets are the public checkpoint's. English agrees by
+  coincidence — both put `english_phoneme` at offset 0 — so English is exact,
+  but our checkpoint inserts `text_ce_tokenizer` at 96 and shifts every later
+  language. Fixing it means carrying the offsets in the GGUF.
+- **Reference audio must already be 22050 Hz mono.** Deliberate: see above.
 - **Full greedy parity beyond step 1.** The first decoder step matches
   bit-exactly; later steps drift on f16 argmax ties. Closing that would mean an
   f32 GGUF, and is only worth doing if a future bug needs the longer baseline.
-- **A packaged tokenizer for our checkpoint.** Its text vocab is 3359 against
-  the public tokenizer's 2362, so `--tokenizer-dir` from the public model gives
-  meaningless IDs. Worked around with `--tokens-file`. Two things are needed for
-  a real fix: this checkpoint's tokenizer assets in a `.nemo`-shaped directory,
-  **and** a non-hard-coded EOS - `tokenizer_impl.cpp:68` has
-  `int eos_id = 2361;` (the public checkpoint's last token) which is never
-  assigned from anywhere. It should be `text_vocab_size - 1`, which is 3358 for
-  ours.
+
 - **Performance** (gaps 8, 9) - untouched, deliberately, since phase 2 rewrote
   the hot loop.
 - `generate_magpietts_codes` in `model.cpp` is dead code (no callers) and was

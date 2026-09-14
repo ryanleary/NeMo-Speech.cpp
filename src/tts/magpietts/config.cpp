@@ -137,6 +137,9 @@ register_runtime_config(common::ParameterParser& p, MagpieRuntimeConfig& c) {
     p.Register(
         "context-codes", &c.context_codes_file,
         "Reference-audio codec codes for zero-shot voice cloning");
+    p.Register(
+        "context-audio", &c.context_audio_file,
+        "Reference WAV for zero-shot voice cloning (mono, codec sample rate)");
     p.Register("speaker", &c.speaker, "Default baked speaker index");
     p.Register("threads", &c.threads, "CPU threads for Magpie and codec", {"--threads"});
     p.Register("codec-threads", &c.codec_threads, "Codec CPU threads; 0 uses threads");
@@ -259,6 +262,9 @@ register_stream_params(common::ParameterParser& p, magpie_stream_params& c) {
     p.Register(
         "context-codes", &c.context_codes_file,
         "Reference-audio codec codes for zero-shot voice cloning");
+    p.Register(
+        "context-audio", &c.context_audio_file,
+        "Reference WAV for zero-shot voice cloning (mono, codec sample rate)");
     p.Register("tokenizer-model-dir", &c.tokenizer_model_dir, "Extracted Magpie .nemo directory");
     p.Register("tn-model-dir", &c.tn_model_dir, "Sparrowhawk TTS TN grammar dir");
     p.Register("tokenizer", c.tokenizer_config);

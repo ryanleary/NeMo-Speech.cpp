@@ -46,6 +46,9 @@ struct magpie_stream_params {
     // integers each. Required by context-encoder checkpoints, ignored by baked
     // ones.
     std::string context_codes_file;
+    // Reference audio for zero-shot cloning, as an alternative to supplying
+    // codes directly. Mono WAV at the codec's sample rate.
+    std::string context_audio_file;
     std::string tokenizer_model_dir;
     std::string tn_model_dir;
     MagpieTokenizerConfig tokenizer_config;
@@ -247,9 +250,11 @@ class MagpieStreamingRuntime {
         magpietts_uma_mode uma_mode, bool magpie_cpu, bool codec_cpu, bool verbose = false);
     int sampleRate() const;
     int speakerCount() const;
+    // Size of the model's text embedding table. The tokenizer needs it to place
+    // the text EOS, which sits at the top of this range.
+    int textVocabSize() const;
     std::vector<std::string> speakerNames() const;
     const std::string& tokenizerProfile() const;
-    int textVocabSize() const;
     bool synthesize(
         magpie_stream_params& params, const std::vector<int32_t>& tokens,
         const magpie_pcm_callback& pcm_callback, stream_run_metrics& metrics);

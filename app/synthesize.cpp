@@ -100,7 +100,8 @@ print_synthesize_help(const char* program) {
         "  --codec-model MODEL       NanoCodec GGUF path or indexed HF repo\n"
         "                            (default: nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps)\n"
         "  --tokenizer-dir MODEL     Tokenizer directory or indexed HF repo\n"
-        "  --context-codes PATH      Reference-audio codec codes (zero-shot voice cloning)\n"
+        "  --context-audio PATH      Reference WAV for zero-shot voice cloning\n"
+        "  --context-codes PATH      Reference-audio codec codes (alternative to --context-audio)\n"
         "  --tokens-file PATH        Synthesize pre-tokenized text token IDs instead of TEXT\n"
         "                            (default: MagpieTTS repository)\n"
         "  --tn-model-dir DIR        Optional text-normalization grammars\n"
@@ -200,6 +201,8 @@ command_synthesize(int argc, char** argv) {
                 parsed.runtime.codec_model = value(i, arg);
             else if (arg == "--tokenizer-dir")
                 parsed.tokenizer_model_dir = value(i, arg);
+            else if (arg == "--context-audio")
+                parsed.runtime.context_audio_file = value(i, arg);
             else if (arg == "--context-codes")
                 parsed.runtime.context_codes_file = value(i, arg);
             else if (arg == "--tokens-file")

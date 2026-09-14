@@ -34,6 +34,7 @@ struct MagpieRuntimeConfig {
     // Reference-audio codec codes for zero-shot cloning; required by
     // context-encoder checkpoints, ignored by baked ones.
     std::string context_codes_file;
+    std::string context_audio_file;
     int speaker = 0;
     int threads = 4;
     int codec_threads = 0;
@@ -165,10 +166,10 @@ class MagpieTtsRuntime {
 
     int sample_rate() const;
     int speaker_count() const;
+    int text_vocab_size() const;
     const std::vector<std::string>& speaker_names() const;
     const std::string& model_name() const;
     const std::string& tokenizer_profile() const;
-    int text_vocab_size() const;
 
     MagpieSynthesisStats synthesize(
         const std::vector<int32_t>& tokens, const MagpieSynthesisOptions& options,
