@@ -1587,15 +1587,21 @@ struct codec_stream_worker {
     bool emit_gap(codec_channel& ch, int samples) {
         const int owed = samples - ch.trailing_quiet_samples;
         ch.trailing_quiet_samples = 0;
-        if (owed <= 0 || !ch.outputs) {
+        if (!ch.outputs) {
             return true;
         }
-        const std::vector<float> silence((size_t)owed, 0.0f);
-        if (!ch.audio_pp.writeDecodedAudio(
-                silence, 0, false, [&](const std::vector<float>& processed) {
-                    return ch.outputs->write_audio(processed);
-                })) {
-            return false;
+        // Even a pause that needs no silence is still a boundary: the state
+        // reset below has to happen either way, or a chunk whose tail was
+        // already quiet enough opens the next one on the previous chunk's
+        // decoder and the click comes back at exactly those seams.
+        if (owed > 0) {
+            const std::vector<float> silence((size_t)owed, 0.0f);
+            if (!ch.audio_pp.writeDecodedAudio(
+                    silence, 0, false, [&](const std::vector<float>& processed) {
+                        return ch.outputs->write_audio(processed);
+                    })) {
+                return false;
+            }
         }
         // The next chunk opens on a clean decoder. Carrying the convolution
         // state across a pause means its first sample is produced from a cache
