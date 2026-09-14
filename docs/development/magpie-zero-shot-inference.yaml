@@ -12,4 +12,3 @@ inference_parameters:
   start_prior_after_n_audio_steps: 0
   max_decoder_steps: 500
   min_generated_frames: 4
-  forceful_chunk_end_threshold: 4
