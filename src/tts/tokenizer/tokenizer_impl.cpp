@@ -763,6 +763,52 @@ cjk_terminal_size_at(const std::string& text, size_t position) {
     return 0;
 }
 
+// Titles are always followed by a name, so the period after one ends a word and
+// not a sentence. NeMo carries the same list (tts_dataset_utils.py,
+// _TITLE_ABBREVIATIONS) and refuses to split there; without it "My dear Mr.
+// Bennet" becomes two chunks, the second opening on a bare surname, and the
+// model stumbles over the seam.
+static bool
+is_title_abbreviation(const std::string& word) {
+    static const std::set<std::string> titles = {"capt", "col",  "dr",   "gen", "gov",
+                                                 "jr",   "lt",   "mr",   "mrs", "ms",
+                                                 "prof", "rev",  "sgt",  "sr"};
+    return titles.count(word) != 0;
+}
+
+// The word a period follows, lowercased, with anything that is not an ASCII
+// letter trimmed off both ends. NeMo compares the raw whitespace-delimited token
+// instead, which misses an opening quote -- `"Mr.` reads as `"mr` there and
+// splits. Trimming can only ever prevent a split, never introduce one.
+static std::string
+word_before_period(const std::string& text, size_t sentence_start, size_t period) {
+    size_t end = period;
+    while (end > sentence_start && (text[end - 1] == ' ' || text[end - 1] == '\t')) {
+        --end;
+    }
+    size_t begin = end;
+    while (begin > sentence_start) {
+        const char c = text[begin - 1];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            break;
+        }
+        --begin;
+    }
+    std::string word;
+    for (size_t i = begin; i < end; ++i) {
+        const char c = text[i];
+        if (c >= 'A' && c <= 'Z') {
+            word.push_back((char)(c + 32));
+        } else if (c >= 'a' && c <= 'z') {
+            word.push_back(c);
+        } else if (!word.empty()) {
+            // Trailing non-letters end the word; leading ones never started it.
+            break;
+        }
+    }
+    return word;
+}
+
 static std::vector<std::string>
 split_sentences(std::string paragraph) {
     paragraph = replace_all(paragraph, "-", " ");
@@ -776,7 +822,11 @@ split_sentences(std::string paragraph) {
     for (size_t i = 0; i < paragraph.size(); ++i) {
         const char c = paragraph[i];
         const char next = i + 1 < paragraph.size() ? paragraph[i + 1] : '\0';
-        const bool ascii_boundary = (c == '.' || c == '?' || c == '!') && next == ' ';
+        bool ascii_boundary = (c == '.' || c == '?' || c == '!') && next == ' ';
+        if (ascii_boundary && c == '.' &&
+            is_title_abbreviation(word_before_period(paragraph, start, i))) {
+            ascii_boundary = false;
+        }
         const size_t cjk_terminal_size = cjk_terminal_size_at(paragraph, i);
         if (ascii_boundary || cjk_terminal_size != 0) {
             size_t end = i + (ascii_boundary ? 1 : cjk_terminal_size);
