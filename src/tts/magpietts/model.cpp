@@ -1758,6 +1758,16 @@ MagpieLongformAttentionPriorState::beginChunk(
     buildInitialChunkPrior(h);
 }
 
+// NeMo's ChunkedInferenceConfig, which the checkpoints do not carry and its
+// servers do not override: short_sentence_threshold, prior_weights_init (seven
+// flat positions opening a chunk), and prior_weights read as
+// (history, current, +1 .. +6).
+static constexpr int kMagpieShortSentenceThreshold = 35;
+static constexpr int kMagpiePriorWeightsInit = 7;
+static constexpr float kMagpiePriorWeights[] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.2f, 0.2f};
+static constexpr int kMagpiePriorWeightCount =
+    (int)(sizeof(kMagpiePriorWeights) / sizeof(kMagpiePriorWeights[0]));
+
 void
 MagpieLongformAttentionPriorState::buildInitialChunkPrior(const magpietts_hparams& h) {
     if (text_len_ <= 0) {
@@ -1766,24 +1776,24 @@ MagpieLongformAttentionPriorState::buildInitialChunkPrior(const magpietts_hparam
     }
 
     const float eps = std::max(0.0f, h.attention_prior_epsilon);
-    const float eps_sq = eps * eps;
-    prior_.assign((size_t)text_len_, eps_sq);
+    prior_.assign((size_t)text_len_, eps);
 
-    if (text_len_ <= 35) {
+    if (text_len_ <= kMagpieShortSentenceThreshold) {
         std::fill(prior_.begin(), prior_.end(), 1.0f);
         return;
     }
 
+    // NeMo's _initialize_chunk_attention_prior: the spliced history is
+    // suppressed hard, the new chunk's opening window is flat, and everything
+    // past it keeps the plain epsilon the fill above left.
     const int current_start = std::max(0, text_len_ - current_chunk_len_);
-    if (current_start > 0) {
-        prior_[(size_t)(current_start - 1)] = 0.2f;
-    }
-    static const float init_weights[] = {0.5f, 1.0f, 0.8f, 0.2f, 0.2f};
-    for (int i = 0; i < (int)(sizeof(init_weights) / sizeof(init_weights[0])); ++i) {
-        const int pos = current_start + i;
-        if (pos >= 0 && pos < text_len_) {
-            prior_[(size_t)pos] = init_weights[i];
+    std::fill(prior_.begin(), prior_.begin() + (size_t)current_start, eps * eps);
+    for (int offset = 0; offset < kMagpiePriorWeightsInit; ++offset) {
+        const int pos = current_start + offset;
+        if (pos >= text_len_) {
+            break;
         }
+        prior_[(size_t)pos] = 1.0f;
     }
 }
 
@@ -1809,21 +1819,29 @@ MagpieLongformAttentionPriorState::buildPrior(const magpietts_hparams& h) {
                 prior_[(size_t)std::min(rel + i, text_len_ - 1)] = 1.0f;
             }
         }
-    } else if (text_len_ <= 35) {
+    } else if (text_len_ <= kMagpieShortSentenceThreshold) {
         std::fill(prior_.begin(), prior_.end(), 1.0f);
     } else {
-        if (rel > 0) {
-            prior_[(size_t)(rel - 1)] = 0.2f;
+        // NeMo's _set_prior_weights_around_position, read straight off
+        // ChunkedInferenceConfig.prior_weights as (history, current, +1 .. +6).
+        // The window is flat out to +4 rather than a decaying ramp: under-
+        // weighting the lookahead leaves the decoder short of anywhere to go and
+        // it dithers, and under-weighting the history cell -- NeMo's comment
+        // there is "slight exposure to history for better pronunciation" --
+        // slurs the first syllable of a chunk.
+        const int history_end = std::max(1, rel - 1);
+        if (history_end < text_len_) {
+            prior_[(size_t)history_end] = kMagpiePriorWeights[0];
         }
-        prior_[(size_t)rel] = 1.0f;
-        static const float lookahead_weights[] = {0.6f, 0.4f, 0.2f, 0.2f};
-        for (int i = 0; i < (int)(sizeof(lookahead_weights) / sizeof(lookahead_weights[0])); ++i) {
-            const int pos = rel + i + 1;
+        prior_[(size_t)rel] = kMagpiePriorWeights[1];
+        for (int offset = 1; offset + 1 < kMagpiePriorWeightCount; ++offset) {
+            const int pos = rel + offset;
             if (pos >= text_len_) {
                 break;
             }
-            prior_[(size_t)pos] = lookahead_weights[i];
+            prior_[(size_t)pos] = kMagpiePriorWeights[offset + 1];
         }
+        // Everything from +7 on is suppressed; the fill above already did it.
     }
 
     for (int absolute = left_offset_; absolute < left_offset_ + text_len_; ++absolute) {

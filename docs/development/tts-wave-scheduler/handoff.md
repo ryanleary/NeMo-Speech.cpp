@@ -13,15 +13,18 @@ additive mask), and the sampler. Opt-in through
 `--tts.batch-size N --tts.longform-history-tokens M` (both required
 together). Default `batch-size 1` leaves the sequential path bit-identical.
 
-Reference hashes for the sequential path, current as of `a905119`:
+Reference hashes for the sequential path:
 
     line       0afc4e3a87b69463
-    paragraph  b108af49283f35d8
-    script     2dbd3bfb55596e25
+    paragraph  52350eb6f1374683
+    script     0f4fa8012061f840
 
 These are a change-detector against our own top-of-tree, not a reference
-oracle. They were re-baselined twice on purpose: once when the decoder took
-flash attention, once when the local transformer did.
+oracle. They have been re-baselined three times on purpose: once when the
+decoder took flash attention, once when the local transformer did, and once
+when the long-form attention prior took NeMo's weights. `line` is a single
+chunk and has never moved -- the prior only shapes multi-chunk runs, so it is
+the control that says a re-baseline was the prior and nothing else.
 
 ## Results
 
