@@ -149,17 +149,24 @@ prefix `[217, 768]`), and compared against ours with
 | reference's own context codes | **0.99999851** | context encoder is exact |
 | reference WAV through our codec encoder | 0.632 | codec encoder diverges |
 
-So the decoder, the context encoder and the prefix construction are right. What
-is not is the NanoCodec **encoder** ported in `943f708`: the original port
-recorded 0.99969 for this same route, so ours has a defect. It is not the
-resampler -- ffmpeg and librosa resampling of the reference give the same 0.632
--- which was the first suspect, because `bf3126c` warns that a differing
-resampler changes the codes silently.
+**Both numbers are correct and nothing is broken.** The 0.632 row compares
+different audio, not different implementations.
 
-Prime suspect is the conflict resolved in `src/tts/nanocodec/model.cpp` while
-porting the encoder, which needed a closing brace added by hand; and, given what
-the context encoder turned out to need, whether the encoder's convolutions want
-centre padding that ours applies causally.
+NeMo's dataset takes a **random window** of the context audio per item --
+`context_duration_min` and `_max` are both 10.0, so the length is fixed and the
+offset is not. `magpie_serve` even has `_share_context()` to force one window
+across a batch, with a comment saying so. The captured reference is therefore a
+random 10 s window of `default.wav`, while the runtime takes the *leading*
+`context_duration_max` seconds, which `bf3126c` chose deliberately.
+
+Encoding the very same file with NeMo's own codec gives frame 0 =
+`[551 1106 212 1270 250 832 1801 743]`, which is byte-identical to ours. The
+captured reference's frame 0 is `[287 1223 566 408 1157 1148 446 929]`: a
+different excerpt of the same speaker. Hence valid codes on both sides, 0.1%
+agreement at every alignment, and a cloned voice that still sounds right.
+
+The correct validation is the codes route, which supplies the reference's own
+window: **cosine 0.99999851**. The port is verified.
 
 Note what this cost to find. Listening said the cloned voice was clearly
 conditioned on the reference; the metric said 0.632. Both were true -- FSQ code
