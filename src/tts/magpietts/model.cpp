@@ -1847,13 +1847,19 @@ MagpieLongformAttentionPriorState::buildPrior(const magpietts_hparams& h) {
         // Everything from +7 on is suppressed; the fill above already did it.
     }
 
-    for (int absolute = left_offset_; absolute < left_offset_ + text_len_; ++absolute) {
+    // NeMo's _penalize_attention_sinks with its attention_sink_threshold of 3:
+    // everything up to AND INCLUDING an over-attended position is suppressed, so
+    // a decoder stuck on one token is pushed off it. Ours ran at a threshold of
+    // 10 -- our own field, not upstream -- and stopped short of the position
+    // actually being attended, so the token it was stuck on kept its full weight
+    // and nothing ever moved.
+    constexpr int kMagpieAttentionSinkThreshold = 3;
+    for (int absolute = left_offset_ + 1; absolute < left_offset_ + text_len_; ++absolute) {
         if (absolute >= 0 && absolute < (int)attended_counts_.size() &&
-            attended_counts_[(size_t)absolute] >= h.attention_prior_decay_threshold) {
+            attended_counts_[(size_t)absolute] >= kMagpieAttentionSinkThreshold) {
             const int rel_pos = absolute - left_offset_;
-            const int preserve_from = std::max(0, std::min(rel, text_len_ - 1));
-            const int fill_end = std::min(std::min(rel_pos + 1, text_len_), preserve_from);
-            std::fill(prior_.begin(), prior_.begin() + fill_end, eps_sq);
+            std::fill(
+                prior_.begin(), prior_.begin() + std::min(rel_pos + 1, text_len_), eps_sq);
         }
     }
 }
@@ -1873,19 +1879,29 @@ MagpieLongformAttentionPriorState::update(
     const int previous_abs =
         std::max(left_offset_, std::min(last_attended_absolute_, left_offset_ + text_len_ - 1));
     const int previous_rel = std::max(0, std::min(previous_abs - left_offset_, text_len_ - 1));
-    const int advance_threshold =
-        effective_attention_prior_advance_threshold(h, previous_rel, text_len_);
+    // NeMo's get_most_attended_text_timestep, including the constant it hardcodes
+    // there: a position attended four times is taken to be a sink and the search
+    // starts one past it. This used to be a configurable
+    // attention_prior_advance_threshold defaulting to 8, which is ours and not
+    // upstream -- and at 8 a stuck decoder crawls one text token per eight steps,
+    // emitting quiet frames the whole way.
+    constexpr int kMagpieAttendedSinkAdvance = 4;
     int search_start_abs = previous_abs;
     if (previous_abs >= 0 && previous_abs < (int)attended_counts_.size() &&
-        attended_counts_[(size_t)previous_abs] >= advance_threshold) {
-        search_start_abs = std::min(previous_abs + 1, left_offset_ + text_len_ - 1);
+        attended_counts_[(size_t)previous_abs] >= kMagpieAttendedSinkAdvance) {
+        search_start_abs = previous_abs + 1;
     }
-    const int last_rel = std::max(0, std::min(search_start_abs - left_offset_, text_len_ - 1));
+    const int last_rel = std::max(0, search_start_abs - left_offset_);
 
-    int attended_rel = last_rel;
+    int attended_rel;
     const int search_end =
         std::min(last_rel + std::max(0, h.attention_prior_lookahead_window), text_len_ - 3);
-    if (search_end > last_rel) {
+    if (search_end <= last_rel) {
+        // NeMo reads an empty slice here and takes it to mean the sentence has
+        // ended, jumping to the last token. We used to stay where we were, which
+        // is a decoder that never reaches its chunk end and keeps generating.
+        attended_rel = text_len_ - 1;
+    } else {
         attended_rel = last_rel;
         float best = alignment_scores[(size_t)last_rel];
         for (int i = last_rel + 1; i < search_end; ++i) {

@@ -15,18 +15,18 @@ together). Default `batch-size 1` leaves the sequential path bit-identical.
 
 Reference hashes for the sequential path:
 
-    line       0afc4e3a87b69463
-    paragraph  d22e3346015f5391
-    script     b75ec1bc76c55ff6
+    line       751fcdb9d4da837e
+    paragraph  bfd19ab1b8b59951
+    script     d60e3add5d088e1a
 
 These are a change-detector against our own top-of-tree, not a reference
-oracle. They have been re-baselined four times on purpose: when the decoder
-took flash attention, when the local transformer did, when the long-form
-attention prior took NeMo's weights, when the pause between long-form
-chunks became a fixed 200 ms, and when that pause became digital silence
-across which the codec's state is reset. `line` is a single chunk and has never moved --
-the last two only shape multi-chunk runs, so it is the control that says a
-re-baseline was the seam and nothing else.
+oracle. `line` is a single chunk and did not move for a long time, because
+every re-baseline until now was about seams: flash attention in the decoder,
+then in the local transformer, the long-form attention prior taking NeMo's
+weights, and the pause between chunks becoming a fixed 200 ms of digital
+silence. It moved when the attended-position search took NeMo's constants,
+which is the first change to reach the single-chunk path -- and that case got
+20% shorter, so it had been stalling too.
 
 ## Results
 
