@@ -118,17 +118,10 @@ splice_longform_history_context(
 // Per-chunk decode state that survives across steps.
 struct MagpieChunkDecodeState {
     int chunk_frames_generated = 0;
-    int near_end_frames = 0;
-    bool suppress_nonfinal_codec_output = false;
-    int suppressed_nonfinal_frames = 0;
     // Steps taken since attention reached the end of this chunk's text. The
     // chunk is held open for forceful_chunk_end_threshold of them so its last
     // phoneme finishes rather than being cut where the attention landed.
     int steps_past_chunk_end = 0;
-    // Steps of audio still owed after a non-final EOS. EOS fires on any of the
-    // emitted codebooks, so it can land a frame or two before the sound it ends
-    // has decayed. Counted down before suppression starts.
-    int eos_tail_steps = 0;
 };
 
 // What one decoder step did to one chunk.
@@ -154,39 +147,21 @@ advance_chunk_state(
     out.stop = false;
 
     bool end_chunk_after_frame = false;
-    bool start_suppressing_after_frame = false;
     bool reached_chunk_end = final_chunk;
-    bool can_catch_up_nonfinal = false;
     if (alignment_scores && !alignment_scores->empty()) {
         prior.update(h, step, text_len, *alignment_scores);
         if (params.verbose) {
             log_longform_attention_prior_trace(label, (int)chunk_index, step, h, prior);
         }
-        const int near_end_threshold = 3;
-        const int last_rel = prior.lastAttendedRelative();
-        reached_chunk_end = last_rel >= std::max(0, text_len - 1);
-        if (!final_chunk) {
-            can_catch_up_nonfinal = true;
-            if (last_rel >= std::max(0, text_len - near_end_threshold)) {
-                ++chunk.near_end_frames;
-            } else {
-                chunk.near_end_frames = 0;
-            }
-            if (chunk.suppress_nonfinal_codec_output) {
-                end_chunk_after_frame = reached_chunk_end;
-            } else if (
-                chunk.near_end_frames >= 1 &&
-                chunk.chunk_frames_generated >= h.min_generated_frames) {
-                if (reached_chunk_end) {
-                    ++chunk.steps_past_chunk_end;
-                    end_chunk_after_frame =
-                        chunk.steps_past_chunk_end >= std::max(1, h.forceful_chunk_end_threshold);
-                } else {
-                    start_suppressing_after_frame = true;
-                }
-            }
-        } else if (reached_chunk_end && chunk.chunk_frames_generated >= h.min_generated_frames) {
-            end_chunk_after_frame = true;
+        reached_chunk_end = prior.lastAttendedRelative() >= std::max(0, text_len - 1);
+        if (reached_chunk_end && chunk.chunk_frames_generated >= h.min_generated_frames) {
+            // A chunk whose text is covered but which has not said so is ended
+            // after forceful_chunk_end_threshold steps. The last chunk has no
+            // successor to hand the rest to, so it ends as soon as it is covered.
+            ++chunk.steps_past_chunk_end;
+            end_chunk_after_frame =
+                final_chunk ||
+                chunk.steps_past_chunk_end >= std::max(1, h.forceful_chunk_end_threshold);
         }
     }
 
@@ -204,20 +179,9 @@ advance_chunk_state(
                 stderr, "%s EOS detected at frame %d for text chunk %zu/%zu\n", label, step,
                 chunk_index + 1, chunk_count);
         }
-        if (final_chunk || reached_chunk_end || !can_catch_up_nonfinal) {
-            out.stop = true;
-        }
-        if (!chunk.suppress_nonfinal_codec_output && chunk.eos_tail_steps == 0) {
-            chunk.eos_tail_steps = std::max(1, h.forceful_chunk_end_threshold);
-            if (params.verbose) {
-                fprintf(
-                    stderr,
-                    "%s codec output for text chunk %zu/%zu ends %d step(s) after non-final EOS, "
-                    "then waits for attention to reach chunk end (relative=%d text_len=%d)\n",
-                    label, chunk_index + 1, chunk_count, chunk.eos_tail_steps,
-                    prior.lastAttendedRelative(), text_len);
-            }
-        }
+        // EOS ends the chunk where it fired. frames_to_emit below cuts this
+        // step's audio at the codebook that carried it.
+        out.stop = true;
     }
 
     for (int c = 0; c < h.audio_codebooks; ++c) {
@@ -228,37 +192,17 @@ advance_chunk_state(
 
     const int frames_to_emit = magpietts_frames_to_emit(
         frames_remaining, h.frame_stacking_factor, has_eos ? eos_lane : -1);
-    if (!chunk.suppress_nonfinal_codec_output) {
-        for (int lane = 0; lane < frames_to_emit; ++lane) {
-            out.frames.push_back(codec_frames[(size_t)lane]);
-        }
-        chunk.chunk_frames_generated += frames_to_emit;
-    } else {
-        chunk.suppressed_nonfinal_frames += frames_to_emit;
+    for (int lane = 0; lane < frames_to_emit; ++lane) {
+        out.frames.push_back(codec_frames[(size_t)lane]);
     }
-    if (chunk.eos_tail_steps > 0 && !chunk.suppress_nonfinal_codec_output) {
-        if (--chunk.eos_tail_steps == 0) {
-            start_suppressing_after_frame = true;
-        }
-    }
-    if (start_suppressing_after_frame) {
-        chunk.suppress_nonfinal_codec_output = true;
-        if (params.verbose) {
-            fprintf(
-                stderr,
-                "%s continuing text chunk %zu/%zu without codec output until attention reaches "
-                "chunk end (relative=%d text_len=%d)\n",
-                label, chunk_index + 1, chunk_count, prior.lastAttendedRelative(), text_len);
-        }
-    }
+    chunk.chunk_frames_generated += frames_to_emit;
     if (end_chunk_after_frame) {
         if (params.verbose) {
             fprintf(
                 stderr,
                 "%s ending text chunk %zu/%zu after attention reached chunk end (relative=%d "
-                "text_len=%d suppressed_codec_frames=%d)\n",
-                label, chunk_index + 1, chunk_count, prior.lastAttendedRelative(), text_len,
-                chunk.suppressed_nonfinal_frames);
+                "text_len=%d)\n",
+                label, chunk_index + 1, chunk_count, prior.lastAttendedRelative(), text_len);
         }
         out.stop = true;
     }
@@ -2354,8 +2298,8 @@ struct WaveSession {
         if (!item.boundary_queued) {
             if (params.verbose) {
                 fprintf(
-                    stderr, "%s wave flush chunk %zu: %zu frames pending (suppressed %d)\n", label,
-                    item.chunk_index, item.frames.size(), item.chunk.suppressed_nonfinal_frames);
+                    stderr, "%s wave flush chunk %zu: %zu frames pending\n", label,
+                    item.chunk_index, item.frames.size());
             }
             if (!discard_audio && !last_chunk && !sink.write_gap(boundary_gap_samples)) {
                 return false;
