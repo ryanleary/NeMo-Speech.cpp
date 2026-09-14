@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "model.h"
 
+#include <cmath>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -72,6 +73,13 @@ struct nc_res_layer {
     std::vector<std::vector<nc_res_block>> by_kernel;
 };
 
+struct nc_encoder {
+    nc_conv pre_conv;
+    std::vector<nc_conv> down_convs;
+    std::vector<nc_res_layer> res_layers;
+    nc_conv post_conv;
+};
+
 struct nc_model {
     nc_hparams hparams;
 
@@ -90,6 +98,8 @@ struct nc_model {
     std::vector<nc_res_layer> res_layers;
     nc_activation post_activation;
     nc_conv post_conv;
+
+    nc_encoder encoder;
 };
 
 namespace nemo_speech::tts::nanocodec {
@@ -121,6 +131,15 @@ gguf_i32(const gguf_context* ctx, const char* key, int32_t def) {
         return (int32_t)gguf_get_val_u64(ctx, id);
     }
     return def;
+}
+
+static bool
+gguf_bool(const gguf_context* ctx, const char* key, bool def) {
+    const int64_t id = gguf_find_key(ctx, key);
+    if (id < 0 || gguf_get_kv_type(ctx, id) != GGUF_TYPE_BOOL) {
+        return def;
+    }
+    return gguf_get_val_bool(ctx, id);
 }
 
 static std::vector<int32_t>
@@ -320,6 +339,16 @@ nc_model_load(
     h.scale = gguf_i32_array(model.gguf, "nano_codec.quantizer.scale", h.scale);
     h.offset = gguf_i32_array(model.gguf, "nano_codec.quantizer.offset", h.offset);
     h.up_rates = gguf_i32_array(model.gguf, "nano_codec.decoder.up_sample_rates", h.up_rates);
+    h.has_encoder = gguf_bool(model.gguf, "nano_codec.has_encoder", false);
+    if (h.has_encoder) {
+        h.down_rates = gguf_i32_array(model.gguf, "nano_codec.encoder.down_sample_rates", h.down_rates);
+        h.encoder_base_channels =
+            gguf_i32(model.gguf, "nano_codec.encoder.base_channels", h.encoder_base_channels);
+        h.encoder_in_kernel =
+            gguf_i32(model.gguf, "nano_codec.encoder.in_kernel_size", h.encoder_in_kernel);
+        h.encoder_out_kernel =
+            gguf_i32(model.gguf, "nano_codec.encoder.out_kernel_size", h.encoder_out_kernel);
+    }
     h.res_kernels =
         gguf_i32_array(model.gguf, "nano_codec.decoder.resblock_kernel_sizes", h.res_kernels);
     h.res_dilations =
@@ -421,6 +450,31 @@ nc_model_load(
     model.post_activation = load_activation(model, "dec.post_act");
     model.post_conv = load_conv(model, "dec.post");
 
+    if (h.has_encoder) {
+        nc_encoder& enc = model.encoder;
+        enc.pre_conv = load_conv(model, "enc.pre");
+        enc.down_convs.resize(h.down_rates.size());
+        enc.res_layers.resize(h.down_rates.size());
+        for (size_t i = 0; i < h.down_rates.size(); ++i) {
+            enc.down_convs[i] =
+                load_conv(model, "enc.down." + std::to_string(i), h.down_rates[i], 1);
+            nc_res_layer& layer = enc.res_layers[i];
+            layer.by_kernel.resize(h.res_kernels.size());
+            for (size_t ik = 0; ik < h.res_kernels.size(); ++ik) {
+                layer.by_kernel[ik].resize(h.res_dilations.size());
+                for (size_t id = 0; id < h.res_dilations.size(); ++id) {
+                    const std::string p = "enc.res." + std::to_string(i) + "." +
+                                          std::to_string(ik) + "." + std::to_string(id);
+                    nc_res_block& block = layer.by_kernel[ik][id];
+                    // The encoder activates with leaky ReLU, so unlike the
+                    // decoder its residual blocks carry no activation weights.
+                    block.input_conv = load_conv(model, p + ".ic", 1, h.res_dilations[id]);
+                    block.skip_conv = load_conv(model, p + ".sc", 1, 1);
+                }
+            }
+        }
+        enc.post_conv = load_conv(model, "enc.post");
+    }
     if (!nc_prepare_deconv_weights(model, verbose)) {
         return false;
     }
@@ -869,6 +923,192 @@ dequantize_tokens_padded(
     dequantize_tokens_into(h, frames, latent_frames, latent);
 }
 
+// Replicate padding: PyTorch's "replicate" mode repeats the edge samples rather
+// than padding with zeros. The decoder pads with zeros and only on the left
+// (it is causal); the encoder is neither.
+static ggml_tensor*
+replicate_pad(ggml_context* ctx, ggml_tensor* x, int left, int right) {
+    if (left <= 0 && right <= 0) {
+        return x;
+    }
+    const int64_t len = x->ne[0];
+    const int64_t channels = x->ne[1];
+    ggml_tensor* out = x;
+    if (left > 0) {
+        ggml_tensor* first = ggml_view_3d(ctx, x, 1, channels, 1, x->nb[1], x->nb[2], 0);
+        ggml_tensor* edge = ggml_repeat_4d(ctx, first, left, channels, 1, 1);
+        out = ggml_concat(ctx, edge, out, 0);
+    }
+    if (right > 0) {
+        ggml_tensor* last =
+            ggml_view_3d(ctx, x, 1, channels, 1, x->nb[1], x->nb[2], (size_t)(len - 1) * x->nb[0]);
+        ggml_tensor* edge = ggml_repeat_4d(ctx, last, right, channels, 1, 1);
+        out = ggml_concat(ctx, out, edge, 0);
+    }
+    return out;
+}
+
+// Non-causal convolution with replicate padding, matching NeMo's Conv1dNorm.
+// For a strided convolution NeMo uses get_down_sample_padding(), which is
+// (kernel - stride + 1) / 2 on each side.
+static ggml_tensor*
+encoder_conv1d(ggml_context* ctx, ggml_tensor* x, const nc_conv& conv) {
+    const int kernel = (int)conv.w->ne[0];
+    const int pad = conv.stride > 1 ? (kernel - conv.stride + 1) / 2
+                                    : (kernel - 1) * conv.dilation / 2;
+    ggml_tensor* padded = replicate_pad(ctx, x, pad, pad);
+    ggml_tensor* y = ggml_conv_1d(ctx, conv.w, padded, conv.stride, 0, conv.dilation);
+    return ggml_add(ctx, y, conv.b);
+}
+
+static ggml_tensor*
+encoder_residual_block(ggml_context* ctx, ggml_tensor* x, const nc_res_block& block) {
+    ggml_tensor* y = ggml_leaky_relu(ctx, x, 0.01f, false);
+    y = encoder_conv1d(ctx, y, block.input_conv);
+    y = ggml_leaky_relu(ctx, y, 0.01f, false);
+    y = encoder_conv1d(ctx, y, block.skip_conv);
+    return ggml_add(ctx, x, y);
+}
+
+static ggml_tensor*
+encoder_reslayer(ggml_context* ctx, ggml_tensor* x, const nc_res_layer& layer) {
+    ggml_tensor* sum = nullptr;
+    for (const auto& stack : layer.by_kernel) {
+        ggml_tensor* y = x;
+        for (const nc_res_block& block : stack) {
+            y = encoder_residual_block(ctx, y, block);
+        }
+        sum = sum ? ggml_add(ctx, sum, y) : y;
+    }
+    return ggml_scale(ctx, sum, 1.0f / (float)layer.by_kernel.size());
+}
+
+// Group FSQ analysis, the inverse of dequantize_tokens. Runs on the host: the
+// encoder output is only latent_dim x frames floats, and keeping it here avoids
+// a second GPU kernel for arithmetic that costs nothing.
+//
+// Mirrors FiniteScalarQuantizer.compress + inputs_to_codes + codes_to_indices.
+static void
+quantize_latents(
+    const nc_hparams& h, const std::vector<float>& latent, int n_frames,
+    std::vector<std::array<int32_t, 8>>& frames) {
+    constexpr float kFsqEps = 1.0e-3f;  // FiniteScalarQuantizer(eps=1e-3)
+    const int group_dim = h.group_dim;
+
+    frames.assign((size_t)n_frames, std::array<int32_t, 8>{});
+    for (int t = 0; t < n_frames; ++t) {
+        for (int g = 0; g < h.num_codebooks; ++g) {
+            int32_t index = 0;
+            for (int d = 0; d < group_dim; ++d) {
+                const int levels = h.levels[d];
+                const float out_scale = 0.5f * (float)(levels - 1) * (1.0f - kFsqEps);
+                const float out_offset = (levels % 2 == 0) ? 0.5f : 0.0f;
+                const float in_shift = std::tan(out_offset / out_scale);
+
+                const int channel = g * group_dim + d;
+                const float x = latent[(size_t)channel * (size_t)n_frames + (size_t)t];
+                const float compressed =
+                    out_scale * std::tanh(x + in_shift) - out_offset;
+                // codes_to_nonnegative reduces to round(compressed) + levels/2
+                // because inputs_to_codes divides by the same scale first.
+                // std::nearbyint follows the current rounding mode (round half
+                // to even), matching torch.round; std::lround would round half
+                // away from zero and disagree on exact ties.
+                const int32_t nonnegative =
+                    (int32_t)std::nearbyint(compressed) + h.offset[d];
+                index += nonnegative * h.base[d];
+            }
+            frames[(size_t)t][(size_t)g] = index;
+        }
+    }
+}
+
+static bool
+encode_eval(
+    const nc_model& model, const std::vector<float>& audio, int threads,
+    std::vector<std::array<int32_t, 8>>& frames) {
+    const ggml_nvtx::range nvtx_range("nanocodec_encode_eval");
+    const nc_hparams& h = model.hparams;
+    if ((int)audio.size() < h.samples_per_frame) {
+        fprintf(
+            stderr, "audio is shorter than one codec frame (%zu < %d samples)\n", audio.size(),
+            h.samples_per_frame);
+        return false;
+    }
+
+    // AudioCodecModel.encode_audio zero-pads so the last frame is full; without
+    // this the encoder drops the trailing partial frame.
+    const int n_frames_expected =
+        ((int)audio.size() + h.samples_per_frame - 1) / h.samples_per_frame;
+    std::vector<float> padded_audio(audio);
+    padded_audio.resize((size_t)n_frames_expected * (size_t)h.samples_per_frame, 0.0f);
+    const int n_samples = (int)padded_audio.size();
+
+    ggml_context* ctx = new_graph_context();
+    if (!ctx) {
+        fprintf(stderr, "failed to allocate graph context\n");
+        return false;
+    }
+
+    ggml_tensor* inp = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_samples, 1, 1);
+    ggml_set_name(inp, "nanocodec_audio_in");
+    ggml_set_input(inp);
+
+    ggml_tensor* x = encoder_conv1d(ctx, inp, model.encoder.pre_conv);
+    for (size_t i = 0; i < h.down_rates.size(); ++i) {
+        x = encoder_reslayer(ctx, x, model.encoder.res_layers[i]);
+        x = ggml_leaky_relu(ctx, x, 0.01f, false);
+        x = encoder_conv1d(ctx, x, model.encoder.down_convs[i]);
+    }
+    x = ggml_leaky_relu(ctx, x, 0.01f, false);
+    x = encoder_conv1d(ctx, x, model.encoder.post_conv);
+    ggml_set_name(x, "nanocodec_latent_out");
+    ggml_set_output(x);
+
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx, NANO_CODEC_MAX_NODES, false);
+    ggml_build_forward_expand(gf, x);
+    tag_graph_first_node(gf);
+
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    if (!allocr || !ggml_gallocr_alloc_graph(allocr, gf)) {
+        fprintf(stderr, "failed to allocate the encoder graph\n");
+        if (allocr) {
+            ggml_gallocr_free(allocr);
+        }
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(inp, padded_audio.data(), 0, padded_audio.size() * sizeof(float));
+    if (ggml_backend_is_cpu(model.backend)) {
+        ggml_backend_cpu_set_n_threads(model.backend, threads);
+    }
+    if (ggml_backend_graph_compute(model.backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "nanocodec encoder graph compute failed\n");
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx);
+        return false;
+    }
+
+    const int n_frames = (int)x->ne[0];
+    const int channels = (int)x->ne[1];
+    if (channels != h.latent_dim) {
+        fprintf(
+            stderr, "encoder produced %d channels, expected %d\n", channels, h.latent_dim);
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<float> latent((size_t)n_frames * (size_t)channels);
+    ggml_backend_tensor_get(x, latent.data(), 0, latent.size() * sizeof(float));
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx);
+
+    quantize_latents(h, latent, n_frames, frames);
+    return true;
+}
+
 static bool
 decode_eval(
     const nc_model& model, const std::vector<std::array<int32_t, 8>>& frames, int threads,
@@ -1301,6 +1541,11 @@ NanoCodecModel::decoderLeftContextSamples() const {
     return require_loaded(this) ? nc_decoder_left_context_samples(impl_->model) : 0;
 }
 
+bool
+NanoCodecModel::hasEncoder() const {
+    return impl_ && impl_->loaded && impl_->model.hparams.has_encoder;
+}
+
 NanoCodecStreamState::NanoCodecStreamState() : impl_(std::make_unique<Impl>()) {
     clear();
 }
@@ -1361,6 +1606,21 @@ NanoCodecStreamGraph::chunkFrames() const {
 }
 
 NanoCodecDecoder::NanoCodecDecoder(const NanoCodecModel& model) : model_(&model) {}
+
+bool
+NanoCodecEncoder::encode(
+    const std::vector<float>& audio, int threads, NanoCodecFrames& frames) const {
+    if (!require_loaded(&model_)) {
+        return false;
+    }
+    if (!model_.hparams().has_encoder) {
+        fprintf(
+            stderr,
+            "this NanoCodec GGUF has no audio encoder; reconvert with --with-codec-encoder\n");
+        return false;
+    }
+    return encode_eval(model_.impl_->model, audio, threads, frames);
+}
 
 bool
 NanoCodecDecoder::decode(

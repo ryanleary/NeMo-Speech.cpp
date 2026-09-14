@@ -30,6 +30,8 @@ class ConversionRequest:
     # Sidecar model config for a bare Lightning .ckpt, which carries weights but
     # no usable model_config.yaml.
     config_yaml: Path | None = None
+    # Convert the codec's audio encoder as well as its decoder.
+    with_codec_encoder: bool = False
     silero_version: str = "6.2.0"
     from_whisper_ggml: Path | None = None
     llama_cpp: Path | None = None
@@ -261,7 +263,9 @@ def convert_model(request: ConversionRequest) -> str:
         from . import codec
 
         assert checkpoint is not None
-        codec.convert(checkpoint, request.outfile, outtype, request.metadata_json)
+        codec.convert(
+            checkpoint, request.outfile, outtype, request.metadata_json,
+            request.with_codec_encoder)
     elif architecture == "nmt":
         _convert_nmt(request, outtype)
     else:

@@ -97,7 +97,9 @@ def make_fsq_codebook(num_groups: int, num_levels: list[int]) -> torch.Tensor:
     return torch.from_numpy(grouped.astype(np.float32))
 
 
-def add_metadata(writer: gguf.GGUFWriter, cfg: dict[str, Any]) -> dict[str, Any]:
+def add_metadata(
+    writer: gguf.GGUFWriter, cfg: dict[str, Any], with_encoder: bool = False
+) -> dict[str, Any]:
     decoder = cfg["audio_decoder"]
     quantizer = cfg["vector_quantizer"]
 
@@ -156,6 +158,22 @@ def add_metadata(writer: gguf.GGUFWriter, cfg: dict[str, Any]) -> dict[str, Any]
     add_i32(writer, "nano_codec.codebook_size", codebook_size)
     add_i32(writer, "nano_codec.codebook_dim_per_group", codebook_dim_per_group)
     add_i32(writer, "nano_codec.latent_dim", latent_dim)
+    # Only written when the encoder is present, so decoder-only GGUFs stay
+    # byte-identical to those produced before this option existed.
+    if with_encoder:
+        writer.add_bool("nano_codec.has_encoder", True)
+        encoder = cfg["audio_encoder"]
+        writer.add_string("nano_codec.encoder.target", str(encoder.get("_target_", "")))
+        writer.add_string("nano_codec.encoder.activation", str(encoder.get("activation", "lrelu")))
+        writer.add_string("nano_codec.encoder.pad_mode", str(encoder.get("pad_mode", "")))
+        add_i32(writer, "nano_codec.encoder.encoded_dim", encoder["encoded_dim"])
+        add_i32(writer, "nano_codec.encoder.base_channels", encoder["base_channels"])
+        add_i32(writer, "nano_codec.encoder.in_kernel_size", encoder.get("in_kernel_size", 7))
+        add_i32(writer, "nano_codec.encoder.out_kernel_size", encoder.get("out_kernel_size", 7))
+        writer.add_array(
+            "nano_codec.encoder.down_sample_rates",
+            [int(x) for x in encoder["down_sample_rates"]],
+        )
     add_i32(writer, "nano_codec.decoder.input_dim", decoder["input_dim"])
     add_i32(writer, "nano_codec.decoder.base_channels", decoder["base_channels"])
     add_i32(writer, "nano_codec.decoder.in_kernel_size", decoder.get("in_kernel_size", 7))
@@ -190,6 +208,10 @@ def materialize_weight_norm(sd: dict[str, torch.Tensor], stem: str) -> torch.Ten
 
 def short_tensor_name(name: str) -> str:
     replacements = {
+        "audio_encoder.pre_conv.conv.weight": "enc.pre.w",
+        "audio_encoder.pre_conv.conv.bias": "enc.pre.b",
+        "audio_encoder.post_conv.conv.weight": "enc.post.w",
+        "audio_encoder.post_conv.conv.bias": "enc.post.b",
         "audio_decoder.pre_conv.conv.weight": "dec.pre.w",
         "audio_decoder.pre_conv.conv.bias": "dec.pre.b",
         "audio_decoder.post_conv.conv.weight": "dec.post.w",
@@ -206,6 +228,25 @@ def short_tensor_name(name: str) -> str:
     )
     if match:
         return f"dec.act.{match.group(1)}.{match.group(2)}"
+
+    # The encoder uses leaky ReLU throughout, so its activations carry no
+    # parameters; only convolutions are stored.
+    match = re.fullmatch(
+        r"audio_encoder\.down_sample_conv_layers\.(\d+)\.conv\.(weight|bias)", name
+    )
+    if match:
+        suffix = "w" if match.group(2) == "weight" else "b"
+        return f"enc.down.{match.group(1)}.{suffix}"
+
+    match = re.fullmatch(
+        r"audio_encoder\.res_layers\.(\d+)\.res_blocks\.(\d+)\.res_blocks\.(\d+)\."
+        r"(input_conv|skip_conv)\.conv\.(weight|bias)",
+        name,
+    )
+    if match:
+        conv = "ic" if match.group(4) == "input_conv" else "sc"
+        suffix = "w" if match.group(5) == "weight" else "b"
+        return f"enc.res.{match.group(1)}.{match.group(2)}.{match.group(3)}.{conv}.{suffix}"
 
     match = re.fullmatch(r"audio_decoder\.up_sample_conv_layers\.(\d+)\.conv\.(weight|bias)", name)
     if match:
@@ -350,6 +391,57 @@ def add_decoder_tensors(
     return n_written, skipped
 
 
+def add_encoder_tensors(
+    writer: gguf.GGUFWriter,
+    cfg: dict[str, Any],
+    sd: dict[str, torch.Tensor],
+    outtype: str,
+) -> int:
+    """Convert the audio encoder: wav -> latents, the analysis half of the codec.
+
+    Only needed to derive codec codes from audio on-device (zero-shot voice
+    cloning conditions on reference-audio codes). Decoder-only GGUFs stay
+    byte-identical when this is off.
+    """
+    n_written = 0
+    prefix = "audio_encoder."
+
+    for name in sd:
+        if not name.startswith(prefix) or name.endswith(WN_ORIGINAL0):
+            continue
+
+        if name.endswith(WN_ORIGINAL1):
+            stem = name[: -len(WN_ORIGINAL1)]
+            add_tensor(writer, stem + ".weight", materialize_weight_norm(sd, stem), outtype)
+            n_written += 1
+            continue
+
+        if name.endswith(".bias"):
+            # (C,) -> (1, C, 1) so it broadcasts over the conv output, matching
+            # how the decoder's biases are stored.
+            tensor = sd[name].detach().cpu().float().reshape(1, -1, 1).contiguous()
+            add_tensor(writer, name, tensor, outtype)
+            n_written += 1
+            continue
+
+        raise ValueError(f"unexpected audio encoder tensor: {name}")
+
+    return n_written
+
+
+def validate_encoder_config(cfg: dict[str, Any]) -> None:
+    target = cfg_get(cfg, "audio_encoder._target_")
+    if target != "nemo.collections.tts.modules.audio_codec_modules.HiFiGANEncoder":
+        raise RuntimeError(f"unsupported audio encoder: {target}")
+    if cfg_get(cfg, "audio_encoder.activation", "lrelu") != "lrelu":
+        raise RuntimeError("this converter currently expects leaky ReLU encoder activations")
+    pad_mode = cfg_get(cfg, "audio_encoder.pad_mode", "reflect")
+    if pad_mode != "replicate":
+        raise RuntimeError(
+            f"this converter currently expects replicate encoder padding, not {pad_mode}"
+        )
+
+
 def validate_config(cfg: dict[str, Any]) -> None:
     if cfg.get("target") != "nemo.collections.tts.models.audio_codec.AudioCodecModel":
         raise RuntimeError(f"unsupported target: {cfg.get('target')}")
@@ -376,6 +468,7 @@ def convert(
     output: Path,
     outtype: str = "f16",
     metadata_json: Path | None = None,
+    with_encoder: bool = False,
 ) -> None:
     root, tmp = extract_nemo(source)
 
@@ -386,8 +479,14 @@ def convert(
 
         output.parent.mkdir(parents=True, exist_ok=True)
         writer = gguf.GGUFWriter(output, "nemo-nano-codec")
-        summary = add_metadata(writer, cfg)
+        summary = add_metadata(writer, cfg, with_encoder)
         n_written, skipped = add_decoder_tensors(writer, cfg, sd, outtype)
+        n_encoder = 0
+        if with_encoder:
+            validate_encoder_config(cfg)
+            n_encoder = add_encoder_tensors(writer, cfg, sd, outtype)
+            skipped = [name for name in skipped if not name.startswith("audio_encoder.")]
+            n_written += n_encoder
 
         writer.write_header_to_file()
         writer.write_kv_data_to_file()
@@ -398,6 +497,8 @@ def convert(
         summary["tensors_skipped"] = skipped
         summary["output"] = str(output)
         summary["outtype"] = outtype
+        summary["encoder_tensors"] = n_encoder
+        summary["has_encoder"] = with_encoder
 
         if metadata_json:
             metadata_json.parent.mkdir(parents=True, exist_ok=True)
@@ -406,7 +507,8 @@ def convert(
             )
 
         print(f"wrote {output}")
-        print(f"stored {n_written} decoder/FSQ tensors; skipped {len(skipped)} source tensors")
+        kind = "decoder/FSQ/encoder" if with_encoder else "decoder/FSQ"
+        print(f"stored {n_written} {kind} tensors; skipped {len(skipped)} source tensors")
     finally:
         if tmp is not None:
             tmp.cleanup()

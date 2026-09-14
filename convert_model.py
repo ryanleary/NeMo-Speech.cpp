@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
         help="sidecar model config for a bare Lightning .ckpt (MagpieTTS); the file may be the "
         "model config itself or a hparams file with a top-level 'cfg:' key",
     )
+    parser.add_argument(
+        "--with-codec-encoder",
+        action="store_true",
+        help="also convert the NanoCodec audio encoder (wav -> codes), needed to derive "
+        "reference-audio codes on-device",
+    )
     parser.add_argument("--silero-version", default="6.2.0", help="Silero VAD package version")
     parser.add_argument(
         "--from-whisper-ggml", type=Path, help="convert a whisper.cpp Silero VAD file"
@@ -110,6 +116,7 @@ def main() -> int:
         metadata_json=args.metadata_json,
         local_transformer_outtype=args.local_transformer_outtype,
         config_yaml=args.config_yaml,
+        with_codec_encoder=args.with_codec_encoder,
         silero_version=args.silero_version,
         from_whisper_ggml=args.from_whisper_ggml,
         llama_cpp=args.llama_cpp,

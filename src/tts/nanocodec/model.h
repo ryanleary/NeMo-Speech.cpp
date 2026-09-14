@@ -25,6 +25,14 @@ struct NanoCodecHParams {
     std::vector<int32_t> up_rates = {8, 8, 4, 2, 2};
     std::vector<int32_t> res_kernels = {3, 7, 11};
     std::vector<int32_t> res_dilations = {1, 3, 5};
+
+    // Analysis half. Present only in GGUFs converted with --with-codec-encoder;
+    // needed to derive codec codes from audio on-device.
+    bool has_encoder = false;
+    std::vector<int32_t> down_rates = {2, 2, 4, 8, 8};
+    int32_t encoder_base_channels = 24;
+    int32_t encoder_in_kernel = 7;
+    int32_t encoder_out_kernel = 7;
 };
 
 using NanoCodecFrame = std::array<int32_t, 8>;
@@ -54,12 +62,28 @@ class NanoCodecModel {
     int codebookSize() const;
     int decoderLeftContextFrames() const;
     int64_t decoderLeftContextSamples() const;
+    bool hasEncoder() const;
 
    private:
     friend class NanoCodecDecoder;
+    friend class NanoCodecEncoder;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+// Audio -> codec codes, the analysis direction. Requires a GGUF converted with
+// --with-codec-encoder.
+class NanoCodecEncoder {
+   public:
+    explicit NanoCodecEncoder(const NanoCodecModel& model) : model_(model) {}
+
+    // `audio` is mono float samples at the model's sample rate. Produces one
+    // frame of `num_codebooks` codes per `samples_per_frame` input samples.
+    bool encode(const std::vector<float>& audio, int threads, NanoCodecFrames& frames) const;
+
+   private:
+    const NanoCodecModel& model_;
 };
 
 class NanoCodecStreamState {
@@ -77,6 +101,7 @@ class NanoCodecStreamState {
 
    private:
     friend class NanoCodecDecoder;
+    friend class NanoCodecEncoder;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -99,6 +124,7 @@ class NanoCodecStreamGraph {
 
    private:
     friend class NanoCodecDecoder;
+    friend class NanoCodecEncoder;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
