@@ -227,10 +227,6 @@ def add_metadata(
         baked_lens = [int(x) for x in sd["baked_context_embedding_len"].tolist()]
         baked_speakers = int(sd["baked_context_embedding.weight"].shape[0])
 
-    encoder = cfg["encoder"]
-    decoder = cfg["decoder"]
-    lt_hidden = int(cfg.get("local_transformer_hidden_dim", 256))
-    frame_stacking = int(cfg.get("frame_stacking_factor", 1))
     # One embedding table per (codebook, stack slot); NeMo indexes them as
     # `c + i * C`, so the table count is C * stacking and the real codebook
     # count - what the codec consumes - is the quotient.
@@ -243,6 +239,7 @@ def add_metadata(
             f"frame_stacking_factor {frame_stacking}"
         )
     n_codebooks = emit_codebooks // frame_stacking
+    profile = tokenizer_profile(cfg, text_vocab, frame_stacking)
 
     # The local transformer emits one projection per table, and the final
     # projection is (tables * vocab). Both must agree or the runtime will read
