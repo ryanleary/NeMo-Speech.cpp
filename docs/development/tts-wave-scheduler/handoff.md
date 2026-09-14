@@ -16,15 +16,16 @@ together). Default `batch-size 1` leaves the sequential path bit-identical.
 Reference hashes for the sequential path:
 
     line       0afc4e3a87b69463
-    paragraph  52350eb6f1374683
-    script     0f4fa8012061f840
+    paragraph  4b258ccab6b505c4
+    script     830d0c6b84c59dab
 
 These are a change-detector against our own top-of-tree, not a reference
-oracle. They have been re-baselined three times on purpose: once when the
-decoder took flash attention, once when the local transformer did, and once
-when the long-form attention prior took NeMo's weights. `line` is a single
-chunk and has never moved -- the prior only shapes multi-chunk runs, so it is
-the control that says a re-baseline was the prior and nothing else.
+oracle. They have been re-baselined four times on purpose: when the decoder
+took flash attention, when the local transformer did, when the long-form
+attention prior took NeMo's weights, and when the pause between long-form
+chunks became a fixed 200 ms. `line` is a single chunk and has never moved --
+the last two only shape multi-chunk runs, so it is the control that says a
+re-baseline was the seam and nothing else.
 
 ## Results
 
