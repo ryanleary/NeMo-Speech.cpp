@@ -48,6 +48,8 @@ base_hparams() {
 
 }  // namespace
 
+constexpr int kSink = nemo_speech::tts::kMagpieAttendedSinkAdvance;
+
 int
 main() {
     bool ok = true;
@@ -60,62 +62,61 @@ main() {
         const std::vector<float>& prior = state.prior();
         ok &= expect((int)prior.size() == (int)scores.size(), "prior length");
         if ((int)prior.size() >= 7) {
-            ok &= expect(state.lastAttended() == 2, "lookahead argmax is clamped to one step");
+            ok &= expect(state.lastAttended() == 3, "the search takes the peak in its window");
             ok &= expect(near(prior[0], 0.1f), "history before exposed window uses epsilon");
-            ok &= expect(near(prior[1], 1.0f), "previous timestep is exposed");
-            ok &= expect(near(prior[2], 1.0f), "current timestep is exposed");
-            ok &= expect(near(prior[3], 1.0f), "future timestep +1 is exposed");
-            ok &= expect(near(prior[4], 1.0f), "future timestep +2 is exposed");
-            ok &= expect(near(prior[5], 1.0f), "future timestep +3 is exposed");
-            ok &= expect(near(prior[6], 0.1f), "outside lookahead uses epsilon");
+            ok &= expect(near(prior[1], 0.1f), "before the exposed window uses epsilon");
+            ok &= expect(near(prior[2], 1.0f), "previous timestep is exposed");
+            ok &= expect(near(prior[3], 1.0f), "current timestep is exposed");
+            ok &= expect(near(prior[4], 1.0f), "future timestep +1 is exposed");
+            ok &= expect(near(prior[5], 1.0f), "future timestep +2 is exposed");
+            ok &= expect(near(prior[6], 1.0f), "future timestep +3 is exposed");
+            ok &= expect(near(prior[7], 0.1f), "outside lookahead uses epsilon");
         } else {
             ok &= expect(false, "prior size too small for indexed assertions");
         }
 
         state.update(h, 1, (int)scores.size(), scores);
-        ok &= expect(state.lastAttended() == 3, "second update advances one more step");
+        ok &= expect(state.lastAttended() == 3, "attention stays on the peak while it leads");
     }
 
     {
         tts::MagpieAttentionPriorState state;
         tts::magpietts_hparams h = base_hparams();
-        h.attention_prior_advance_threshold = 8;
         std::vector<float> scores = {0.0f, 1.0f, 0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f, 0.3f, 0.2f};
-        for (int step = 0; step < 8; ++step) {
+        for (int step = 0; step < kSink; ++step) {
             state.update(h, step, (int)scores.size(), scores);
         }
-        ok &= expect(state.lastAttended() == 1, "early attention can remain for 8 frames");
-        state.update(h, 8, (int)scores.size(), scores);
-        ok &=
-            expect(state.lastAttended() == 2, "early attention advances at configured threshold 8");
+        ok &= expect(state.lastAttended() == 1, "early attention holds until the sink threshold");
+        state.update(h, kSink, (int)scores.size(), scores);
+        ok &= expect(state.lastAttended() == 2, "early attention advances once it is a sink");
     }
 
     {
         tts::MagpieAttentionPriorState state;
         tts::magpietts_hparams h = base_hparams();
-        h.attention_prior_advance_threshold = 8;
+        h.attention_prior_lookahead_window = 5;
         std::vector<float> scores = {0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 1.0f, 0.0f, 0.0f, 0.0f};
-        for (int step = 0; step < 12; ++step) {
+        for (int step = 0; step < 1 + kSink; ++step) {
             state.update(h, step, (int)scores.size(), scores);
         }
-        ok &= expect(state.lastAttended() == 6, "attention reaches near-end token");
-        ok &= expect(state.lastAttended() == 6, "near-end attention can remain for 8 frames");
-        state.update(h, 12, (int)scores.size(), scores);
+        ok &= expect(state.lastAttended() == 6, "near-end attention holds until it is a sink");
+        state.update(h, 1 + kSink, (int)scores.size(), scores);
         ok &= expect(
-            state.lastAttended() == 7, "near-end attention advances at configured threshold 8");
+            state.lastAttended() == (int)scores.size() - 1,
+            "an empty search window means the sentence has ended");
     }
 
     {
         tts::MagpieAttentionPriorState state;
         tts::magpietts_hparams h = base_hparams();
-        h.attention_prior_advance_threshold = 0;
-        h.attention_prior_decay_threshold = 2;
+        h.attention_prior_lookahead_window = 8;
         std::vector<float> scores(8, 0.0f);
-        for (int step = 0; step < 6; ++step) {
+        scores[4] = 1.0f;
+        for (int step = 0; step < 1 + kSink; ++step) {
             state.update(h, step, (int)scores.size(), scores);
         }
         ok &= expect(state.lastAttended() == 7, "single-chunk attention reaches final token");
-        state.update(h, 6, (int)scores.size(), scores);
+        state.update(h, 1 + kSink, (int)scores.size(), scores);
         ok &= expect(
             has_active_prior(state.prior(), h.attention_prior_epsilon),
             "single-chunk prior keeps active focus after final-token decay");
@@ -165,63 +166,54 @@ main() {
     {
         tts::MagpieLongformAttentionPriorState state;
         tts::magpietts_hparams h = base_hparams();
-        h.attention_prior_advance_threshold = 8;
         h.attention_prior_lookahead_window = 5;
         state.beginChunk(h, 0, 10, 10, true);
         std::vector<float> scores = {0.0f, 0.1f, 1.0f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f, 0.3f, 0.2f};
-        for (int step = 0; step < 8; ++step) {
+        for (int step = 0; step < kSink; ++step) {
             state.update(h, step, (int)scores.size(), scores);
         }
         ok &= expect(
             state.lastAttendedAbsolute() == 2,
-            "longform attention can remain on an early token for 8 frames");
-        state.update(h, 8, (int)scores.size(), scores);
+            "longform attention holds on an early token until it is a sink");
+        state.update(h, kSink, (int)scores.size(), scores);
         ok &= expect(
-            state.lastAttendedAbsolute() == 3,
-            "longform early attention advances at configured threshold 8");
+            state.lastAttendedAbsolute() == 3, "longform early attention advances past the sink");
     }
 
     {
         tts::MagpieLongformAttentionPriorState state;
         tts::magpietts_hparams h = base_hparams();
-        h.attention_prior_advance_threshold = 8;
         h.attention_prior_lookahead_window = 5;
         state.beginChunk(h, 0, 10, 10, true);
         std::vector<float> scores = {0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 1.0f, 0.0f, 0.0f, 0.0f};
-        for (int step = 0; step < 6; ++step) {
+        for (int step = 0; step < 1 + kSink; ++step) {
             state.update(h, step, (int)scores.size(), scores);
         }
         ok &= expect(
             state.lastAttendedAbsolute() == 6,
-            "streaming near-end attention does not advance after 5 observations");
-        for (int step = 6; step < 9; ++step) {
-            state.update(h, step, (int)scores.size(), scores);
-        }
+            "longform near-end attention holds until it is a sink");
+        state.update(h, 1 + kSink, (int)scores.size(), scores);
         ok &= expect(
-            state.lastAttendedAbsolute() == 6,
-            "streaming near-end attention remains through 8 observations");
-        state.update(h, 9, (int)scores.size(), scores);
-        ok &= expect(
-            state.lastAttendedAbsolute() == 7,
-            "streaming near-end attention advances one token when search window is empty");
+            state.lastAttendedAbsolute() == (int)scores.size() - 1,
+            "an empty search window means the sentence has ended");
     }
 
     {
         tts::MagpieLongformAttentionPriorState state;
         tts::magpietts_hparams h = base_hparams();
-        h.attention_prior_advance_threshold = 0;
-        h.attention_prior_decay_threshold = 2;
         h.attention_prior_lookahead_window = 5;
-        const int text_len = 134;
+        const int text_len = 20;
         std::vector<float> scores((size_t)text_len, 0.0f);
+        scores[(size_t)text_len - 4] = 1.0f;
+        h.attention_prior_lookahead_window = text_len;
         state.beginChunk(h, 0, text_len, text_len, true);
-        for (int step = 0; step < text_len - 2; ++step) {
+        for (int step = 0; step < 1 + kSink; ++step) {
             state.update(h, step, text_len, scores);
         }
         ok &= expect(
             state.lastAttendedAbsolute() == text_len - 1,
             "longform first chunk reaches final token without overshooting");
-        state.update(h, text_len - 2, text_len, scores);
+        state.update(h, 1 + kSink, text_len, scores);
         ok &= expect(
             has_active_prior(state.prior(), h.attention_prior_epsilon),
             "longform prior keeps active focus after final-token decay");

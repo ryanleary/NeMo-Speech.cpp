@@ -826,12 +826,6 @@ magpietts_model_load_impl(
     h.forceful_chunk_end_threshold = gguf_i32(
         model.gguf, "magpietts.inference.forceful_chunk_end_threshold",
         h.forceful_chunk_end_threshold);
-    h.attention_prior_advance_threshold = gguf_i32(
-        model.gguf, "magpietts.inference.attention_prior_advance_threshold",
-        h.attention_prior_advance_threshold);
-    h.attention_prior_decay_threshold = gguf_i32(
-        model.gguf, "magpietts.inference.attention_prior_decay_threshold",
-        h.attention_prior_decay_threshold);
     h.estimate_alignment_from_layers =
         gguf_i32_array(model.gguf, "magpietts.inference.estimate_alignment_from_layers");
     h.apply_prior_to_layers =
@@ -848,23 +842,12 @@ magpietts_model_load_impl(
                 h.attention_prior_lookahead_window);
             h.start_prior_after_n_audio_steps = json_i32(
                 config_json, "start_prior_after_n_audio_steps", h.start_prior_after_n_audio_steps);
-            h.attention_prior_advance_threshold = json_i32(
-                config_json, "attention_prior_advance_threshold",
-                h.attention_prior_advance_threshold);
-            h.attention_prior_decay_threshold = json_i32(
-                config_json, "attention_prior_decay_threshold", h.attention_prior_decay_threshold);
             h.estimate_alignment_from_layers =
                 json_i32_array(config_json, "estimate_alignment_from_layers");
             h.apply_prior_to_layers = json_i32_array(config_json, "apply_prior_to_layers");
         }
     }
 
-    if (h.attention_prior_advance_threshold < 0 || h.attention_prior_decay_threshold < 0) {
-        fprintf(
-            stderr, "attention prior thresholds must be non-negative: advance=%d decay=%d\n",
-            h.attention_prior_advance_threshold, h.attention_prior_decay_threshold);
-        return false;
-    }
 
     if (h.frame_stacking_factor < 1) {
         fprintf(
@@ -1041,14 +1024,13 @@ magpietts_model_load_impl(
             stderr,
             "loaded MagpieTTS GGUF: conditioning=%s text_vocab=%d audio_codebooks=%d "
             "stacking=%d audio_vocab=%d speakers=%d "
-            "attention_prior=%s epsilon=%.4g lookahead=%d start_step=%d advance_threshold=%d "
-            "decay_threshold=%d estimate_layers=%s apply_layers=%s\n",
+            "attention_prior=%s epsilon=%.4g lookahead=%d start_step=%d "
+            "estimate_layers=%s apply_layers=%s\n",
             h.conditioning == MAGPIETTS_CONDITIONING_BAKED ? "baked" : "context_encoder",
             h.text_vocab_size, h.audio_codebooks, h.frame_stacking_factor, h.audio_vocab_size,
             h.conditioning == MAGPIETTS_CONDITIONING_BAKED ? h.baked_speakers : 0,
             h.apply_attention_prior ? "on" : "off", h.attention_prior_epsilon,
             h.attention_prior_lookahead_window, h.start_prior_after_n_audio_steps,
-            h.attention_prior_advance_threshold, h.attention_prior_decay_threshold,
             format_i32_list(h.estimate_alignment_from_layers).c_str(),
             format_i32_list(h.apply_prior_to_layers).c_str());
     }
@@ -1583,13 +1565,6 @@ read_file(const std::string& path) {
     return ss.str();
 }
 
-static int
-effective_attention_prior_advance_threshold(
-    const magpietts_hparams& h, int attended_relative_index, int text_len) {
-    (void)attended_relative_index;
-    (void)text_len;
-    return std::max(0, h.attention_prior_advance_threshold);
-}
 
 void
 MagpieAttentionPriorState::reset() {
@@ -1641,11 +1616,9 @@ MagpieAttentionPriorState::update(
     }
 
     const int previous_last = std::max(0, std::min(last_attended_, text_len - 1));
-    const int max_next = std::min(previous_last + 1, text_len - 1);
     int last = previous_last;
-    const int advance_threshold = effective_attention_prior_advance_threshold(h, last, text_len);
     if (last < (int)attended_counts_.size() &&
-        attended_counts_[(size_t)last] >= advance_threshold) {
+        attended_counts_[(size_t)last] >= kMagpieAttendedSinkAdvance) {
         last = std::min(last + 1, text_len - 1);
     }
 
@@ -1663,7 +1636,7 @@ MagpieAttentionPriorState::update(
         }
     }
 
-    last_attended_ = std::max(0, std::min({attended, max_next, text_len - 1}));
+    last_attended_ = std::max(0, std::min(attended, text_len - 1));
     if (last_attended_ < (int)attended_counts_.size()) {
         ++attended_counts_[(size_t)last_attended_];
     }
@@ -1679,10 +1652,11 @@ MagpieAttentionPriorState::update(
         }
     }
 
+    // Everything up to and including an over-attended position drops back to
+    // epsilon, so the decoder cannot settle on a token it has already spoken.
     for (int i = 0; i < (int)attended_counts_.size(); ++i) {
-        if (attended_counts_[(size_t)i] >= h.attention_prior_decay_threshold) {
-            const int preserve_from = std::max(0, std::min(last_attended_, text_len - 1));
-            const int fill_end = std::min(std::min(i + 1, text_len), preserve_from);
+        if (attended_counts_[(size_t)i] >= kMagpieAttendedSinkAdvance) {
+            const int fill_end = std::min(i + 1, text_len);
             std::fill(prior_.begin(), prior_.begin() + fill_end, h.attention_prior_epsilon);
         }
     }
@@ -1872,10 +1846,6 @@ MagpieLongformAttentionPriorState::update(
     const int previous_abs =
         std::max(left_offset_, std::min(last_attended_absolute_, left_offset_ + text_len_ - 1));
     const int previous_rel = std::max(0, std::min(previous_abs - left_offset_, text_len_ - 1));
-    // A position attended this many times is a sink, so the search starts one
-    // past it rather than letting the decoder settle on a token it has already
-    // spoken. get_most_attended_text_timestep hardcodes the same constant.
-    constexpr int kMagpieAttendedSinkAdvance = 4;
     int search_start_abs = previous_abs;
     if (previous_abs >= 0 && previous_abs < (int)attended_counts_.size() &&
         attended_counts_[(size_t)previous_abs] >= kMagpieAttendedSinkAdvance) {

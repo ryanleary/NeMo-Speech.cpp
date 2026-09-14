@@ -50,6 +50,11 @@ enum magpietts_conditioning {
     MAGPIETTS_CONDITIONING_CONTEXT_ENCODER,
 };
 
+// A text position attended this many times is treated as a sink: the search for
+// the next one starts past it, and the prior behind it is suppressed. Hardcoded
+// upstream, so hardcoded here.
+inline constexpr int kMagpieAttendedSinkAdvance = 4;
+
 struct magpietts_hparams {
     int32_t text_vocab_size = 0;
     // Real codec codebooks - what the NanoCodec consumes per frame.
@@ -126,8 +131,6 @@ struct magpietts_hparams {
     // token, from ChunkedInferenceConfig. Only multi-chunk runs have a chunk to
     // end early.
     int32_t forceful_chunk_end_threshold = 1;
-    int32_t attention_prior_advance_threshold = 8;
-    int32_t attention_prior_decay_threshold = 10;
     std::vector<int32_t> estimate_alignment_from_layers;
     std::vector<int32_t> apply_prior_to_layers;
 };

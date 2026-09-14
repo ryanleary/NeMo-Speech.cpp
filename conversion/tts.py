@@ -416,16 +416,6 @@ def add_metadata(
         "magpietts.inference.forceful_chunk_end_threshold",
         inf.get("forceful_chunk_end_threshold", 1),
     )
-    add_i32(
-        writer,
-        "magpietts.inference.attention_prior_advance_threshold",
-        inf.get("attention_prior_advance_threshold", 8),
-    )
-    add_i32(
-        writer,
-        "magpietts.inference.attention_prior_decay_threshold",
-        inf.get("attention_prior_decay_threshold", 10),
-    )
     add_i32_array(
         writer,
         "magpietts.inference.estimate_alignment_from_layers",

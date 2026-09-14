@@ -2252,9 +2252,7 @@ struct WaveSession {
         // Without this the chunk resumes at relative 0 and crawls through its
         // own history one token a step, re-speaking it.
         if (ci > 0) {
-            item->prior.seedLastAttendedAbsolute(
-                absolute - 1,
-                std::max(h.attention_prior_advance_threshold, h.attention_prior_decay_threshold));
+            item->prior.seedLastAttendedAbsolute(absolute - 1, kMagpieAttendedSinkAdvance);
         }
         item->prior.beginChunk(h, item->left_offset, item->text_len, (int)current.size(), ci == 0);
         item->audio_codes.assign(h.audio_codebooks, {});
