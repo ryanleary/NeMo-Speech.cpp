@@ -3377,10 +3377,19 @@ stream_magpie_to_audio(
     // it take the workspace exclusively, which parks the engine and everything
     // already in it until it is done. Short texts are the common case in
     // serving, so that is the difference between a tail and a stall.
+    // The wave prefill reads conditioning straight out of the baked table, one
+    // row per lane, so it already carries a voice per lane. A context-encoder
+    // checkpoint has no such table -- its conditioning is a computed prefix
+    // held on the decoder, one for the whole engine -- and lanes belonging to
+    // different requests would all get whichever was set last. Refuse rather
+    // than hand one request another's voice; the prefix has to become a
+    // per-item field of MagpieWavePrefillItem first, beside `speaker`.
+    const bool wave_conditioning_ok = h.conditioning == MAGPIETTS_CONDITIONING_BAKED;
     const bool use_wave = (wave_width > 1) && use_cuda_sampling &&
                           params.use_local_transformer && params.use_cfg &&
                           params.use_kv_cache && params.longform_history_tokens >= 0 &&
-                          wave_attention_ok && wave_width_ok && h.dec_kernel == 1;
+                          wave_attention_ok && wave_width_ok && wave_conditioning_ok &&
+                          h.dec_kernel == 1;
     // Asking for a wave and silently getting sequential decode is the worst
     // outcome, so say which requirement was not met. A single chunk is not
     // a failure: there is no wave to form.
@@ -3391,6 +3400,9 @@ stream_magpie_to_audio(
                           : !params.use_kv_cache          ? "the decoder K/V cache is off"
                           : !wave_attention_ok ? "this build lacks the patched cached attention"
                           : !wave_width_ok     ? "the batched sampler tops out at 256 lanes"
+                          : !wave_conditioning_ok
+                              ? "this checkpoint conditions on a computed context prefix, which "
+                                "the wave cannot yet carry per lane"
                           : h.dec_kernel != 1
                               ? "this model's decoder feed-forward is a convolution"
                               : "the long-form history is adaptive";

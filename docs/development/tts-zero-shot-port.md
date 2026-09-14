@@ -4,7 +4,10 @@ Standalone by convention: zero-shot support stays in its own commits, and the
 general development notes do not link here. Nothing in
 `docs/development/README.md` should point at this file.
 
-Status: analysed, not started. `perf/continuous-batching` is unchanged.
+Status: **landed**, except for one piece. Zero-shot checkpoints run, and clone
+from a reference WAV, on the sequential path. The wave refuses them with a
+diagnostic rather than running them, because its conditioning is still
+decoder-wide. See "What is left" at the end.
 
 ## What to port
 
@@ -97,3 +100,38 @@ share filenames with the public checkpoint's but differ in content.
 - Per-session voices: two concurrent requests with different reference WAVs in
   one wave, each matching its own solo run. This is the case the original
   commits never had to consider and the one most likely to be wrong.
+
+
+## What is left
+
+`MagpieWavePrefillItem` carries `speaker` per item, and its comment says why
+that is enough: "A step never re-supplies it -- the baked context lands in this
+lane's K/V ring here and stays -- so voices only have to be separable at
+admission." The same is true of a computed prefix, which makes this a
+prefill-only change rather than a step-loop one.
+
+What the wave prefill does today is read conditioning straight out of the baked
+table, `ggml_get_rows(model_.baked_context, speaker_in)`, one row per lane. A
+context-encoder checkpoint has no such table -- `model.baked_context` is null --
+and its conditioning is a computed prefix held on `MagpieDecoder`, one for the
+whole engine. Lanes from different requests would all get whichever prefix was
+set last.
+
+So the wave now refuses a context-encoder checkpoint and says so, rather than
+faulting on the null table or, worse, handing one request another's voice.
+
+To lift it:
+
+1. Give `MagpieWavePrefillItem` a `const magpietts_context_prefix* context`
+   beside `speaker`.
+2. In the wave prefill graph, when the checkpoint conditions on a context
+   encoder, build the `[n_embd, ctx_len, items]` conditioning block from each
+   item's prefix instead of the baked row lookup. Every item in one prefill
+   burst already opens at the same length, which is the constraint this needs.
+3. `WaveSession` gains `context_prefix()` the way it has `speaker()`, and
+   `WaveEngine::admit` sets `slot.context = owner.context_prefix()`.
+4. Drop `wave_conditioning_ok`.
+
+The test that matters is the one neither original commit had to consider: two
+concurrent requests with different reference WAVs in one wave, each matching its
+own solo run.
