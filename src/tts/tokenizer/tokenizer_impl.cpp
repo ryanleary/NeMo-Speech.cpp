@@ -688,7 +688,11 @@ split_words_by_limit(const std::string& text, int max_words) {
 
 static std::vector<std::string>
 split_long_sentence_by_commas(const std::string& sentence) {
-    constexpr int kMaxWordsPerPhrase = 35;
+    // magpie_serve packs chunks to max_chunk_chars = 300 and only splits a
+    // sentence on its commas when it is longer than that. 35 words is about 200
+    // characters, so we were cutting ordinary sentences in half and putting a
+    // chunk seam -- and a pause -- where the author put a comma.
+    constexpr int kMaxWordsPerPhrase = 50;
     if (count_ascii_space_words(sentence) <= kMaxWordsPerPhrase) {
         return {sentence};
     }
