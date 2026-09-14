@@ -135,3 +135,36 @@ To lift it:
 The test that matters is the one neither original commit had to consider: two
 concurrent requests with different reference WAVs in one wave, each matching its
 own solo run.
+
+
+## Validation, and where it actually stands
+
+Reference captured from the Python implementation with
+`scripts/tts/capture-magpie-reference.py` (42 text tokens, 215 context frames,
+prefix `[217, 768]`), and compared against ours with
+`scripts/tts/compare-context-prefix.py`:
+
+| conditioning route | cosine | verdict |
+|---|---|---|
+| reference's own context codes | **0.99999851** | context encoder is exact |
+| reference WAV through our codec encoder | 0.632 | codec encoder diverges |
+
+So the decoder, the context encoder and the prefix construction are right. What
+is not is the NanoCodec **encoder** ported in `943f708`: the original port
+recorded 0.99969 for this same route, so ours has a defect. It is not the
+resampler -- ffmpeg and librosa resampling of the reference give the same 0.632
+-- which was the first suspect, because `bf3126c` warns that a differing
+resampler changes the codes silently.
+
+Prime suspect is the conflict resolved in `src/tts/nanocodec/model.cpp` while
+porting the encoder, which needed a closing brace added by hand; and, given what
+the context encoder turned out to need, whether the encoder's convolutions want
+centre padding that ours applies causally.
+
+Note what this cost to find. Listening said the cloned voice was clearly
+conditioned on the reference; the metric said 0.632. Both were true -- FSQ code
+indices differ enough to move the prefix a long way while the speaker identity
+survives decoding. An earlier reading of the same numbers concluded the opposite,
+that the context encoder was at fault, because the two routes were measured
+either side of the padding fix rather than together. Measure both arms after
+every change, or the comparison says nothing.
