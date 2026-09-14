@@ -1,0 +1,14 @@
+# Inference parameters for the pre-release zero-shot MagpieTTS checkpoint.
+#
+# The checkpoint ships none: magpie_serve/engine.py builds
+# ModelInferenceParameters in code, so nothing in the config or the .ckpt says
+# the attention prior should be on. These are that function's values.
+inference_parameters:
+  apply_attention_prior: true
+  attention_prior_epsilon: 0.1
+  attention_prior_lookahead_window: 6
+  estimate_alignment_from_layers: [4, 5, 8, 9]
+  apply_prior_to_layers: [2, 3, 4, 5, 6, 7, 8, 9, 10]
+  start_prior_after_n_audio_steps: 0
+  max_decoder_steps: 500
+  min_generated_frames: 4

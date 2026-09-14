@@ -6,7 +6,7 @@ general development notes do not link here. Nothing in
 
 Status: **landed**. Zero-shot checkpoints run, clone from a reference WAV, and
 batch through the wave at the same rate the baked checkpoint manages -- the
-whole novel in four minutes. What remains is packaging, not capability: see
+whole novel in three minutes. What remains is packaging, not capability: see
 "What is still missing" at the end.
 
 ## What to port
@@ -165,6 +165,42 @@ were overridden.
 Embedding the tokenizer in the GGUF, as the ASR models do, would remove this
 whole directory and the mismatch class with it.
 
+## The checkpoint carries no inference parameters
+
+This one bit cost a whole render. The checkpoint's config has no
+`inference_parameters` block at all: `magpie_serve/engine.py` builds
+`ModelInferenceParameters` in code. Conversion therefore fell back to defaults,
+and the default for `apply_attention_prior` is **false**, with no
+`apply_prior_to_layers` and no `estimate_alignment_from_layers` written either.
+
+The prior is what keeps cross-attention walking the text forward. Without it the
+decoder loops: it reads the first minute correctly and then repeats itself, and
+the repeats are exact -- identical code frames, not merely similar audio. On the
+opening 1,200 characters of the novel, with `--top-k 1`:
+
+| | frames | in a repeat of >= 100 frames | audio |
+|---|---|---|---|
+| baked, sequential | 1,843 | 0% | 85.7 s |
+| baked, wave w=16 | 1,799 | 0% | 83.7 s |
+| zero-shot, no prior, sequential | 2,248 | **14.3%** | 104.6 s |
+| zero-shot, no prior, wave w=16 | 2,826 | **21.7%** | 131.4 s |
+| zero-shot, prior on, sequential | 1,604 | 0% | 74.6 s |
+| zero-shot, prior on, wave w=16 | 1,610 | 0% | 74.9 s |
+
+Two things to take from the table. The looping was never the wave's -- the
+sequential path had it too -- but the wave made it worse, so a bug that had been
+tolerable at one lane became obvious at sixteen. And the tell was in plain sight
+before anyone listened: the same text took 26% longer through the wave than
+through the sequential path, where the baked checkpoint differs by 2%. **A large
+duration difference between two decode paths on identical text is a correctness
+signal, not a voice-pacing one.** It was dismissed as the cloned voice speaking
+more slowly. It was not.
+
+`convert_model.py --inference-yaml` supplies what the checkpoint omits;
+`docs/development/magpie-zero-shot-inference.yaml` holds this checkpoint's
+values, copied from the server. Conversion now warns when it is about to write a
+checkpoint with no prior.
+
 ## Batching zero-shot through the wave
 
 Conditioning is now per lane, which is what `speaker` always was and for the
@@ -220,33 +256,34 @@ Pride and Prejudice (Gutenberg 1342), same text as the baked run, one request,
 |---|---|---|
 | conditioning positions | 110 (table row) | 217 (context encoder) |
 | chunks | -- | 7,072 |
-| output | 12 h 31 m | **15 h 35 m** (1,236,879,360 samples) |
-| wall clock | 3 m 29.7 s | **3 m 58.8 s** |
-| realtime factor | 216.3x | **234.9x** |
-| decoder / codec alone | -- | 451.6x / 277.3x |
-| first audio | -- | 867 ms |
-| peak RSS | 24.9 GB | 26.5 GB |
-| FLAC | 873 MB (44%) | 1.28 GB (52%) |
+| output | 12 h 31 m | **11 h 04 m** (877,853,696 samples) |
+| wall clock | 3 m 29.7 s | **3 m 06.4 s** |
+| realtime factor | 216.3x | **213.5x** |
+| decoder / codec alone | -- | 337.1x / 262.5x |
+| first audio | -- | 878 ms |
+| peak RSS | 24.9 GB | 24.7 GB |
+| FLAC | 873 MB (44%) | 890 MB (53%) |
 
-The cloned voice reads the same book 25% longer -- it is a slower speaker, not a
-slower decoder -- so realtime factor is the number to compare, and it is
-slightly *above* the baked run. Nothing about the conditioning route costs
-throughput; the 5x gap was entirely the wave being switched off.
+Within 1.3% of the baked checkpoint's rate, on a voice that reads the book an
+hour and a half faster (183 words a minute against 162). Nothing about the
+conditioning route costs throughput; the 5x gap was entirely the wave being
+switched off. The decoder's own 337x is below the 451x the same run reached
+without an attention prior, which is what the prior costs: it is applied in nine
+layers and alignment is estimated from four more.
 
-Levels sampled at 60 s, 22,000 s, 44,000 s and 55,000 s: mean -21 to -23 dB,
-peak -3.5 to -4.1 dB. Consistent across the whole book, no silence, no clipping.
+Levels sampled at 60 s, 15,000 s, 30,000 s and 39,000 s: mean -20.5 to -21.8 dB,
+peak -2.6 to -3.9 dB. Consistent across the whole book, no silence, no clipping.
 
-Run to run the sample count moves by about 0.5% (1.2427 G against 1.2369 G on
-two runs of the same command). That is the documented lane dependence: which
-lane a chunk lands in depends on admission timing, and the arithmetic depends on
-the lane.
+Run to run the sample count moves by a fraction of a percent. That is the
+documented lane dependence: which lane a chunk lands in depends on admission
+timing, and the arithmetic depends on the lane.
 
 ---
 
 # What is still missing
 
 The demo works: `synthesize -i pride.txt --tts.context-audio <voice>.wav`
-renders the novel in a cloned voice at 234.9x. Three things stand between that
+renders the novel in a cloned voice at 213.5x. Three things stand between that
 and a checkpoint anyone can run.
 
 ## Gap 1 -- the tokenizer has to be hand-built
@@ -309,6 +346,7 @@ W=~/devel/magpie-tts-server/magpie_tts_weights
 NEMO_SPEECH_TOKENIZER_PROFILE=v2607 python convert_model.py \
     $W/Magpie-TTS--val_cer_gt=0.3605-step=1200.ckpt \
     --config-yaml $W/config_v3_nostress_fixed.local.yaml \
+    --inference-yaml <repo>/docs/development/magpie-zero-shot-inference.yaml \
     --outfile magpie-zs.f16.gguf --outtype f16
 python convert_model.py $W/21fps_causal_codecmodel.nemo \
     --with-codec-encoder --outfile nanocodec-enc.f16.gguf --outtype f16
@@ -358,6 +396,9 @@ if you need to compare those instead.
   entirely wrong diagnosis.
 - Listening and the metric can both be right. A cloned voice sounded correct
   while the prefix cosine was 0.63: different windows of the same speaker.
+- A duration difference between two decode paths on the same text is a bug until
+  proved otherwise. 26% was explained away as a slower voice; it was the decoder
+  looping.
 - A full `cmake --build` that fails late can leave a stale `nemo-speech` behind,
   and the next benchmark silently measures the previous build. Fixed for the ASR
   test, but check the binary's timestamp when a result surprises you.
