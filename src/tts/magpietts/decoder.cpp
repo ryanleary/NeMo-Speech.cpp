@@ -953,9 +953,12 @@ class PersistentDecoderModule final : public ggml_runtime::Module {
 }  // namespace
 
 static int
-checked_persistent_cache_len(const magpietts_model& model, int stacked_position_budget) {
-    const int64_t cache_len =
-        static_cast<int64_t>(model.hparams.baked_context_length) + stacked_position_budget - 1;
+checked_persistent_cache_len(
+    const magpietts_model& model, int stacked_position_budget, int context_len) {
+    // The conditioning prefix opens every sequence, so it sets where the ring
+    // starts. A baked checkpoint's is the table's fixed width; a zero-shot one's
+    // is whatever the context encoder produced, which is not the same number.
+    const int64_t cache_len = static_cast<int64_t>(context_len) + stacked_position_budget - 1;
     if (cache_len <= 0 || cache_len >= model.hparams.n_ctx) {
         throw std::runtime_error("invalid persistent Magpie decoder cache length");
     }
@@ -966,11 +969,11 @@ class MagpieDecoder::PersistentDecoderRuntime {
    public:
     PersistentDecoderRuntime(
         const magpietts_model& model, const DecoderCrossKvCache& cross_kv, int text_len,
-        int stacked_position_budget, int items = 1,
+        int stacked_position_budget, int context_len, int items = 1,
         std::vector<const DecoderCrossKvCache*> item_cross_kv = {})
         : model_(model), cross_kv_(&cross_kv), text_len_(text_len),
-          stacked_position_budget_(stacked_position_budget),
-          cache_len_(checked_persistent_cache_len(model, stacked_position_budget)),
+          stacked_position_budget_(stacked_position_budget), context_len_(context_len),
+          cache_len_(checked_persistent_cache_len(model, stacked_position_budget, context_len)),
           lanes_(kMagpieCfgLanesPerItem * items), wave_(!item_cross_kv.empty()),
           backend_manager_(ggml_runtime::Params{true, 0, nullptr}, model.backend),
           module_(model, cross_kv, text_len, cache_len_, lanes_, std::move(item_cross_kv)),
@@ -1134,9 +1137,10 @@ class MagpieDecoder::PersistentDecoderRuntime {
     }
 
     bool matches(
-        const DecoderCrossKvCache* cross_kv, int text_len, int stacked_position_budget) const {
+        const DecoderCrossKvCache* cross_kv, int text_len, int stacked_position_budget,
+        int context_len) const {
         return cross_kv == cross_kv_ && text_len == text_len_ &&
-               stacked_position_budget == stacked_position_budget_;
+               stacked_position_budget == stacked_position_budget_ && context_len == context_len_;
     }
 
     // A wave's graph bakes in its width, the text window its cross arena is
@@ -1148,6 +1152,8 @@ class MagpieDecoder::PersistentDecoderRuntime {
     }
 
     bool sequence_matches(int n_tokens) const { return n_tokens == n_tokens_[0]; }
+
+    int contextLen() const { return context_len_; }
 
     int items() const { return items_(); }
 
@@ -1253,18 +1259,41 @@ class MagpieDecoder::PersistentDecoderRuntime {
                 return false;
             }
         }
-        const int total_len = h.baked_context_length + audio_len;
+        const int total_len = context_len_ + audio_len;
         if (audio_len <= 0 || total_len > cache_len_) {
             return false;
         }
 
         std::vector<std::pair<std::string, std::vector<int32_t>>> i32_inputs;
         std::vector<std::pair<std::string, std::vector<float>>> f32_inputs;
-        std::vector<int32_t> speakers(static_cast<size_t>(items));
-        for (int at = 0; at < items; ++at) {
-            speakers[static_cast<size_t>(at)] = wave[static_cast<size_t>(at)].speaker;
+        // A checkpoint either looks its conditioning up by speaker or computes it
+        // from reference audio; which one it is does not vary lane by lane, so
+        // the first item decides and the rest are checked against it.
+        const bool computed_context =
+            wave.front().context != nullptr && wave.front().context->computed();
+        if (computed_context) {
+            // Item-major, which is what [n_embd, context_len_, items] is.
+            const size_t per_item =
+                static_cast<size_t>(h.n_embd) * static_cast<size_t>(context_len_);
+            std::vector<float> block(per_item * static_cast<size_t>(items));
+            for (int at = 0; at < items; ++at) {
+                const magpietts_context_prefix* prefix = wave[static_cast<size_t>(at)].context;
+                if (!prefix || !prefix->computed() || prefix->len != context_len_ ||
+                    prefix->values->size() != per_item) {
+                    return false;
+                }
+                std::copy(
+                    prefix->values->begin(), prefix->values->end(),
+                    block.begin() + static_cast<size_t>(at) * per_item);
+            }
+            f32_inputs.push_back({std::string("magpietts_prefill_context"), std::move(block)});
+        } else {
+            std::vector<int32_t> speakers(static_cast<size_t>(items));
+            for (int at = 0; at < items; ++at) {
+                speakers[static_cast<size_t>(at)] = wave[static_cast<size_t>(at)].speaker;
+            }
+            i32_inputs.push_back({std::string("magpietts_prefill_speaker"), std::move(speakers)});
         }
-        i32_inputs.push_back({std::string("magpietts_prefill_speaker"), std::move(speakers)});
         for (int codebook = 0; codebook < h.stacked_audio_codebooks(); ++codebook) {
             // Item-major, so a reshape turns one get_rows into [n_embd, T, items].
             std::vector<int32_t> rows(static_cast<size_t>(items) * audio_len);
@@ -1299,7 +1328,21 @@ class MagpieDecoder::PersistentDecoderRuntime {
                         std::log(std::max((*prior)[static_cast<size_t>(i)], 1.0e-20f));
             }
         }
-        f32_inputs.push_back({"magpietts_prefill_prior", std::move(log_prior)});
+        // An input nothing reads is pruned from the graph and then cannot be
+        // bound by name, so the prior exists only where a layer applies it. Not
+        // every checkpoint does.
+        bool prior_used = false;
+        for (int layer_index = 0; layer_index < static_cast<int>(tr.layers.size()); ++layer_index) {
+            if (tr.has_cross && tr.layers[static_cast<size_t>(layer_index)].has_cross &&
+                tr.apply_attention_prior &&
+                runtime_layer_selected(tr.apply_prior_to_layers, layer_index)) {
+                prior_used = true;
+                break;
+            }
+        }
+        if (prior_used) {
+            f32_inputs.push_back({"magpietts_prefill_prior", std::move(log_prior)});
+        }
 
         // Node count is dominated by the layer body; the K/V appends and the
         // alignment reduction are a fixed tail.
@@ -1312,14 +1355,23 @@ class MagpieDecoder::PersistentDecoderRuntime {
         ggml_context* ctx = sized_graph_context(graph_nodes);
         ggml_cgraph* gf = ggml_new_graph_custom(ctx, graph_nodes, false);
 
-        ggml_tensor* speaker_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, items);
-        ggml_set_name(speaker_in, "magpietts_prefill_speaker");
-        ggml_set_input(speaker_in);
-        // One row of baked_context holds a whole speaker context, so items rows
-        // is the whole wave.
-        ggml_tensor* baked = ggml_reshape_3d(
-            ctx, ggml_get_rows(ctx, model_.baked_context, speaker_in), h.n_embd,
-            h.baked_context_length, items);
+        ggml_tensor* baked = nullptr;
+        if (computed_context) {
+            // The lanes' prefixes arrive already computed, one block each, in the
+            // shape the baked lookup would have produced.
+            baked = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, h.n_embd, context_len_, items);
+            ggml_set_name(baked, "magpietts_prefill_context");
+            ggml_set_input(baked);
+        } else {
+            ggml_tensor* speaker_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, items);
+            ggml_set_name(speaker_in, "magpietts_prefill_speaker");
+            ggml_set_input(speaker_in);
+            // One row of baked_context holds a whole speaker context, so items rows
+            // is the whole wave.
+            baked = ggml_reshape_3d(
+                ctx, ggml_get_rows(ctx, model_.baked_context, speaker_in), h.n_embd, context_len_,
+                items);
+        }
 
         ggml_tensor* audio = nullptr;
         for (int codebook = 0; codebook < h.stacked_audio_codebooks(); ++codebook) {
@@ -1346,9 +1398,12 @@ class MagpieDecoder::PersistentDecoderRuntime {
         ggml_set_input(pos);
         x = ggml_add(ctx, x, ggml_get_rows(ctx, tr.pos_emb, pos));
 
-        ggml_tensor* prior = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, text_len_, items);
-        ggml_set_name(prior, "magpietts_prefill_prior");
-        ggml_set_input(prior);
+        ggml_tensor* prior = nullptr;
+        if (prior_used) {
+            prior = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, text_len_, items);
+            ggml_set_name(prior, "magpietts_prefill_prior");
+            ggml_set_input(prior);
+        }
 
         // Where this run's chunks are to be found, in admission order. A
         // contiguous run is an offset into the lane-ordered arena; a scatter was
@@ -1627,7 +1682,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
                 return false;
         }
         const int total_len =
-            h.baked_context_length + static_cast<int>(raw_len / h.frame_stacking_factor);
+            context_len_ + static_cast<int>(raw_len / h.frame_stacking_factor);
         if (total_len != n_tokens_[0] + 1 || n_tokens_[0] >= cache_len_)
             return false;
 
@@ -1759,7 +1814,7 @@ class MagpieDecoder::PersistentDecoderRuntime {
             // so it is held to nothing but in-range tokens.
             if (slot.live) {
                 const int total_len =
-                    h.baked_context_length + static_cast<int>(raw_len / h.frame_stacking_factor);
+                    context_len_ + static_cast<int>(raw_len / h.frame_stacking_factor);
                 if (total_len != n_tokens_[static_cast<size_t>(item)] + 1 ||
                     n_tokens_[static_cast<size_t>(item)] >= cache_len_) {
                     return false;
@@ -1958,6 +2013,8 @@ class MagpieDecoder::PersistentDecoderRuntime {
     const DecoderCrossKvCache* cross_kv_ = nullptr;
     int text_len_ = 0;
     int stacked_position_budget_ = 0;
+    // Positions the conditioning prefix occupies at the head of every sequence.
+    int context_len_ = 0;
     int cache_len_ = 0;
     int lanes_ = kMagpieCfgLanes;
     bool wave_ = false;
@@ -2042,6 +2099,25 @@ MagpieDecoder::prefillWave(
         static_cast<int>(items.size()) > width || model_.hparams.dec_kernel != 1) {
         return false;
     }
+    // The conditioning prefix sets where every lane's sequence starts, so the
+    // runtime is sized to it. It is a property of the checkpoint, not of a
+    // request: a baked table has one width, and a context encoder pads to one
+    // fixed length. Lanes that disagree would need different ring arithmetic, so
+    // refuse rather than open a runtime one of them does not fit.
+    const magpietts_context_prefix* first_context = items.front().context;
+    const bool computed_context = first_context && first_context->computed();
+    const int context_len =
+        computed_context ? first_context->len : model_.hparams.baked_context_length;
+    if (context_len <= 0) {
+        return false;
+    }
+    for (const MagpieWavePrefillItem& item : items) {
+        const bool computed = item.context && item.context->computed();
+        if (computed != computed_context || (computed && item.context->len != context_len)) {
+            fprintf(stderr, "MagpieTTS wave: lanes disagree on conditioning length\n");
+            return false;
+        }
+    }
     std::vector<const DecoderCrossKvCache*> item_cross_kv;
     item_cross_kv.reserve(items.size());
     int text_len = 0;
@@ -2065,7 +2141,8 @@ MagpieDecoder::prefillWave(
             // Open at the full width with every lane empty. Chunks arrive lane by
             // lane from here on, including this first cohort.
             wave_runtime_ = std::make_unique<PersistentDecoderRuntime>(
-                model_, *items.front().cross_kv, text_len, stacked_position_budget, width,
+                model_, *items.front().cross_kv, text_len, stacked_position_budget, context_len,
+                width,
                 std::vector<const DecoderCrossKvCache*>(static_cast<size_t>(width), nullptr));
             fprintf(
                 stderr,
@@ -2073,7 +2150,7 @@ MagpieDecoder::prefillWave(
                 "device K/V arena enabled\n",
                 width);
         }
-        if (wave_runtime_->items() == width &&
+        if (wave_runtime_->items() == width && wave_runtime_->contextLen() == context_len &&
             wave_runtime_->waveFits(text_len, stacked_position_budget) &&
             wave_runtime_->refillWaveCross(lanes, item_cross_kv) &&
             wave_runtime_->prefill(
@@ -2133,8 +2210,9 @@ MagpieDecoder::evalCachedPair(
         cond_kv.n_tokens == uncond_kv.n_tokens;
     if (persistent_candidate) {
         try {
-            if (persistent_runtime_ &&
-                !persistent_runtime_->matches(cond_cross_kv, text_len, stacked_position_budget)) {
+            if (persistent_runtime_ && !persistent_runtime_->matches(
+                                           cond_cross_kv, text_len, stacked_position_budget,
+                                           contextLength())) {
                 // Cross-cache address, shape, or request budget changes require a new graph.
                 persistent_runtime_.reset();
                 cond_kv.clear();
@@ -2142,7 +2220,7 @@ MagpieDecoder::evalCachedPair(
             }
             if (cond_kv.n_tokens > 0 && !persistent_runtime_) {
                 persistent_runtime_ = std::make_unique<PersistentDecoderRuntime>(
-                    model_, *cond_cross_kv, text_len, stacked_position_budget);
+                    model_, *cond_cross_kv, text_len, stacked_position_budget, contextLength());
                 persistent_runtime_->seed(cond_kv, uncond_kv);
                 fprintf(
                     stderr,

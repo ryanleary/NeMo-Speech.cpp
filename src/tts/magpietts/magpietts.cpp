@@ -2056,6 +2056,10 @@ struct WaveSession {
     // what the decode-throughput measurement needs.
     bool discard_audio = false;
     int64_t discarded_frames = 0;
+    // The voice this request clones, for checkpoints that compute conditioning
+    // from reference audio. Null on baked checkpoints, where `speaker` says it
+    // instead. Borrowed: the storage is the request's and outlives the session.
+    const magpietts_context_prefix* request_context = nullptr;
 
     // Where the session is in the engine's hands. Ordered so that anything at
     // `completed` or beyond is terminal, which is what a submitter waits on.
@@ -2305,6 +2309,7 @@ struct WaveSession {
     // wave carries chunks from several requests these differ lane by lane, so
     // the engine reads them through the lane's owner.
     int speaker() const { return params.speaker; }
+    const magpietts_context_prefix* context_prefix() const { return request_context; }
     int position_budget() const {
         return (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
     }
@@ -2460,6 +2465,7 @@ struct WaveEngine {
             slot.text_cond_device = &item.text_cond_device;
             slot.text_len = item.text_len;
             slot.speaker = owner.speaker();
+            slot.context = owner.context_prefix();
             slot.audio_codes = &item.audio_codes;
             slot.cross_kv = &item.cross_kv;
             slot.prior = item.prior.priorForStep(mh, item.text_len);
@@ -3377,19 +3383,14 @@ stream_magpie_to_audio(
     // it take the workspace exclusively, which parks the engine and everything
     // already in it until it is done. Short texts are the common case in
     // serving, so that is the difference between a tail and a stall.
-    // The wave prefill reads conditioning straight out of the baked table, one
-    // row per lane, so it already carries a voice per lane. A context-encoder
-    // checkpoint has no such table -- its conditioning is a computed prefix
-    // held on the decoder, one for the whole engine -- and lanes belonging to
-    // different requests would all get whichever was set last. Refuse rather
-    // than hand one request another's voice; the prefix has to become a
-    // per-item field of MagpieWavePrefillItem first, beside `speaker`.
-    const bool wave_conditioning_ok = h.conditioning == MAGPIETTS_CONDITIONING_BAKED;
+    // Conditioning is per lane either way: a baked checkpoint looks a row up by
+    // the lane's speaker, a zero-shot one is handed the lane's computed prefix.
+    // Both land in that lane's K/V ring at admission and stay, so two requests
+    // cloning different voices can share one wave.
     const bool use_wave = (wave_width > 1) && use_cuda_sampling &&
                           params.use_local_transformer && params.use_cfg &&
                           params.use_kv_cache && params.longform_history_tokens >= 0 &&
-                          wave_attention_ok && wave_width_ok && wave_conditioning_ok &&
-                          h.dec_kernel == 1;
+                          wave_attention_ok && wave_width_ok && h.dec_kernel == 1;
     // Asking for a wave and silently getting sequential decode is the worst
     // outcome, so say which requirement was not met. A single chunk is not
     // a failure: there is no wave to form.
@@ -3400,9 +3401,6 @@ stream_magpie_to_audio(
                           : !params.use_kv_cache          ? "the decoder K/V cache is off"
                           : !wave_attention_ok ? "this build lacks the patched cached attention"
                           : !wave_width_ok     ? "the batched sampler tops out at 256 lanes"
-                          : !wave_conditioning_ok
-                              ? "this checkpoint conditions on a computed context prefix, which "
-                                "the wave cannot yet carry per lane"
                           : h.dec_kernel != 1
                               ? "this model's decoder feed-forward is a convolution"
                               : "the long-form history is adaptive";
@@ -3480,6 +3478,9 @@ stream_magpie_to_audio(
     // is constant for the whole request, so it is computed once here and the
     // storage must outlive every eval below.
     std::vector<float> context_prefix;
+    // The same prefix the decoder is given, in the form a wave lane takes it:
+    // the sequential path reads it off the decoder, the wave off the session.
+    magpietts_context_prefix request_prefix;
     decoder.clearContextPrefix();
     if (h.conditioning == MAGPIETTS_CONDITIONING_CONTEXT_ENCODER) {
         if (params.context_audio_file.empty() && params.context_codes_file.empty()) {
@@ -3518,6 +3519,8 @@ stream_magpie_to_audio(
             return false;
         }
         decoder.setContextPrefix(context_prefix, context_len);
+        request_prefix.values = &context_prefix;
+        request_prefix.len = context_len;
         if (params.verbose) {
             fprintf(
                 stderr, "%s context: %zu codec frames -> %d conditioning positions\n", label,
@@ -3616,6 +3619,8 @@ stream_magpie_to_audio(
                     session_frames[(size_t)i], session_frames[(size_t)i], boundary_silence_rng,
                     boundary_silence_dist}));
                 sessions.back()->discard_audio = true;
+                sessions.back()->request_context =
+                    request_prefix.computed() ? &request_prefix : nullptr;
                 if (!sessions.back()->plan_chunks()) {
                     return end_run();
                 }
@@ -3762,6 +3767,7 @@ stream_magpie_to_audio(
                                 decoder_frames_generated,
                                 boundary_silence_rng,
                                 boundary_silence_dist};
+            session.request_context = request_prefix.computed() ? &request_prefix : nullptr;
             if (!session.plan_chunks()) {
                 return end_run();
             }

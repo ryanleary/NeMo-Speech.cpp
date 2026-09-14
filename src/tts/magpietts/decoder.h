@@ -76,7 +76,9 @@ struct MagpieWaveDecodeItem {
     bool live = true;
 };
 
-// One chunk's opening in a wave. A wave prefills every chunk's baked context
+struct magpietts_context_prefix;
+
+// One chunk's opening in a wave. A wave prefills every chunk's conditioning
 // through one graph, so the scheduler hands the whole group over at once.
 struct MagpieWavePrefillItem {
     const std::vector<float>* text_cond = nullptr;
@@ -86,6 +88,11 @@ struct MagpieWavePrefillItem {
     // lands in this lane's K/V ring here and stays -- so voices only have to be
     // separable at admission, and lanes opened together may differ.
     int speaker = 0;
+    // The chunk's own conditioning prefix, for checkpoints that compute one from
+    // reference audio instead of looking a speaker up in a table. Null means the
+    // baked table; a computed prefix is per lane for the same reason `speaker`
+    // is, and lands in the ring at the same moment.
+    const magpietts_context_prefix* context = nullptr;
     const std::vector<std::vector<int32_t>>* audio_codes = nullptr;
     DecoderCrossKvCache* cross_kv = nullptr;
     // Length is this chunk's own text_len, not the wave's widest.
