@@ -66,6 +66,13 @@ def parse_args() -> argparse.Namespace:
         "model config itself or a hparams file with a top-level 'cfg:' key",
     )
     parser.add_argument(
+        "--inference-yaml",
+        type=Path,
+        help="inference parameters for a MagpieTTS checkpoint that carries none of its own "
+        "(attention prior, alignment layers, decode limits); merged over whatever the model "
+        "config provides",
+    )
+    parser.add_argument(
         "--with-codec-encoder",
         action="store_true",
         help="also convert the NanoCodec audio encoder (wav -> codes), needed to derive "
@@ -116,6 +123,7 @@ def main() -> int:
         metadata_json=args.metadata_json,
         local_transformer_outtype=args.local_transformer_outtype,
         config_yaml=args.config_yaml,
+        inference_yaml=args.inference_yaml,
         with_codec_encoder=args.with_codec_encoder,
         silero_version=args.silero_version,
         from_whisper_ggml=args.from_whisper_ggml,

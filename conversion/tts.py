@@ -431,6 +431,17 @@ def add_metadata(
         "magpietts.inference.apply_prior_to_layers",
         inf.get("apply_prior_to_layers"),
     )
+    if not inf.get("apply_attention_prior", False):
+        print(
+            "warning: this checkpoint's config sets no attention prior, so none is written.\n"
+            "         The prior is what keeps cross-attention walking the text forward; "
+            "without\n"
+            "         it long inputs loop, repeating seconds of audio verbatim. If the model "
+            "is\n"
+            "         served with a prior (NeMo's own servers set one in code, not in the "
+            "config),\n"
+            "         pass --inference-yaml with those values."
+        )
 
     return summary
 
@@ -520,6 +531,7 @@ def convert(
     metadata_json: Path | None = None,
     local_transformer_outtype: str | None = None,
     config_yaml: Path | None = None,
+    inference_yaml: Path | None = None,
 ) -> None:
     root: Path | None = None
     tmp: tempfile.TemporaryDirectory[str] | None = None
@@ -550,6 +562,20 @@ def convert(
             )
 
         sd = {k: v for k, v in sd.items() if not k.startswith(TRAINING_ONLY_PREFIXES)}
+
+        # A model served from Python can have its inference parameters set in the
+        # serving code rather than in any file it ships, and then the checkpoint
+        # says nothing about the attention prior -- which the decoder needs to
+        # walk the text monotonically. Without it long inputs loop: whole seconds
+        # of audio come back repeated verbatim.
+        if inference_yaml is not None:
+            overrides = read_sidecar_config(inference_yaml)
+            if "inference_parameters" in overrides:
+                overrides = overrides["inference_parameters"] or {}
+            merged = dict(cfg.get("inference_parameters") or {})
+            merged.update(overrides)
+            cfg = dict(cfg)
+            cfg["inference_parameters"] = merged
 
         output.parent.mkdir(parents=True, exist_ok=True)
         writer = gguf.GGUFWriter(output, "magpietts")

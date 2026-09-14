@@ -30,6 +30,11 @@ class ConversionRequest:
     # Sidecar model config for a bare Lightning .ckpt, which carries weights but
     # no usable model_config.yaml.
     config_yaml: Path | None = None
+    # Inference parameters for a checkpoint whose config carries none. A model
+    # served from Python can have them set in the serving code rather than in
+    # any file, and then nothing in the checkpoint says the attention prior
+    # should be on.
+    inference_yaml: Path | None = None
     # Convert the codec's audio encoder as well as its decoder.
     with_codec_encoder: bool = False
     silero_version: str = "6.2.0"
@@ -258,6 +263,7 @@ def convert_model(request: ConversionRequest) -> str:
             request.metadata_json,
             request.local_transformer_outtype,
             request.config_yaml,
+            request.inference_yaml,
         )
     elif architecture == "codec":
         from . import codec
