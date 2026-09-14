@@ -41,14 +41,32 @@ enum magpietts_uma_mode {
     MAGPIETTS_UMA_ON,
 };
 
+// How the decoder gets its conditioning prefix. The two are the same tensor
+// produced at different times: a baked row is a cached context-encoder output.
+enum magpietts_conditioning {
+    // A table of precomputed prefixes, one per stock speaker.
+    MAGPIETTS_CONDITIONING_BAKED,
+    // Computed at inference from reference-audio codec codes (zero-shot).
+    MAGPIETTS_CONDITIONING_CONTEXT_ENCODER,
+};
+
 struct magpietts_hparams {
     int32_t text_vocab_size = 0;
+    // Real codec codebooks - what the NanoCodec consumes per frame.
     int32_t audio_codebooks = 8;
+    // Codebooks the model emits per decoder step: audio_codebooks *
+    // frame_stacking_factor. Indexes the audio embedding tables, the local
+    // transformer output projections, and the final-projection logits, all of
+    // which carry one entry per (codebook, stack slot) pair.
+    int32_t emit_codebooks = 8;
     int32_t audio_codebook_size = 2016;
     int32_t audio_vocab_size = 2024;
     int32_t audio_bos_id = 2016;
     int32_t audio_eos_id = 2017;
+    int32_t context_audio_bos_id = 2018;
+    int32_t context_audio_eos_id = 2019;
     int32_t mask_token_id = 2020;
+    // Codec frames emitted per decoder step.
     int32_t frame_stacking_factor = 1;
 
     // Number of model prediction slots in one decoder position.  v2602 has
@@ -72,10 +90,27 @@ struct magpietts_hparams {
     int32_t lt_heads = 1;
     int32_t lt_hidden = 256;
     int32_t lt_ctx = 10;
+    // NeMo only builds the input projection when lt_hidden != n_embd; when it
+    // is absent the step is the identity.
+    bool has_lt_in_projection = true;
+
+    magpietts_conditioning conditioning = MAGPIETTS_CONDITIONING_BAKED;
 
     int32_t baked_context_length = 110;
     int32_t baked_context_dim = 768;
     int32_t baked_speakers = 5;
+
+    int32_t ctx_enc_layer = 1;
+    int32_t ctx_enc_head = 12;
+    int32_t ctx_enc_kernel = 3;
+    bool ctx_enc_causal = false;
+    int32_t ctx_enc_max_positions = 2048;
+    // NeMo pads the conditioning sequence to a fixed length derived from
+    // context_duration_max and the codec frame rate, then runs the context
+    // encoder over the padding as valid positions. The padded rows are not
+    // inert: a bidirectional encoder mixes them into every output, so the
+    // prefix is wrong without them. 0 means "no padding" (older exports).
+    float ctx_enc_max_duration_s = 0.0f;
 
     int32_t max_decoder_steps = 500;
     int32_t top_k = 80;
@@ -295,7 +330,9 @@ class MagpieModel {
     bool cuda_unified_memory = false;
 
     ggml_tensor* text_embedding = nullptr;
+    // One per (codebook, stack slot); size is hparams.emit_codebooks.
     std::vector<ggml_tensor*> audio_embeddings;
+    // Baked conditioning only; null for context-encoder checkpoints.
     ggml_tensor* baked_context = nullptr;
     ggml_tensor* final_proj_w = nullptr;
     ggml_tensor* final_proj_b = nullptr;
@@ -307,6 +344,8 @@ class MagpieModel {
     magpietts_transformer encoder;
     magpietts_transformer decoder;
     magpietts_transformer local;
+    // Context-encoder conditioning only; empty otherwise.
+    magpietts_transformer context_encoder;
 };
 
 using magpietts_model = MagpieModel;

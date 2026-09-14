@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 set(MAGPIETTS_MODEL_SOURCES
     audio_pp.cpp
+    context.cpp
     decoder.cpp
     encoder.cpp
     lt.cpp

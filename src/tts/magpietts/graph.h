@@ -39,6 +39,10 @@ as_f32_contig(ggml_context* ctx, ggml_tensor* t) {
 
 ggml_tensor* layer_norm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight);
 ggml_tensor* linear(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x, ggml_tensor* b = nullptr);
+// Feed-forward convolution. `causal` selects left-padding (autoregressive
+// stacks) or symmetric padding (bidirectional ones, e.g. the context encoder).
+ggml_tensor* conv1d(
+    ggml_context* ctx, ggml_tensor* x, const std::vector<ggml_tensor*>& kernels, bool causal);
 ggml_tensor* causal_conv1d(
     ggml_context* ctx, ggml_tensor* x, const std::vector<ggml_tensor*>& kernels);
 ggml_tensor* self_attention(

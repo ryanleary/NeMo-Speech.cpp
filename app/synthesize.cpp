@@ -8,7 +8,9 @@
 #include <fstream>
 #include <mutex>
 #include <random>
+#include <sstream>
 #include <stdexcept>
+#include <vector>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,6 +30,31 @@
 #include "parameter_parser.h"
 
 namespace {
+
+// Whitespace- or comma-separated token IDs, as written by
+// scripts/tts/dump-magpie-reference.py.
+std::vector<int32_t>
+read_token_ids(const std::string& path) {
+    std::ifstream in(path);
+    if (!in)
+        throw std::runtime_error("failed to open token file: " + path);
+    std::vector<int32_t> tokens;
+    std::string word;
+    while (in >> word) {
+        for (char& c : word) {
+            if (c == ',')
+                c = ' ';
+        }
+        std::istringstream parts(word);
+        long value = 0;
+        while (parts >> value)
+            tokens.push_back((int32_t)value);
+    }
+    if (tokens.empty())
+        throw std::runtime_error("token file contains no token IDs: " + path);
+    return tokens;
+}
+
 
 void
 write_audio(const std::filesystem::path& path, const std::string& audio, bool force) {
@@ -73,6 +100,8 @@ print_synthesize_help(const char* program) {
         "  --codec-model MODEL       NanoCodec GGUF path or indexed HF repo\n"
         "                            (default: nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps)\n"
         "  --tokenizer-dir MODEL     Tokenizer directory or indexed HF repo\n"
+        "  --context-codes PATH      Reference-audio codec codes (zero-shot voice cloning)\n"
+        "  --tokens-file PATH        Synthesize pre-tokenized text token IDs instead of TEXT\n"
         "                            (default: MagpieTTS repository)\n"
         "  --tn-model-dir DIR        Optional text-normalization grammars\n"
         "  -i, --input PATH          Read text from a UTF-8 file\n"
@@ -123,7 +152,7 @@ command_synthesize(int argc, char** argv) {
             parser.ApplyYaml(config_file);
         parser.ApplyEnv("NEMO_SPEECH");
 
-        std::string text, input_path, output_path = "speech.wav", language, voice;
+        std::string text, input_path, output_path = "speech.wav", language, voice, tokens_path;
         std::string format = "wav";
         int concurrency = 1;
         int arrival_ms = 0;
@@ -171,6 +200,10 @@ command_synthesize(int argc, char** argv) {
                 parsed.runtime.codec_model = value(i, arg);
             else if (arg == "--tokenizer-dir")
                 parsed.tokenizer_model_dir = value(i, arg);
+            else if (arg == "--context-codes")
+                parsed.runtime.context_codes_file = value(i, arg);
+            else if (arg == "--tokens-file")
+                tokens_path = value(i, arg);
             else if (arg == "--tn-model-dir")
                 parsed.tn_model_dir = value(i, arg);
             else if (arg == "--input" || arg == "-i")
@@ -274,15 +307,27 @@ command_synthesize(int argc, char** argv) {
         if (warmup)
             synthesizer->warmup("Hello", 1);
 
+        std::string pcm;
+        const auto append = [&](const auto&, const std::string& chunk) {
+            pcm += chunk;
+            return true;
+        };
+        // The request is built once; which of the three paths runs it differs.
         nemo_speech::tts::SynthesisRequest request;
         request.text = text;
         request.language_code = language;
         request.voice_name = voice;
         request.output_sample_rate = output_rate;
         request.options = request_options;
-        std::string pcm;
         nemo_speech::tts::SynthesisResult result;
-        if (concurrency > 1) {
+        if (!tokens_path.empty()) {
+            // Bypasses the tokenizer entirely. A custom checkpoint's text
+            // vocabulary generally differs from the packaged tokenizer's, so
+            // this is how to drive one whose assets are not in .nemo form, and
+            // how to compare token-for-token against a reference implementation.
+            result = synthesizer->synthesize_tokens(
+                read_token_ids(tokens_path), request_options, output_rate, append);
+        } else if (concurrency > 1) {
             // Fire the same request from N threads at one synthesizer. What it
             // measures is whether they share the wave: aggregate realtime
             // factor against a single request's, at the same time to first

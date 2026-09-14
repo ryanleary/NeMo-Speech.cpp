@@ -165,6 +165,7 @@ class MagpieTtsRuntime::Impl {
         magpie_stream_params params;
         params.magpie_model = config_.magpie_model;
         params.codec_model = config_.codec_model;
+        params.context_codes_file = config_.context_codes_file;
         params.tokens = tokens;
         params.token_chunks = token_chunks;
         params.warmup_tokens = tokens;

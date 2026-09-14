@@ -27,6 +27,9 @@ class ConversionRequest:
     max_seq_length: int = 128
     metadata_json: Path | None = None
     local_transformer_outtype: str | None = None
+    # Sidecar model config for a bare Lightning .ckpt, which carries weights but
+    # no usable model_config.yaml.
+    config_yaml: Path | None = None
     silero_version: str = "6.2.0"
     from_whisper_ggml: Path | None = None
     llama_cpp: Path | None = None
@@ -75,7 +78,33 @@ def _resolve_nemo_for_detection(
     raise RuntimeError(f"no supported checkpoint found in {request.source}")
 
 
+def _local_lightning_checkpoint(request: ConversionRequest) -> Path | None:
+    """A bare Lightning .ckpt, which only MagpieTTS conversion accepts.
+
+    These carry no `model_config.yaml`, so the architecture cannot be sniffed
+    from the file; it comes from the sidecar the caller must supply.
+    """
+    local = Path(request.source).expanduser()
+    if local.is_file() and local.suffix.lower() == ".ckpt":
+        return local
+    return None
+
+
 def detect_architecture(request: ConversionRequest) -> tuple[str, Path | None]:
+    lightning = _local_lightning_checkpoint(request)
+    if lightning is not None:
+        if request.architecture not in ("auto", "tts"):
+            raise ValueError(
+                f"a Lightning .ckpt is only supported for --architecture tts, "
+                f"not {request.architecture}"
+            )
+        if request.config_yaml is None:
+            raise RuntimeError(
+                f"{lightning.name} is a bare Lightning checkpoint; pass --config-yaml "
+                "with the model config it is served under"
+            )
+        return "tts", lightning
+
     if request.architecture != "auto":
         if request.architecture not in ARCHITECTURES:
             raise ValueError(f"unknown architecture: {request.architecture}")
@@ -226,6 +255,7 @@ def convert_model(request: ConversionRequest) -> str:
             outtype,
             request.metadata_json,
             request.local_transformer_outtype,
+            request.config_yaml,
         )
     elif architecture == "codec":
         from . import codec

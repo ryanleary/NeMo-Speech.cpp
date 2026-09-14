@@ -41,6 +41,11 @@ struct magpie_stream_params {
     std::string text_file;
     std::string warmup_text;
     std::string warmup_text_file;
+    // Reference-audio codec codes for zero-shot voice cloning, as produced by
+    // the NanoCodec encoder. One line per codec frame, `audio_codebooks`
+    // integers each. Required by context-encoder checkpoints, ignored by baked
+    // ones.
+    std::string context_codes_file;
     std::string tokenizer_model_dir;
     std::string tn_model_dir;
     MagpieTokenizerConfig tokenizer_config;

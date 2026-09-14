@@ -26,6 +26,7 @@
 #include <utility>
 
 #include "audio_pp.h"
+#include "context.h"
 #include "decoder.h"
 #include "encoder.h"
 #include "ggml_log_filter.h"
@@ -1131,7 +1132,7 @@ struct stream_code_writer {
 };
 
 static bool
-load_forced_code_frames(
+load_code_frames(
     const char* path, int audio_codebooks, std::vector<std::vector<int32_t>>& frames) {
     frames.clear();
     if (!path || !path[0]) {
@@ -1140,7 +1141,7 @@ load_forced_code_frames(
 
     std::ifstream in(path);
     if (!in) {
-        fprintf(stderr, "failed to open MagpieTTS forced-code file: %s\n", path);
+        fprintf(stderr, "failed to open MagpieTTS code file: %s\n", path);
         return false;
     }
 
@@ -1156,15 +1157,13 @@ load_forced_code_frames(
             frame = parse_token_list(line);
         }
         catch (const std::exception& e) {
-            fprintf(
-                stderr, "failed to parse forced-code frame %d in %s: %s\n", line_no, path,
-                e.what());
+            fprintf(stderr, "failed to parse code frame %d in %s: %s\n", line_no, path, e.what());
             return false;
         }
         if ((int)frame.size() != audio_codebooks) {
             fprintf(
-                stderr, "forced-code frame %d in %s has %zu codebooks, expected %d\n", line_no,
-                path, frame.size(), audio_codebooks);
+                stderr, "code frame %d in %s has %zu codebooks, expected %d\n", line_no, path,
+                frame.size(), audio_codebooks);
             return false;
         }
         frames.push_back(std::move(frame));
@@ -3177,7 +3176,8 @@ stream_magpie_to_audio(
     }
     const size_t total_text_tokens = token_count(token_chunks);
     const bool longform_active = token_chunks.size() > 1;
-    if (params.speaker < 0 || params.speaker >= h.baked_speakers) {
+    if (h.conditioning == MAGPIETTS_CONDITIONING_BAKED &&
+        (params.speaker < 0 || params.speaker >= h.baked_speakers)) {
         fprintf(stderr, "speaker must be in [0, %d]\n", h.baked_speakers - 1);
         return false;
     }
@@ -3258,7 +3258,7 @@ stream_magpie_to_audio(
     const char* forced_codes_path = std::getenv("MAGPIETTS_FORCE_CODES");
     std::vector<std::vector<int32_t>> forced_code_frames;
     if (std::strcmp(label, "stream") == 0 &&
-        !load_forced_code_frames(forced_codes_path, h.audio_codebooks, forced_code_frames)) {
+        !load_code_frames(forced_codes_path, h.audio_codebooks, forced_code_frames)) {
         return false;
     }
     if (params.verbose) {
@@ -3385,10 +3385,63 @@ stream_magpie_to_audio(
     DecoderKvCache& uncond_kv = workspace.uncond_kv;
     DecoderCrossKvCache& cond_cross_kv = workspace.cond_cross_kv;
     MagpieDecoder& decoder = workspace.decoder;
+
+    // Zero-shot checkpoints build their conditioning prefix from reference
+    // audio; baked ones look it up per speaker inside the decoder. The prefix
+    // is constant for the whole request, so it is computed once here and the
+    // storage must outlive every eval below.
+    std::vector<float> context_prefix;
+    decoder.clearContextPrefix();
+    if (h.conditioning == MAGPIETTS_CONDITIONING_CONTEXT_ENCODER) {
+        if (params.context_codes_file.empty()) {
+            fprintf(
+                stderr,
+                "this checkpoint clones a voice from reference audio; pass --context-codes\n");
+            return false;
+        }
+        std::vector<std::vector<int32_t>> context_frames;
+        if (!load_code_frames(
+                params.context_codes_file.c_str(), h.audio_codebooks, context_frames)) {
+            return false;
+        }
+        if (context_frames.empty()) {
+            fprintf(stderr, "context code file is empty: %s\n", params.context_codes_file.c_str());
+            return false;
+        }
+        std::vector<std::vector<int32_t>> context_codes(
+            (size_t)h.audio_codebooks, std::vector<int32_t>(context_frames.size()));
+        for (size_t t = 0; t < context_frames.size(); ++t) {
+            for (int c = 0; c < h.audio_codebooks; ++c) {
+                context_codes[(size_t)c][t] = context_frames[t][(size_t)c];
+            }
+        }
+        int context_len = 0;
+        MagpieContextEncoder context_encoder(magpie);
+        if (!context_encoder.encode(
+                context_codes, params.threads, codec_fps, context_prefix, context_len)) {
+            return false;
+        }
+        decoder.setContextPrefix(context_prefix, context_len);
+        if (params.verbose) {
+            fprintf(
+                stderr, "%s context: %zu codec frames -> %d conditioning positions\n", label,
+                context_frames.size(), context_len);
+        }
+    }
     MagpieEncoder& encoder = workspace.encoder;
 
     stream_code_writer code_writer;
-    if (!code_writer.open(write_codes ? params.codes_out : std::string())) {
+    // Debug hook for code-level parity against NeMo; see
+    // scripts/tts/compare-codes.py.
+    std::string codes_out = write_codes ? params.codes_out : std::string();
+    if (codes_out.empty()) {
+        if (const char* dump = std::getenv("MAGPIETTS_CODES_DUMP")) {
+            if (dump[0]) {
+                codes_out = std::string(dump) + "." + label;
+            }
+        }
+    }
+    if (!code_writer.open(codes_out)) {
         return false;
     }
 
@@ -3772,6 +3825,7 @@ stream_magpie_to_audio(
                 const bool forbid_eos = step * h.frame_stacking_factor < h.min_generated_frames;
                 std::vector<int32_t> next_codes;
                 std::vector<int32_t> argmax_codes;
+                std::vector<std::vector<int32_t>> codec_frames;
                 std::vector<float> alignment_scores;
                 magpietts_decoder_attention decoder_attention;
                 decoder_attention.prior = attention_prior.priorForStep(h, text_len);
@@ -3869,8 +3923,8 @@ stream_magpie_to_audio(
                         next_codes = std::move(cuda_sample.codes);
                         argmax_codes = std::move(cuda_sample.argmax_codes);
                     }
-                    if ((int)next_codes.size() != h.stacked_audio_codebooks() ||
-                        (int)argmax_codes.size() != h.stacked_audio_codebooks()) {
+                    if ((int)next_codes.size() != h.emit_codebooks ||
+                        (int)argmax_codes.size() != h.emit_codebooks) {
                         fprintf(
                             stderr, "CUDA sampler returned an unexpected number of codebooks\n");
                         return end_run();

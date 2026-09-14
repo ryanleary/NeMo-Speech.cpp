@@ -21,6 +21,16 @@
 
 namespace nemo_speech::tts {
 
+// NeMo only builds an input projection when the local transformer's hidden size
+// differs from the decoder's; when it does not, the step is the identity and
+// the tensors are absent from the checkpoint.
+static ggml_tensor*
+local_transformer_project_in(ggml_context* ctx, const magpietts_model& model, ggml_tensor* x) {
+    if (!model.hparams.has_lt_in_projection) {
+        return x;
+    }
+    return linear(ctx, model.lt_in_w, x, model.lt_in_b);
+}
 static constexpr int64_t kMagpieLocalKqMaskPad = 64;
 
 class LocalTransformerCudaAttentionCache {
@@ -302,10 +312,10 @@ magpietts_model_init_local_transformer_copy(
     std::vector<std::pair<const ggml_tensor*, ggml_tensor*>> copies;
     if (!magpietts_local_add_tensor_vector(
             dst.ctx, src.audio_embeddings, dst.audio_embeddings, copies, fp32) ||
-        (src.lt_in_w &&
-         !magpietts_local_add_tensor(dst.ctx, src.lt_in_w, &dst.lt_in_w, copies, fp32)) ||
-        (src.lt_in_b &&
-         !magpietts_local_add_tensor(dst.ctx, src.lt_in_b, &dst.lt_in_b, copies, fp32)) ||
+        !(src.hparams.has_lt_in_projection
+              ? (magpietts_local_add_tensor(dst.ctx, src.lt_in_w, &dst.lt_in_w, copies, fp32) &&
+                 magpietts_local_add_tensor(dst.ctx, src.lt_in_b, &dst.lt_in_b, copies, fp32))
+              : true) ||
         !magpietts_local_add_tensor_vector(dst.ctx, src.lt_out_w, dst.lt_out_w, copies, fp32) ||
         !magpietts_local_add_tensor_vector(dst.ctx, src.lt_out_b, dst.lt_out_b, copies, fp32) ||
         !magpietts_local_copy_transformer_layout(dst.ctx, src.local, dst.local, copies, fp32)) {
@@ -804,7 +814,7 @@ local_transformer_graph_init(
     graph.reset();
 
     const auto& h = model.hparams;
-    if (codebook_idx < 0 || codebook_idx >= h.stacked_audio_codebooks()) {
+    if (codebook_idx < 0 || codebook_idx >= h.emit_codebooks) {
         fprintf(stderr, "invalid local-transformer codebook index: %d\n", codebook_idx);
         return false;
     }
@@ -856,13 +866,13 @@ local_transformer_graph_init(
                 graph.dec_cond, pair ? "magpietts_local_transformer_dec_cond"
                                      : "magpietts_local_transformer_dec_last");
             ggml_set_input(graph.dec_cond);
-            input_cond = graph.dec_cond;
+            input_cond = local_transformer_project_in(graph.ctx, model, graph.dec_cond);
             if (pair) {
                 graph.dec_uncond =
                     ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, h.n_embd, batch_columns);
                 ggml_set_name(graph.dec_uncond, "magpietts_local_transformer_dec_uncond");
                 ggml_set_input(graph.dec_uncond);
-                input_uncond = graph.dec_uncond;
+                input_uncond = local_transformer_project_in(graph.ctx, model, graph.dec_uncond);
             }
         } else {
             const std::string name = "magpietts_local_transformer_prev_code";
@@ -871,9 +881,9 @@ local_transformer_graph_init(
             ggml_set_input(graph.prev_token);
             ggml_tensor* emb = ggml_get_rows(
                 graph.ctx, model.audio_embeddings[codebook_idx - 1], graph.prev_token);
-            input_cond = emb;
+            input_cond = local_transformer_project_in(graph.ctx, model, emb);
             if (pair)
-                input_uncond = emb;
+                input_uncond = input_cond;
         }
 
         graph.pos_emb = ggml_view_2d(
@@ -885,8 +895,7 @@ local_transformer_graph_init(
             const int pair_dim = cuda_cached_attention ? 1 : 2;
             ggml_tensor* pair_input = ggml_concat(graph.ctx, input_cond, input_uncond, pair_dim);
             ggml_tensor* cur_pair =
-                model.lt_in_w ? linear(graph.ctx, model.lt_in_w, pair_input, model.lt_in_b)
-                              : pair_input;
+pair_input;
             ggml_tensor* out_pair = local_transformer_forward_cached_pair_fixed_pos(
                 graph.ctx, graph.gf, model.local, cur_pair, graph.pos_emb, bank.cond_cache,
                 bank.uncond_cache,
@@ -909,8 +918,7 @@ local_transformer_graph_init(
             ggml_build_forward_expand(graph.gf, graph.logits_uncond);
         } else {
             ggml_tensor* cur_cond =
-                model.lt_in_w ? linear(graph.ctx, model.lt_in_w, input_cond, model.lt_in_b)
-                              : input_cond;
+                input_cond;
             ggml_tensor* out_cond = local_transformer_forward_cached_fixed_pos(
                 graph.ctx, graph.gf, model.local, cur_cond, graph.pos_emb, bank.single_cache,
                 codebook_idx);
@@ -1325,7 +1333,7 @@ sample_local_codebooks_impl(
         return false;
     }
     std::vector<int32_t> prev;
-    for (int c = 0; c < stacked_codebooks; ++c) {
+    for (int c = 0; c < h.emit_codebooks; ++c) {
         std::vector<float> logits;
         if (use_cfg) {
             std::vector<float> uncond;
@@ -1346,7 +1354,9 @@ sample_local_codebooks_impl(
             logits, h, temperature, top_k, rng, forbid_audio_eos);
         const int greedy = MagpieCodebookSampler::argmaxFromLogits(logits, h, forbid_audio_eos);
         dump_local_codebook_logits(logit_dump, c, sampled, greedy, logits);
-        const int emitted = forced_codes ? (*forced_codes)[c] : sampled;
+        const int emitted = forced_codes && (int)forced_codes->size() == h.emit_codebooks
+                                ? (*forced_codes)[c]
+                                : sampled;
         codes.push_back(emitted);
         argmax_codes.push_back(greedy);
         prev.push_back(emitted);

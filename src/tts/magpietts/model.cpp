@@ -731,6 +731,38 @@ magpietts_model_load_impl(
     h.mask_token_id = gguf_i32(model.gguf, "magpietts.mask_token_id", h.mask_token_id);
     h.frame_stacking_factor =
         gguf_i32(model.gguf, "magpietts.frame_stacking_factor", h.frame_stacking_factor);
+    h.context_audio_bos_id =
+        gguf_i32(model.gguf, "magpietts.context_audio_bos_id", h.audio_codebook_size + 2);
+    h.context_audio_eos_id =
+        gguf_i32(model.gguf, "magpietts.context_audio_eos_id", h.audio_codebook_size + 3);
+    // GGUFs written before stacked checkpoints were supported carry no
+    // emit_codebooks; for them the product is the correct value.
+    h.emit_codebooks = gguf_i32(
+        model.gguf, "magpietts.emit_codebooks", h.audio_codebooks * h.frame_stacking_factor);
+    h.has_lt_in_projection =
+        gguf_bool(model.gguf, "magpietts.local_transformer.has_in_projection", true);
+
+    // Likewise: no conditioning key means a baked checkpoint, which is all that
+    // existed when those files were written.
+    const std::string conditioning = gguf_string(model.gguf, "magpietts.conditioning");
+    if (conditioning.empty() || conditioning == "baked") {
+        h.conditioning = MAGPIETTS_CONDITIONING_BAKED;
+    } else if (conditioning == "context_encoder") {
+        h.conditioning = MAGPIETTS_CONDITIONING_CONTEXT_ENCODER;
+        h.ctx_enc_layer = gguf_i32(model.gguf, "magpietts.context_encoder.layers", h.ctx_enc_layer);
+        h.ctx_enc_head = gguf_i32(model.gguf, "magpietts.context_encoder.heads", h.ctx_enc_head);
+        h.ctx_enc_kernel =
+            gguf_i32(model.gguf, "magpietts.context_encoder.kernel_size", h.ctx_enc_kernel);
+        h.ctx_enc_causal =
+            gguf_bool(model.gguf, "magpietts.context_encoder.causal", h.ctx_enc_causal);
+        h.ctx_enc_max_positions = gguf_i32(
+            model.gguf, "magpietts.context_encoder.max_positions", h.ctx_enc_max_positions);
+        h.ctx_enc_max_duration_s = gguf_f32(
+            model.gguf, "magpietts.context_encoder.max_duration_s", h.ctx_enc_max_duration_s);
+    } else {
+        fprintf(stderr, "unsupported magpietts.conditioning: %s\n", conditioning.c_str());
+        return false;
+    }
     if (h.audio_codebooks < 1 || h.frame_stacking_factor < 1) {
         fprintf(
             stderr, "invalid stacked audio layout: codebooks=%d frame_stacking_factor=%d\n",
@@ -831,6 +863,27 @@ magpietts_model_load_impl(
         return false;
     }
 
+    if (h.frame_stacking_factor < 1) {
+        fprintf(
+            stderr, "invalid frame_stacking_factor=%d\n", h.frame_stacking_factor);
+        return false;
+    }
+    if (h.emit_codebooks != h.audio_codebooks * h.frame_stacking_factor) {
+        fprintf(
+            stderr,
+            "emit_codebooks=%d does not match audio_codebooks=%d * frame_stacking_factor=%d\n",
+            h.emit_codebooks, h.audio_codebooks, h.frame_stacking_factor);
+        return false;
+    }
+    if (!h.has_lt_in_projection && h.lt_hidden != h.n_embd) {
+        // Treating a missing projection as identity is only sound when the
+        // dimensions already agree, which is exactly when NeMo omits it.
+        fprintf(
+            stderr,
+            "no local transformer input projection, but lt_hidden=%d != embedding_dim=%d\n",
+            h.lt_hidden, h.n_embd);
+        return false;
+    }
     if (model.tokenizer_profile.empty()) {
         model.tokenizer_profile = magpietts_infer_tokenizer_profile(h);
     }
@@ -926,26 +979,20 @@ magpietts_model_load_impl(
     fclose(f);
 
     model.text_embedding = require_tensor(model, "text_embedding.weight");
-    model.baked_context = require_tensor(model, "baked_context_embedding.weight");
     model.final_proj_w = require_tensor(model, "final_proj.weight");
     model.final_proj_b = require_tensor(model, "final_proj.bias");
-    // v2602 projects decoder/audio embeddings into the local-transformer
-    // dimension.  In v2607 those dimensions are both 768 and the checkpoint
-    // intentionally omits the projection (identity input).
-    model.lt_in_w = ggml_get_tensor(model.ctx, "local_transformer_in_projection.weight");
-    model.lt_in_b = ggml_get_tensor(model.ctx, "local_transformer_in_projection.bias");
-    if ((model.lt_in_w == nullptr) != (model.lt_in_b == nullptr)) {
-        fprintf(stderr, "local-transformer input projection must include both weight and bias\n");
-        return false;
-    }
-    if (model.lt_in_w == nullptr && h.n_embd != h.lt_hidden) {
-        fprintf(
-            stderr, "local-transformer input projection is missing for incompatible dimensions\n");
-        return false;
+
+    if (h.conditioning == MAGPIETTS_CONDITIONING_BAKED) {
+        model.baked_context = require_tensor(model, "baked_context_embedding.weight");
     }
 
-    model.audio_embeddings.resize(h.stacked_audio_codebooks());
-    for (int i = 0; i < h.stacked_audio_codebooks(); ++i) {
+    if (h.has_lt_in_projection) {
+        model.lt_in_w = require_tensor(model, "local_transformer_in_projection.weight");
+        model.lt_in_b = require_tensor(model, "local_transformer_in_projection.bias");
+    }
+
+    model.audio_embeddings.resize(h.emit_codebooks);
+    for (int i = 0; i < h.emit_codebooks; ++i) {
         model.audio_embeddings[i] =
             require_tensor(model, "audio_embeddings." + std::to_string(i) + ".weight");
     }
@@ -962,6 +1009,13 @@ magpietts_model_load_impl(
     load_transformer(
         model, model.local, "local_transformer", h.lt_layers, h.lt_hidden, h.lt_heads, 1, true,
         false, 0, 0);
+    if (h.conditioning == MAGPIETTS_CONDITIONING_CONTEXT_ENCODER) {
+        // Structurally the text encoder with one layer; the only difference is
+        // that it attends bidirectionally over the reference audio.
+        load_transformer(
+            model, model.context_encoder, "context_encoder", h.ctx_enc_layer, h.n_embd,
+            h.ctx_enc_head, h.ctx_enc_kernel, h.ctx_enc_causal, false, 0, 0);
+    }
 #if defined(GGML_USE_METAL)
     if (ggml_backend_is_metal(model.backend)) {
         model.encoder.portable_causal_mask = true;
@@ -970,27 +1024,31 @@ magpietts_model_load_impl(
     }
 #endif
 
-    model.lt_out_w.resize(h.stacked_audio_codebooks());
-    model.lt_out_b.resize(h.stacked_audio_codebooks());
-    for (int i = 0; i < h.stacked_audio_codebooks(); ++i) {
+    model.lt_out_w.resize(h.emit_codebooks);
+    model.lt_out_b.resize(h.emit_codebooks);
+    for (int i = 0; i < h.emit_codebooks; ++i) {
         model.lt_out_w[i] = require_tensor(
             model, "local_transformer_out_projections." + std::to_string(i) + ".weight");
         model.lt_out_b[i] = require_tensor(
             model, "local_transformer_out_projections." + std::to_string(i) + ".bias");
     }
 
-    fprintf(
-        stderr,
-        "loaded MagpieTTS GGUF: text_vocab=%d audio_codebooks=%d stacked_slots=%d audio_vocab=%d "
-        "speakers=%d "
-        "attention_prior=%s epsilon=%.4g lookahead=%d start_step=%d advance_threshold=%d "
-        "decay_threshold=%d estimate_layers=%s apply_layers=%s\n",
-        h.text_vocab_size, h.audio_codebooks, h.stacked_audio_codebooks(), h.audio_vocab_size,
-        h.baked_speakers, h.apply_attention_prior ? "on" : "off", h.attention_prior_epsilon,
-        h.attention_prior_lookahead_window, h.start_prior_after_n_audio_steps,
-        h.attention_prior_advance_threshold, h.attention_prior_decay_threshold,
-        format_i32_list(h.estimate_alignment_from_layers).c_str(),
-        format_i32_list(h.apply_prior_to_layers).c_str());
+    if (verbose) {
+        fprintf(
+            stderr,
+            "loaded MagpieTTS GGUF: conditioning=%s text_vocab=%d audio_codebooks=%d "
+            "stacking=%d audio_vocab=%d speakers=%d "
+            "attention_prior=%s epsilon=%.4g lookahead=%d start_step=%d advance_threshold=%d "
+            "decay_threshold=%d estimate_layers=%s apply_layers=%s\n",
+            h.conditioning == MAGPIETTS_CONDITIONING_BAKED ? "baked" : "context_encoder",
+            h.text_vocab_size, h.audio_codebooks, h.frame_stacking_factor, h.audio_vocab_size,
+            h.conditioning == MAGPIETTS_CONDITIONING_BAKED ? h.baked_speakers : 0,
+            h.apply_attention_prior ? "on" : "off", h.attention_prior_epsilon,
+            h.attention_prior_lookahead_window, h.start_prior_after_n_audio_steps,
+            h.attention_prior_advance_threshold, h.attention_prior_decay_threshold,
+            format_i32_list(h.estimate_alignment_from_layers).c_str(),
+            format_i32_list(h.apply_prior_to_layers).c_str());
+    }
     return true;
 }
 
@@ -1917,6 +1975,25 @@ MagpieCodeGenerator::generate(
     magpietts_model& model = model_;
     auto& h = model.hparams;
     const char* label = run_label ? run_label : "run";
+
+    // This non-streaming generator has no callers; stream_magpie_to_audio in
+    // magpietts.cpp superseded it. It was left at one codec frame per decoder
+    // step and one conditioning source, so refuse the cases it would get wrong
+    // rather than emitting plausible-looking but incorrect codes.
+    if (h.frame_stacking_factor != 1) {
+        fprintf(
+            stderr,
+            "generate_magpietts_codes does not support frame_stacking_factor=%d; "
+            "use the streaming path\n",
+            h.frame_stacking_factor);
+        return false;
+    }
+    if (h.conditioning != MAGPIETTS_CONDITIONING_BAKED) {
+        fprintf(
+            stderr,
+            "generate_magpietts_codes supports only baked conditioning; use the streaming path\n");
+        return false;
+    }
     std::mt19937 rng((uint32_t)params.seed);
     bool use_cuda_lt = false;
     if (params.use_local_transformer &&

@@ -3,13 +3,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Convert NVIDIA NeMo MagpieTTS checkpoints to GGUF.
 
-This converter targets the public MagpieTTS multilingual 357M checkpoint:
-https://huggingface.co/nvidia/magpie_tts_multilingual_357m
+Handles both conditioning styles of the ``decoder_ce`` model type:
+
+* **baked** - the public MagpieTTS multilingual 357M checkpoint
+  (https://huggingface.co/nvidia/magpie_tts_multilingual_357m), which ships a
+  table of precomputed context embeddings, one per stock speaker.
+* **context_encoder** - zero-shot checkpoints, which keep the context encoder
+  itself and compute the conditioning prefix from reference audio codes at
+  inference time.
+
+The two are the same thing at different times: a baked row *is* a cached
+context-encoder output, which is why they share every downstream tensor. Which
+one a checkpoint uses is recorded in ``magpietts.conditioning``.
 
 The generated GGUF stores the autoregressive MagpieTTS model weights and
-metadata needed by the GGML example. The NanoCodec vocoder referenced by the
-NeMo config is not bundled in the Magpie .nemo archive and is not converted
-here.
+metadata needed by the runtime. The NanoCodec vocoder referenced by the NeMo
+config is not bundled in the Magpie .nemo archive and is not converted here.
 """
 
 from __future__ import annotations
@@ -28,6 +37,56 @@ from .tts_tokenizer_profiles import tokenizer_profile
 
 SPECIAL_AUDIO_TOKENS = 8
 SPEAKER_NAMES = ["John", "Sofia", "Aria", "Jason", "Leo"]
+
+# The plain model and the GRPO preference-optimization wrapper produce the same
+# inference graph; only the training harness around it differs.
+SUPPORTED_TARGETS = (
+    "nemo.collections.tts.models.magpietts.MagpieTTSModel",
+    "nemo.collections.tts.models.magpietts_preference_optimization.MagpieTTSModelOnlinePO",
+)
+
+# Modules that exist only for training and must never reach the GGUF. The GRPO
+# checkpoints carry a full torchaudio SQUIM reward model (106 tensors).
+TRAINING_ONLY_PREFIXES = ("squim_objective_model.", "_speaker_verification_model.", "_codec_model.")
+
+CONDITIONING_BAKED = "baked"
+CONDITIONING_CONTEXT_ENCODER = "context_encoder"
+
+
+def is_lightning_checkpoint(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() == ".ckpt"
+
+
+def read_sidecar_config(path: Path) -> dict[str, Any]:
+    """Read a model config that lives outside the checkpoint.
+
+    Accepts either the model config itself or a Lightning `hparams.yaml`, which
+    nests it under a top-level `cfg:` key.
+    """
+    import yaml
+
+    with path.open("r", encoding="utf-8") as stream:
+        value = yaml.safe_load(stream)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"sidecar config is not a mapping: {path}")
+    if "cfg" in value and isinstance(value["cfg"], dict):
+        value = value["cfg"]
+    return value
+
+
+def read_lightning_state_dict(path: Path) -> dict[str, torch.Tensor]:
+    """Load a bare Lightning checkpoint.
+
+    `weights_only=True` cannot be used: these carry an omegaconf DictConfig in
+    `hyper_parameters`. The file is the caller's own training output, and only
+    tensors are read out of it.
+    """
+    blob = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    if not isinstance(blob, dict) or "state_dict" not in blob:
+        raise RuntimeError(f"not a Lightning checkpoint (no state_dict): {path}")
+    return {
+        k: v for k, v in blob["state_dict"].items() if isinstance(v, torch.Tensor)
+    }
 
 
 def extract_nemo(path: Path) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
@@ -80,6 +139,41 @@ def add_i32_array(writer: gguf.GGUFWriter, key: str, value: Any) -> None:
         writer.add_array(key, items)
 
 
+BAKED_TENSORS = (
+    "baked_context_embedding.weight",
+    "_baked_embedding_T",
+    "_baked_embedding_D",
+    "baked_context_embedding_len",
+)
+
+
+def detect_conditioning(sd: dict[str, torch.Tensor]) -> str:
+    """Decide from the weights, not the config.
+
+    NeMo drops the context encoder when it bakes the embeddings and vice versa,
+    so the tensors are authoritative; `has_baked_context_embedding` is not even
+    set in some sidecar configs.
+    """
+    baked = [name for name in BAKED_TENSORS if name in sd]
+    has_context_encoder = any(k.startswith("context_encoder.") for k in sd)
+
+    if baked and has_context_encoder:
+        raise RuntimeError(
+            "checkpoint has both baked context embeddings and a context encoder; "
+            "cannot tell which conditioning path it was trained for"
+        )
+    if baked:
+        missing = [name for name in BAKED_TENSORS if name not in sd]
+        if missing:
+            raise RuntimeError(f"baked conditioning is missing {', '.join(missing)}")
+        return CONDITIONING_BAKED
+    if has_context_encoder:
+        return CONDITIONING_CONTEXT_ENCODER
+    raise RuntimeError(
+        "checkpoint has neither baked context embeddings nor a context encoder; "
+        "this is not a supported MagpieTTS decoder_ce checkpoint"
+    )
+
 def _indexed_weight_indices(sd: dict[str, torch.Tensor], prefix: str) -> list[int]:
     suffix = ".weight"
     indices: list[int] = []
@@ -122,29 +216,64 @@ def add_metadata(
     audio_vocab = int(sd["audio_embeddings.0.weight"].shape[0])
     codebook_size = audio_vocab - SPECIAL_AUDIO_TOKENS
     text_vocab = int(sd["text_embedding.weight"].shape[0])
-    baked_t = int(sd["_baked_embedding_T"].item())
-    baked_d = int(sd["_baked_embedding_D"].item())
-    baked_lens = [int(x) for x in sd["baked_context_embedding_len"].tolist()]
-    profile = tokenizer_profile(cfg, text_vocab, frame_stacking)
-    n_codebooks = n_stacked_codebooks // frame_stacking
-    expected_logits = n_stacked_codebooks * audio_vocab
-    if int(sd["final_proj.weight"].shape[0]) != expected_logits:
-        raise ValueError(
-            "final_proj rows do not match stacked audio layout: "
-            f"rows={sd['final_proj.weight'].shape[0]} expected={expected_logits}"
-        )
-    lt_head_indices = _indexed_weight_indices(sd, "local_transformer_out_projections.")
-    n_lt_heads = len(lt_head_indices)
-    if n_lt_heads != n_stacked_codebooks:
-        raise ValueError(
-            "local transformer output heads do not match audio embeddings: "
-            f"heads={n_lt_heads} embeddings={n_stacked_codebooks}"
-        )
-    _require_contiguous_indices(
-        "local transformer output projection", lt_head_indices, n_stacked_codebooks
-    )
 
-    inf = cfg.get("inference_parameters", {})
+    conditioning = detect_conditioning(sd)
+    baked_t = baked_d = 0
+    baked_lens: list[int] = []
+    baked_speakers = 0
+    if conditioning == CONDITIONING_BAKED:
+        baked_t = int(sd["_baked_embedding_T"].item())
+        baked_d = int(sd["_baked_embedding_D"].item())
+        baked_lens = [int(x) for x in sd["baked_context_embedding_len"].tolist()]
+        baked_speakers = int(sd["baked_context_embedding.weight"].shape[0])
+
+    encoder = cfg["encoder"]
+    decoder = cfg["decoder"]
+    lt_hidden = int(cfg.get("local_transformer_hidden_dim", 256))
+    frame_stacking = int(cfg.get("frame_stacking_factor", 1))
+    # One embedding table per (codebook, stack slot); NeMo indexes them as
+    # `c + i * C`, so the table count is C * stacking and the real codebook
+    # count - what the codec consumes - is the quotient.
+    emit_codebooks = int(
+        len([k for k in sd if k.startswith("audio_embeddings.") and k.endswith(".weight")])
+    )
+    if emit_codebooks % frame_stacking != 0:
+        raise RuntimeError(
+            f"{emit_codebooks} audio embedding tables is not a multiple of "
+            f"frame_stacking_factor {frame_stacking}"
+        )
+    n_codebooks = emit_codebooks // frame_stacking
+
+    # The local transformer emits one projection per table, and the final
+    # projection is (tables * vocab). Both must agree or the runtime will read
+    # the wrong slice of the logits.
+    n_lt_out = len(
+        [k for k in sd if k.startswith("local_transformer_out_projections.") and k.endswith(".weight")]
+    )
+    if n_lt_out != emit_codebooks:
+        raise RuntimeError(
+            f"expected {emit_codebooks} local transformer output projections, found {n_lt_out}"
+        )
+    final_rows = int(sd["final_proj.weight"].shape[0])
+    if final_rows != emit_codebooks * audio_vocab:
+        raise RuntimeError(
+            f"final_proj has {final_rows} rows; expected {emit_codebooks} * {audio_vocab}"
+        )
+
+    inf = cfg.get("inference_parameters") or {}
+
+    has_lt_in_projection = "local_transformer_in_projection.weight" in sd
+    if not has_lt_in_projection and lt_hidden != int(cfg.get("embedding_dim", decoder["d_model"])):
+        # NeMo only omits the projection when it would be square; without it the
+        # runtime has to treat the step as identity, which is only valid then.
+        raise RuntimeError(
+            f"no local_transformer_in_projection, but local_transformer_hidden_dim "
+            f"{lt_hidden} != embedding_dim {cfg.get('embedding_dim')}"
+        )
+
+    context_encoder = cfg.get("context_encoder") or {}
+    if conditioning == CONDITIONING_CONTEXT_ENCODER and not context_encoder:
+        raise RuntimeError("checkpoint has context_encoder weights but no context_encoder config")
 
     summary: dict[str, Any] = {
         "architecture": "magpietts",
@@ -153,8 +282,10 @@ def add_metadata(
         "nemo_version": cfg.get("nemo_version"),
         "tokenizer_profile": profile,
         "codec_model": cfg.get("codecmodel_path"),
+        "conditioning": conditioning,
         "text_vocab_size": text_vocab,
         "audio_codebooks": n_codebooks,
+        "emit_codebooks": emit_codebooks,
         "stacked_audio_codebooks": n_stacked_codebooks,
         "audio_codebook_size": codebook_size,
         "audio_vocab_size": audio_vocab,
@@ -163,13 +294,22 @@ def add_metadata(
         "encoder_layers": int(encoder["n_layers"]),
         "decoder_layers": int(decoder["n_layers"]),
         "context_length": int(decoder["max_length_causal_mask"]),
-        "speaker_names": SPEAKER_NAMES,
+        "has_local_transformer_in_projection": has_lt_in_projection,
+        "context_duration_max": float(cfg.get("context_duration_max", 0.0))
+        if conditioning == CONDITIONING_CONTEXT_ENCODER
+        else 0.0,
+        "speaker_names": SPEAKER_NAMES if conditioning == CONDITIONING_BAKED else [],
         "baked_context_length": baked_t,
         "baked_context_dim": baked_d,
         "baked_context_lens": baked_lens,
+        "baked_speakers": baked_speakers,
     }
 
-    writer.add_name("NVIDIA MagpieTTS multilingual 357M")
+    writer.add_name(
+        "NVIDIA MagpieTTS multilingual 357M"
+        if conditioning == CONDITIONING_BAKED
+        else "NVIDIA MagpieTTS zero-shot"
+    )
     writer.add_description(
         "MagpieTTS autoregressive codec-token generator converted from NeMo to GGUF"
     )
@@ -179,11 +319,40 @@ def add_metadata(
     writer.add_string("magpietts.model_type", str(cfg.get("model_type", "")))
     writer.add_string("magpietts.codec_model", str(cfg.get("codecmodel_path", "")))
     writer.add_string("magpietts.config_json", json.dumps(cfg, ensure_ascii=False, sort_keys=True))
-    writer.add_array("magpietts.speaker_names", SPEAKER_NAMES)
-    writer.add_array("magpietts.baked_context_lens", baked_lens)
+    writer.add_string("magpietts.conditioning", conditioning)
+    add_bool(writer, "magpietts.local_transformer.has_in_projection", has_lt_in_projection)
+    if conditioning == CONDITIONING_BAKED:
+        writer.add_array("magpietts.speaker_names", SPEAKER_NAMES)
+        writer.add_array("magpietts.baked_context_lens", baked_lens)
+    else:
+        add_i32(writer, "magpietts.context_encoder.layers", int(context_encoder["n_layers"]))
+        add_i32(writer, "magpietts.context_encoder.heads", int(context_encoder["sa_n_heads"]))
+        add_i32(
+            writer, "magpietts.context_encoder.kernel_size", int(context_encoder["kernel_size"])
+        )
+        add_bool(
+            writer, "magpietts.context_encoder.causal", bool(context_encoder.get("is_causal", False))
+        )
+        add_i32(
+            writer,
+            "magpietts.context_encoder.max_positions",
+            int(sd["context_encoder.position_embeddings.weight"].shape[0]),
+        )
+        # The dataset pads the conditioning sequence out to a fixed length
+        # derived from context_duration_max (text_to_speech_dataset.py:
+        # `int(context_duration_max * sample_rate / samples_per_frame) + 2`),
+        # and the context encoder then runs over the padding as valid
+        # positions. The runtime needs the duration to reproduce that, because
+        # the frame rate is a property of the codec, not of this checkpoint.
+        add_f32(
+            writer,
+            "magpietts.context_encoder.max_duration_s",
+            float(cfg.get("context_duration_max", 0.0)),
+        )
 
     add_i32(writer, "magpietts.text_vocab_size", text_vocab)
     add_i32(writer, "magpietts.audio_codebooks", n_codebooks)
+    add_i32(writer, "magpietts.emit_codebooks", emit_codebooks)
     add_i32(writer, "magpietts.stacked_audio_codebooks", n_stacked_codebooks)
     add_i32(writer, "magpietts.audio_codebook_size", codebook_size)
     add_i32(writer, "magpietts.audio_vocab_size", audio_vocab)
@@ -216,9 +385,10 @@ def add_metadata(
         "magpietts.local_transformer.context_length",
         int(sd["local_transformer.position_embeddings.weight"].shape[0]),
     )
-    add_i32(writer, "magpietts.baked_context_length", baked_t)
-    add_i32(writer, "magpietts.baked_context_dim", baked_d)
-    add_i32(writer, "magpietts.baked_speakers", int(sd["baked_context_embedding.weight"].shape[0]))
+    if conditioning == CONDITIONING_BAKED:
+        add_i32(writer, "magpietts.baked_context_length", baked_t)
+        add_i32(writer, "magpietts.baked_context_dim", baked_d)
+        add_i32(writer, "magpietts.baked_speakers", baked_speakers)
     add_i32(writer, "magpietts.inference.max_decoder_steps", inf.get("max_decoder_steps", 500))
     add_i32(writer, "magpietts.inference.topk", inf.get("topk", 80))
     add_i32(writer, "magpietts.inference.min_generated_frames", inf.get("min_generated_frames", 4))
@@ -316,6 +486,8 @@ def add_tensors(
         if name.endswith(".causal_mask"):
             skipped.append(name)
             continue
+        if name.startswith(TRAINING_ONLY_PREFIXES):
+            raise RuntimeError(f"training-only tensor reached the writer: {name}")
 
         tensor_outtype = (
             local_transformer_outtype
@@ -350,20 +522,37 @@ def convert(
     outtype: str = "f16",
     metadata_json: Path | None = None,
     local_transformer_outtype: str | None = None,
+    config_yaml: Path | None = None,
 ) -> None:
-    root, tmp = extract_nemo(source)
-    try:
-        cfg = read_config(root)
-        sd = read_state_dict(root)
-
-        if cfg.get("target") != "nemo.collections.tts.models.magpietts.MagpieTTSModel":
-            raise RuntimeError(f"unsupported target: {cfg.get('target')}")
-        # v2602 records this in the config while v2607 retains the baked
-        # tensor but omits the legacy config flag.
-        if cfg.get("model_type") != "decoder_ce" or "baked_context_embedding.weight" not in sd:
+    root: Path | None = None
+    tmp: tempfile.TemporaryDirectory[str] | None = None
+    if is_lightning_checkpoint(source):
+        if config_yaml is None:
             raise RuntimeError(
-                "this GGML example expects MagpieTTS decoder_ce with baked context embeddings"
+                f"{source.name} is a bare Lightning checkpoint and carries no usable "
+                "model config; pass --config-yaml with the config the model is served under"
             )
+        cfg = read_sidecar_config(config_yaml)
+        sd = read_lightning_state_dict(source)
+    else:
+        root, tmp = extract_nemo(source)
+        cfg = read_sidecar_config(config_yaml) if config_yaml else read_config(root)
+        sd = read_state_dict(root)
+    try:
+
+        if cfg.get("target") not in SUPPORTED_TARGETS:
+            raise RuntimeError(
+                f"unsupported target: {cfg.get('target')}\n"
+                f"       supported: {', '.join(SUPPORTED_TARGETS)}\n"
+                "       a Lightning .ckpt embeds the training target in its own hparams; "
+                "pass the sidecar config the server loads instead"
+            )
+        if cfg.get("model_type") != "decoder_ce":
+            raise RuntimeError(
+                f"unsupported model_type: {cfg.get('model_type')} (expected decoder_ce)"
+            )
+
+        sd = {k: v for k, v in sd.items() if not k.startswith(TRAINING_ONLY_PREFIXES)}
 
         output.parent.mkdir(parents=True, exist_ok=True)
         writer = gguf.GGUFWriter(output, "magpietts")

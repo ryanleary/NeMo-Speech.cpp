@@ -31,6 +31,9 @@ enum class MagpieLongformMode {
 struct MagpieRuntimeConfig {
     std::string magpie_model;
     std::string codec_model;
+    // Reference-audio codec codes for zero-shot cloning; required by
+    // context-encoder checkpoints, ignored by baked ones.
+    std::string context_codes_file;
     int speaker = 0;
     int threads = 4;
     int codec_threads = 0;

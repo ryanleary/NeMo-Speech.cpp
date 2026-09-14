@@ -59,6 +59,12 @@ def parse_args() -> argparse.Namespace:
         choices=("f16", "f32"),
         help="override MagpieTTS local-transformer and audio-embedding storage type",
     )
+    parser.add_argument(
+        "--config-yaml",
+        type=Path,
+        help="sidecar model config for a bare Lightning .ckpt (MagpieTTS); the file may be the "
+        "model config itself or a hparams file with a top-level 'cfg:' key",
+    )
     parser.add_argument("--silero-version", default="6.2.0", help="Silero VAD package version")
     parser.add_argument(
         "--from-whisper-ggml", type=Path, help="convert a whisper.cpp Silero VAD file"
@@ -103,6 +109,7 @@ def main() -> int:
         max_seq_length=args.max_seq_length,
         metadata_json=args.metadata_json,
         local_transformer_outtype=args.local_transformer_outtype,
+        config_yaml=args.config_yaml,
         silero_version=args.silero_version,
         from_whisper_ggml=args.from_whisper_ggml,
         llama_cpp=args.llama_cpp,

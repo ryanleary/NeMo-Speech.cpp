@@ -117,6 +117,20 @@ struct magpietts_cuda_sample_request {
     std::vector<int32_t> argmax_codes;
 };
 
+// The decoder's conditioning prefix, prepended to the audio sequence.
+//
+// Baked checkpoints look it up from a table by speaker index; zero-shot ones
+// compute it from reference audio. Either way it is one (len, n_embd) tensor
+// that is constant for a whole request, which is why it lives on the decoder
+// rather than being threaded through every eval call.
+struct magpietts_context_prefix {
+    // Row-major [len][n_embd]. Empty means "use the baked table".
+    const std::vector<float>* values = nullptr;
+    int len = 0;
+
+    bool computed() const { return values != nullptr; }
+};
+
 class MagpieDecoder {
    public:
     explicit MagpieDecoder(const magpietts_model& model);
@@ -124,6 +138,21 @@ class MagpieDecoder {
 
     MagpieDecoder(const MagpieDecoder&) = delete;
     MagpieDecoder& operator=(const MagpieDecoder&) = delete;
+
+    // Supply a computed conditioning prefix. Must be called before any eval on
+    // a context-encoder checkpoint; ignored by baked ones. The referenced
+    // vector must outlive every eval call that follows.
+    void setContextPrefix(const std::vector<float>& values, int len) {
+        context_prefix_.values = &values;
+        context_prefix_.len = len;
+    }
+    void clearContextPrefix() { context_prefix_ = magpietts_context_prefix(); }
+
+    // Length of the conditioning prefix this decoder will prepend.
+    int contextLength() const {
+        return context_prefix_.computed() ? context_prefix_.len
+                                          : model_.hparams.baked_context_length;
+    }
 
     bool eval(
         const std::vector<float>& text_cond, int text_len,
@@ -208,6 +237,7 @@ class MagpieDecoder {
     class PersistentDecoderRuntime;
 
     const magpietts_model& model_;
+    magpietts_context_prefix context_prefix_;
     mutable MagpiePinnedHostScratch output_staging_;
     mutable std::unique_ptr<PersistentDecoderRuntime> persistent_runtime_;
     mutable std::unique_ptr<PersistentDecoderRuntime> wave_runtime_;
