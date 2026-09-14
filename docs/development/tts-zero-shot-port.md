@@ -201,6 +201,71 @@ more slowly. It was not.
 values, copied from the server. Conversion now warns when it is about to write a
 checkpoint with no prior.
 
+## Long-form history must be 1
+
+The second thing that cost a render. `--tts.longform-history-tokens` splices the
+tail of chunk N-1's text in front of chunk N so the decoder opens with context
+rather than cold. The baked benchmarks use 20, and 20 is what every command in
+the wave-scheduler notes carries.
+
+This checkpoint speaks the history. Transcribed with Whisper, the opening
+paragraph at history 20:
+
+```
+baked, either path   ... must be in want of a wife. However little known ...
+zero-shot, seq       ... must be in want of a wife. Uffent a, however little known ...
+                     ... of some one or other of their daughter's otters.
+zero-shot, wave      ... must be in want of a wife. But to Tefertepe. However little known ...
+                     ... of some one or other of their daughter, daughters,
+```
+
+A garbled fragment at every chunk seam, and a duplicated word at the end. It is
+not subtle once transcribed and it is inaudible as "wrong" if you are listening
+for voice quality rather than words.
+
+History is what does it, not the wave -- the sequential path has it too, and
+long-form off is clean at any width. NeMo's own default is
+`ChunkedInferenceConfig.history_len_heuristic = 1`; 20 came from this repo's
+baked benchmark commands and was carried into the zero-shot ones by hand.
+
+Use **`--tts.longform-history-tokens 1`** for a context-encoder checkpoint.
+
+**Transcribe, do not just listen.** Voice identity and prosody survived this
+perfectly; only the words were wrong. Every check up to this point -- prefix
+cosine, step-0 exactness, repeat scans, silence measurement, level sweeps --
+passed while the model was saying "their daughter's otters". Whisper plus a word
+error rate against the source text is cheap, and it is the only check here that
+would have caught it:
+
+```bash
+# render, transcribe, score -- the loop that found everything below
+nemo-speech synthesize -i sample.txt ... -o out.wav
+python3 transcribe.py out.wav          # whisper-small, 24 s windows
+python3 wer.py sample.txt out.txt
+```
+
+Two general fixes came out of that loop, both of them upstream mismatches rather
+than anything zero-shot, and both now in their own commits:
+
+- **The long-form attention prior had weights of our own** -- a decaying ramp
+  where NeMo's `prior_weights` is flat out to +4. Under-weighted lookahead makes
+  the decoder dither, which is dead air; an under-weighted history cell slurs the
+  first syllable of a chunk.
+- **Sentence splitting ended a sentence on `Mr.`**, so a chunk closed on a title
+  and the next opened on a bare surname. NeMo keeps a 14-entry title list and
+  refuses to split there.
+
+Word error rate against the source, first 20,000 characters (3,614 words):
+
+| | baked, history 20 | zero-shot, history 1 |
+|---|---|---|
+| before both fixes | 3.02% | 5.89% |
+| after both | **3.02%** | **2.57%** |
+
+The zero-shot path more than halves and ends below the baked checkpoint. The
+baked path does not move, which is what the title list predicts -- it only fires
+on text containing a title.
+
 ## Batching zero-shot through the wave
 
 Conditioning is now per lane, which is what `speaker` always was and for the
@@ -255,24 +320,27 @@ Pride and Prejudice (Gutenberg 1342), same text as the baked run, one request,
 | | baked | zero-shot |
 |---|---|---|
 | conditioning positions | 110 (table row) | 217 (context encoder) |
-| chunks | -- | 7,072 |
-| output | 12 h 31 m | **11 h 04 m** (877,853,696 samples) |
-| wall clock | 3 m 29.7 s | **3 m 06.4 s** |
-| realtime factor | 216.3x | **213.5x** |
-| decoder / codec alone | -- | 337.1x / 262.5x |
-| first audio | -- | 878 ms |
-| peak RSS | 24.9 GB | 24.7 GB |
-| FLAC | 873 MB (44%) | 890 MB (53%) |
+| chunks | -- | 6,253 |
+| output | 12 h 31 m | **10 h 11 m** (36,640.8 s of audio) |
+| wall clock | 3 m 29.7 s | **2 m 51.0 s** |
+| realtime factor | 216.3x | **214.3x** |
+| decoder / codec alone | -- | 336.4x / 262.1x |
+| first audio | -- | 879 ms |
+| peak RSS | 24.9 GB | 22.6 GB |
+| FLAC | 873 MB (44%) | 809 MB (51%) |
 
-Within 1.3% of the baked checkpoint's rate, on a voice that reads the book an
-hour and a half faster (183 words a minute against 162). Nothing about the
-conditioning route costs throughput; the 5x gap was entirely the wave being
-switched off. The decoder's own 337x is below the 451x the same run reached
-without an attention prior, which is what the prior costs: it is applied in nine
-layers and alignment is estimated from four more.
+Within 1% of the baked checkpoint's rate, on a voice that reads the book two
+hours faster (199 words a minute against 162). Nothing about the conditioning
+route costs throughput; the 5x gap was entirely the wave being switched off.
 
-Levels sampled at 60 s, 15,000 s, 30,000 s and 39,000 s: mean -20.5 to -21.8 dB,
-peak -2.6 to -3.9 dB. Consistent across the whole book, no silence, no clipping.
+Transcribed at 0 s, 12,000 s, 24,000 s and 35,000 s, all four windows read
+correctly against the source.
+
+Worth keeping in view: the first version of this table said 15 h 35 m at 234.9x.
+Every hour above the number here was the decoder looping or dithering. **A
+realtime factor is only as good as the words underneath it**, and three separate
+defects each made the audio longer, which made the throughput number look
+better.
 
 Run to run the sample count moves by a fraction of a percent. That is the
 documented lane dependence: which lane a chunk lands in depends on admission
@@ -283,7 +351,7 @@ timing, and the arithmetic depends on the lane.
 # What is still missing
 
 The demo works: `synthesize -i pride.txt --tts.context-audio <voice>.wav`
-renders the novel in a cloned voice at 213.5x. Three things stand between that
+renders the novel in a cloned voice at 214.3x. Three things stand between that
 and a checkpoint anyone can run.
 
 ## Gap 1 -- the tokenizer has to be hand-built
@@ -363,7 +431,7 @@ nemo-speech synthesize -i pride.txt --device cuda --no-warmup \
     --tts.codec-model nanocodec-enc.f16.gguf \
     --tts.tokenizer-model-dir ~/nemo-bench-assets/tokenizer-v2607 \
     --tts.context-audio ~/devel/magpie-tts-server/var/ctx_cache/default.wav \
-    --tts.batch-size 128 --tts.longform-history-tokens 20 --tts.chunk-frames 32 \
+    --tts.batch-size 128 --tts.longform-history-tokens 1 --tts.chunk-frames 32 \
   | ffmpeg -f s16le -ar 22050 -ac 1 -i - -c:a flac -y pride-zeroshot.flac
 ```
 
