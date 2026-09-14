@@ -287,6 +287,32 @@ Queue everyone and they all wait; turn half away and the half you took get first
 audio in a fifth of the time. Which is right depends on whether a router can
 place the refused request somewhere else.
 
+### One book, end to end
+
+Pride and Prejudice (Gutenberg 1342), boilerplate and front matter stripped,
+synthesized as a single request on one GB300:
+
+| | |
+|---|---|
+| input | 684,232 chars / 121,811 words / ~5,766 sentences |
+| output | 993,592,320 samples at 22.05 kHz = **12 h 31 m** |
+| wall clock | **3 min 29.7 s** |
+| realtime factor | **216.3x** |
+| WAV / FLAC | 1.99 GB / 873 MB (44%, 24 s to encode) |
+| host CPU | 170% of one core |
+| peak RSS | 24.9 GB |
+
+Two things worth noting. 216.3x against the ~197x that 320 mixed-length requests
+reach is the same per-request overhead seen from the other side: one request
+amortises its session, prefill and codec channel over twelve hours of audio
+instead of over a sentence. And the 24.9 GB is the CLI accumulating the whole
+output in memory before writing it -- fine here, but it scales with output
+length, so anything much longer wants the audio streamed to disk as it arrives
+rather than buffered.
+
+Audio checked at 60 s, 22,000 s and 44,000 s: mean -26 to -28 dB, peaks -7 to
+-9 dB. Consistent across the whole book, no silence and no clipping.
+
 ### Greedy batch: the machine's ceiling
 
 Competing-consumer mode -- a queue of work, N requests in flight, each decoded
