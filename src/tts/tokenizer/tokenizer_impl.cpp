@@ -826,6 +826,14 @@ word_before_period(const std::string& text, size_t sentence_start, size_t period
 
 static std::vector<std::string>
 split_sentences(std::string paragraph) {
+    // A dash long enough to be punctuation ends a clause, and the clause after
+    // it has to be able to start a chunk. Flattening it to whitespace the way a
+    // hyphen is flattened leaves no terminal mark, so the text either side rides
+    // into one long chunk that opens mid-sentence -- and the decoder answers a
+    // chunk like that with silence rather than speech.
+    for (const char* dash : {"\u2014", "\u2013", "--"}) {
+        paragraph = replace_all(paragraph, dash, ". ");
+    }
     paragraph = replace_all(paragraph, "-", " ");
     paragraph = replace_all(paragraph, "*", "");
     if (paragraph.find_first_not_of(" \t\r\n") == std::string::npos) {
