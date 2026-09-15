@@ -109,3 +109,26 @@ both the quote rule and the comma split reproduces the reference's boundaries
 (124 chunks against its 125) and measured worse -- but that was measured before
 the mechanism was understood, and its two step-budget exhaustions suggest the
 real prerequisite is a larger `max_decoder_steps`, not shorter chunks.
+
+### Narrowed further: it depends on position in the request
+
+Three more eliminations on the same reproducer, none of which fixed it:
+
+| | |
+|---|---|
+| a dangling opening quote starts the chunk | no -- removing it, or closing it, still silent |
+| the sentence is out of distribution | no -- it speaks alone in 6.0 s |
+| it needs a preceding sentence for prosody | no -- it speaks with one in 13.0 s |
+
+The same words, with the same chunk boundaries around them, are spoken when the
+request holds two chunks and lost when it holds thirteen and they fall at the
+fourth. So the trigger is not the text, its shape, or where the chunk begins in
+the sentence -- it is *where the chunk falls in the request*.
+
+That points at state carried between chunks rather than anything about the chunk
+itself. Both paths reuse decoder state across chunks: the sequential path keeps
+`persistent_runtime_` and reseeds its K/V per chunk, and a wave lane is reused
+with its ring rotated. The next experiment is to force a fresh decoder for every
+chunk and see whether the silence goes away; if it does, the question becomes
+which piece of carried state is wrong, and `resetWave` / the persistent runtime's
+reseed path are where to look.
