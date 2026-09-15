@@ -73,3 +73,39 @@ Anything measured by rendering needs two disjoint passages and both wave widths.
 A single passage gives opposite answers to the same question: tuning the
 attention prior's advance threshold looked best at 4 on one and worst at 4 on
 the other, and both readings were noise.
+
+## The stall, and what it is really about
+
+A chunk can come back as silence: the decoder emits quiet frames for its whole
+length while its cross-attention stays pinned to the chunk's first token. Dumped
+per step, the model's attention peak is sharp (peak/mean ~94) but frozen at
+position 1, while the tracked position marches to 207 -- because the search
+window is forward-only and the tracker monotonic, so once it passes the model it
+can never come back. Every guard reads the tracker, not the model, so nothing
+notices. That is true upstream too: `get_most_attended_text_timestep` slices
+`alignment_attention_scores[last_attended:window_end]`, and a peak behind the
+window is outside the slice.
+
+What has been ruled out, on a 1,500-character reproducer that fails in both
+decode paths deterministically:
+
+| | |
+|---|---|
+| our attention prior causes it | no -- `apply_attention_prior: false`, still silent |
+| the spliced history token | no -- `longform-history-tokens 0`, still silent |
+| the model cannot say this text | no -- the reference speaks it |
+| text normalization resolves the dash | no -- the WFST normalizer leaves `,--` untouched |
+| the chunk is too long | no -- the reference speaks a 403-token chunk containing the same words |
+
+What is left is where a chunk *starts*. On that passage the reference produces
+two chunks, the first 403 tokens long and beginning at a sentence; we produced
+eight, one of which began mid-clause at the dash, and that one went silent.
+
+So the lever is chunk boundaries, and the question for the next pass is not "how
+long may a chunk be" but "where may one begin". Note this cuts against the
+closing-quote rule above: it was added because run-on sentences were being cut at
+commas, but the reference solves the same problem by not cutting at all. Removing
+both the quote rule and the comma split reproduces the reference's boundaries
+(124 chunks against its 125) and measured worse -- but that was measured before
+the mechanism was understood, and its two step-budget exhaustions suggest the
+real prerequisite is a larger `max_decoder_steps`, not shorter chunks.
