@@ -831,7 +831,16 @@ split_sentences(std::string paragraph) {
     // hyphen is flattened leaves no terminal mark, so the text either side rides
     // into one long chunk that opens mid-sentence -- and the decoder answers a
     // chunk like that with silence rather than speech.
+    // Punctuation already carrying the break is absorbed rather than doubled:
+    // "began again,--" would otherwise read as "began again,." and the comma
+    // would be spoken against a full stop.
     for (const char* dash : {"\u2014", "\u2013", "--"}) {
+        for (const char* lead : {",", ";", ":"}) {
+            paragraph = replace_all(paragraph, std::string(lead) + dash, ". ");
+        }
+        for (const char* keep : {".", "!", "?"}) {
+            paragraph = replace_all(paragraph, std::string(keep) + dash, std::string(keep) + " ");
+        }
         paragraph = replace_all(paragraph, dash, ". ");
     }
     paragraph = replace_all(paragraph, "-", " ");
